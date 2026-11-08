@@ -853,6 +853,76 @@ function isCorroborated(modelAnswer, results, question = "") {
   );
 }
 
+/**
+ * モデルの答えが主張している事実の種類（文の形から判定する）。
+ * このモデルの答えは「Xの名物はYです」「『Z』の作者はWです」のような
+ * 決まった形で出てくるため、形から種類が読み取れる。形が読み取れない
+ * 答え（地の文）は null。
+ */
+function answerClaimKind(answer) {
+  const a = answer ?? "";
+  if (/の作者は|の著者は/.test(a)) return "author";
+  if (/の本社は|の本店は|本社所在地は/.test(a)) return "hq";
+  if (/の名物は|が名物|の特産品?は|名物です/.test(a)) return "specialty";
+  if (/の運営会社は|の運営元は|を運営しているのは/.test(a)) return "operator";
+  if (/の国歌は|の首都は/.test(a)) return "attribute";
+  if (/の(総理大臣|首相|知事|社長|会長|代表者?|創業者|創立者|市長|町長|村長|大統領)は/.test(a)) {
+    return "person";
+  }
+  if (/の(高さ|標高|海抜|全長|長さ|重さ|重量|面積|人口)は/.test(a)) {
+    return "measure";
+  }
+  if (/に設立されました|に創立されました|に創業しました|の設立は|の創業は|に完成しました|に開業しました/.test(a)) {
+    return "date";
+  }
+  if (/は.{1,40}にあります|の所在地は/.test(a)) return "place";
+  return null;
+}
+
+/** 決まった形の答えの主語（『…』か「Xの〜」の X）。取れなければ null。 */
+function answerSubjectOf(answer) {
+  const m =
+    /^『(.+?)』/.exec(answer ?? "") ??
+    /^(.{2,24}?)の(?:名物|特産品?|作者|著者|本社|本店|高さ|標高|海抜|全長|長さ|重さ|重量|面積|人口|国歌|首都|社長|会長|知事|総理大臣|首相|運営会社|運営元|設立|創業)/.exec(
+      answer ?? "",
+    );
+  const s = m?.[1]?.trim();
+  return s ? s : null;
+}
+
+/**
+ * 未確認の答えを出す前の関門：質問が求める事実の種類と、モデルの答えが
+ * 主張する種類が食い違っていたら、その答えは質問への答えではない
+ * （知事を聞いたのに名物や作者の答えが出る、など）。主語が質問の対象と
+ * 別物の場合も同じ。食い違う答えは出さず「確認できませんでした」に
+ * する——種類の合わない答えを「未確認」と断っても読む側の助けに
+ * ならないため。種類が読み取れない地の文の答えは従来どおり通す。
+ */
+function modelAnswerFitsQuestion(question, answer) {
+  const claim = answerClaimKind(answer);
+  if (!claim) return true;
+  const expected = classifyQuestion(question);
+  if (expected && claim !== expected) return false;
+  if (!expected) return false;
+  const qSubject = subjectOf(question);
+  const aSubject = answerSubjectOf(answer);
+  if (qSubject && aSubject) {
+    return (
+      titleMatchesSubject(aSubject, qSubject) ||
+      titleMatchesSubject(qSubject, aSubject)
+    );
+  }
+  if (!qSubject && aSubject) {
+    const topic = topicFromQuestion(question);
+    if (topic) {
+      const nt = normalizeJa(topic);
+      const na = normalizeJa(aSubject);
+      if (!(nt.includes(na) || na.includes(nt))) return false;
+    }
+  }
+  return true;
+}
+
 function splitSentences(text) {
   const out = [];
   const parts = text.split(/(?<=[。！？\n])/);
@@ -883,17 +953,37 @@ function classifyQuestion(q) {
   // 会社の役職の語に当たらず、以前は未分類のまま緩い照合に流れていた。
   if (
     /内閣総理大臣|総理大臣|首相/.test(q) &&
-    /(誰|だれ|名前|現職|今|現在)/.test(q)
+    /(誰|だれ|名前|現職|今|現在|教えて|教え|知りたい|聞きたい)/.test(q)
+  ) {
+    return "person";
+  }
+  // 知事も現職者の質問：以前は分類に無く、「福島県知事は誰ですか」が
+  // 未分類のまま緩い照合に流れ、名物や作者の答えがそのまま出ていた。
+  // 「福島県知事」という記事（知事一覧へ飛ぶ）が現職者欄を持つため、
+  // 総理大臣と同じ現職者の仕組みで取り出す。
+  if (
+    /知事/.test(q) &&
+    (/(誰|だれ|名前|現職|今|現在|教えて|教え|知りたい|聞きたい)/.test(q) ||
+      /知事は[？?]/.test(q))
   ) {
     return "person";
   }
   if (
-    (/社長|会長|創業者|創立者|代表/.test(q) && /(誰|だれ|名前)/.test(q)) ||
+    (/社長|会長|創業者|創立者|代表/.test(q) &&
+      /(誰|だれ|名前|教えて|教え|知りたい|聞きたい)/.test(q)) ||
     // 「〜の社長は？」のように「誰」が無くても、役職そのものを
     // 尋ねる文なら人物の質問として扱う（本社の裸形と同じ扱い）。
     /(社長|会長|創業者|創立者|代表)は[？?]/.test(q)
   ) {
     return "person";
+  }
+  // 運営会社：「モーリーファンタジーの運営会社はなんという社名ですか」
+  // は、以前はどの種類にも当たらず事実を取りに行けなかった。
+  if (
+    /運営(会社|元|者|主体)/.test(q) ||
+    (/(を|の)運営/.test(q) && /(会社|社名|何|なに|なん|誰)/.test(q))
+  ) {
+    return "operator";
   }
   // 「大阪の名物は？」「日本の国歌は？」には何/どこ/誰の印が無いため、
   // この2種類が無いと全パターンを素通りして事実が一切取れなかった。
@@ -1090,7 +1180,71 @@ function extractHq(article, label) {
   return null;
 }
 
-function extractPlace(article, label) {
+/**
+ * 県庁所在地（都庁・府庁・道庁所在地も）：聞かれているのは県庁のある
+ * 市であり、所在地欄の番地ではない。所在地欄は「仙台市青葉区本町
+ * 3丁目8番1号」の形で先頭がその市なので、先頭の自治体名だけを取り、
+ * 「宮城県の県庁所在地は仙台市です。」と組み立てる。こうすると市の
+ * 名前だけを答えるモデル（「福島市です」）とも食い違いにならない。
+ * 明示の庁所在地欄があればそれを優先し、最後にリード文も試す。
+ */
+function extractPrefCapital(question, article, label) {
+  const term = /([都道府県]庁所在地)/.exec(question)?.[1] ?? "県庁所在地";
+  const cityOf = (raw) => {
+    if (!raw) return null;
+    let s = raw.replace(/[\s　]/g, "");
+    if (article.title && s.startsWith(article.title)) {
+      s = s.slice(article.title.length);
+    }
+    const m = /^(.{2,12}?[市区町村])/.exec(s);
+    const city = m?.[1] ?? null;
+    return city && city.length >= 2 ? city : null;
+  };
+  for (const name of ["県庁所在地", "都庁所在地", "府庁所在地", "道庁所在地", "庁所在地"]) {
+    const fromField = article.fields[name];
+    const city = cityOf(fromField);
+    if (city) {
+      return makeFact(
+        article,
+        "place",
+        city,
+        `${label}の${term}は${city}です。`,
+        fieldEvidence(article, name, fromField, city),
+      );
+    }
+  }
+  const loc = article.fields["所在地"];
+  const cityFromLoc = cityOf(loc);
+  if (loc && cityFromLoc) {
+    return makeFact(
+      article,
+      "place",
+      cityFromLoc,
+      `${label}の${term}は${cityFromLoc}です。`,
+      fieldEvidence(article, "所在地", loc, cityFromLoc),
+    );
+  }
+  const hit = findSentence(article.lead, (s) => /庁所在地は/.test(s), 12);
+  if (hit) {
+    const m = /庁所在地は、?(.{2,12}?[市区町村])/.exec(hit);
+    if (m?.[1]) {
+      return makeFact(
+        article,
+        "place",
+        m[1],
+        `${label}の${term}は${m[1]}です。`,
+        hit,
+      );
+    }
+  }
+  return null;
+}
+
+function extractPlace(question, article, label) {
+  if (/庁所在地/.test(question)) {
+    const capital = extractPrefCapital(question, article, label);
+    if (capital) return capital;
+  }
   const fieldNames = ["所在地", "場所", "位置"];
   for (const name of fieldNames) {
     const fromField = article.fields[name];
@@ -1341,7 +1495,66 @@ function extractPrimeMinister(article, label) {
   return null;
 }
 
+/**
+ * 現職の知事：「福島県知事」は（Wikipediaのリダイレクトで）福島県知事
+ * 一覧に解決され、その記事は {{Infobox Political post}} に現職者欄を
+ * 持つ（「現職者 = 内堀雅雄（第22代）」）。総理大臣と同じく現職者欄を
+ * 優先し、無ければリードの「現職は…」の形を試す。都道府県名は質問文
+ * から取る（記事タイトルは「…知事一覧」になるため）。
+ */
+function extractGovernor(question, article) {
+  const pref = (
+    /(.{2,8}?(?:都|道|府|県))知事/.exec(question)?.[1] ??
+    article.title.replace(/(?:知事一覧|知事)$/, "")
+  ).replace(/^(現在の|現|今の)/, "");
+  const fieldNames = ["現職者", "現職", "知事", "都知事", "県知事", "府知事", "道知事"];
+  for (const name of fieldNames) {
+    const raw = article.fields[name];
+    if (!raw || /[。]/.test(raw)) continue;
+    // 「内堀雅雄（第22代）」の代数の注記は名前ではないので落とす。
+    const value = cleanPersonName(raw.split(/[（(]/)[0]?.trim() ?? "");
+    if (
+      value.length >= 2 &&
+      value.length <= 12 &&
+      !/[。『』、（）()：:はがをにへとやの]/.test(value)
+    ) {
+      return makeFact(
+        article,
+        "person",
+        value,
+        `${pref}の知事は${value}です。`,
+        fieldEvidence(article, name, raw, value.slice(0, 4)),
+      );
+    }
+  }
+  const hit = findSentence(article.lead, (s) => /現職(?:は|者)/.test(s), 10);
+  if (hit) {
+    const m = /現職(?:は|者[はが]?)(.{2,24}?)(?:（|、|。)/.exec(hit);
+    const captured = (m?.[1] ?? "").trim();
+    const value = captured.includes("議員の")
+      ? (captured.split("議員の").pop() ?? "").trim()
+      : captured;
+    if (
+      value.length >= 2 &&
+      value.length <= 12 &&
+      !/[。『』、（）()：:はがをにへとやの]/.test(value)
+    ) {
+      return makeFact(
+        article,
+        "person",
+        value,
+        `${pref}の知事は${value}です。`,
+        hit,
+      );
+    }
+  }
+  return null;
+}
+
 function extractPerson(question, article, label) {
+  if (/知事/.test(question)) {
+    return extractGovernor(question, article);
+  }
   if (/内閣総理大臣|総理大臣|首相/.test(question)) {
     const leaderLabel = question.includes("日本") ? "日本" : label;
     return extractPrimeMinister(article, leaderLabel);
@@ -1597,6 +1810,74 @@ function extractDefinition(article) {
 }
 
 /**
+ * 運営会社：聞かれているのは運営される側（ブランド・施設）で、答えは
+ * 運営する会社の社名。置き場は3通りある。
+ * 1) 対象記事の「運営会社」などの明示欄。
+ * 2) 記事自体が運営会社の記事：モーリーファンタジーはイオンファン
+ *    タジーの記事へ飛び、その会社記事は 社名 欄を持ち、リードで
+ *    「『モーリーファンタジー』を…運営する」と対象を名指ししている。
+ * 3) ブランド側の記事のリード：「X株式会社が運営する…」の形。
+ * ラベルは記事タイトルではなく質問の題名（ブランド名）を使う。
+ */
+function extractOperator(question, article) {
+  const topic = topicFromQuestion(question);
+  const label = topic ?? article.title;
+  for (const name of ["運営会社", "運営元", "運営者", "運営主体", "事業者"]) {
+    const fromField = article.fields[name];
+    if (fromField && fromField.length <= 40 && !/[。]/.test(fromField)) {
+      return makeFact(
+        article,
+        "operator",
+        fromField,
+        `${label}の運営会社は${fromField}です。`,
+        fieldEvidence(article, name, fromField, fromField.slice(0, 6)),
+      );
+    }
+  }
+  const company = article.fields["社名"];
+  if (
+    company &&
+    topic &&
+    company.length <= 40 &&
+    !/[。]/.test(company) &&
+    normalizeJa(article.lead).includes(normalizeJa(topic)) &&
+    /運営/.test(article.lead)
+  ) {
+    return makeFact(
+      article,
+      "operator",
+      company,
+      `${label}の運営会社は${company}です。`,
+      fieldEvidence(article, "社名", company, topic),
+    );
+  }
+  const patterns = [
+    /([一-鿿々ァ-ヶーA-Za-z0-9・]{2,30}?(?:株式会社|有限会社|合同会社|会社|グループ|財団法人|社団法人|公社|機構))が運営/,
+    /([一-鿿々ァ-ヶーA-Za-z0-9・]{2,30}?(?:株式会社|有限会社|合同会社))の運営(?:する|による|で)/,
+    /は、?([一-鿿々ァ-ヶーA-Za-z0-9・]{2,30}?(?:株式会社|有限会社|合同会社))により運営/,
+  ];
+  for (const re of patterns) {
+    const hit = findSentence(article.lead, (s) => re.test(s), 14);
+    if (!hit) continue;
+    const value = (re.exec(hit)?.[1] ?? "").trim();
+    if (
+      value.length >= 2 &&
+      value.length <= 30 &&
+      !/[。『』、（）()：:はがをにへとや]/.test(value)
+    ) {
+      return makeFact(
+        article,
+        "operator",
+        value,
+        `${label}の運営会社は${value}です。`,
+        hit,
+      );
+    }
+  }
+  return null;
+}
+
+/**
  * 対象記事から、質問の種類に合う事実を取り出す。
  * 取れなければ null（関係ありそうな文を答えとして貼らないための関門）。
  */
@@ -1612,13 +1893,15 @@ function extractFact(question, article) {
     case "hq":
       return extractHq(article, label);
     case "place":
-      return extractPlace(article, label);
+      return extractPlace(question, article, label);
     case "date":
       return extractDate(question, article, label);
     case "measure":
       return extractMeasure(question, article, label);
     case "person":
       return extractPerson(question, article, label);
+    case "operator":
+      return extractOperator(question, article);
     case "specialty":
       return extractSpecialty(article, label);
     case "attribute":
@@ -1946,7 +2229,8 @@ async function searchWikipedia(q) {
   const kindRes = {
     author: /作者|著者|による/,
     hq: /本社/,
-    person: /社長|会長|代表|創業者|総理大臣|首相/,
+    person: /社長|会長|代表|創業者|総理大臣|首相|知事|現職/,
+    operator: /運営/,
     specialty: /名物|郷土料理|特産/,
     attribute: /国歌|首都/,
     date: /設立|創立|創業|竣工|開業|完成/,
@@ -2005,6 +2289,12 @@ function topicFromQuestion(q) {
   );
   t = t.replace(/について.*$/, "");
   t = t.replace(/(を)?(教えて|教え|知りたい|聞きたい).*$/, "");
+  // 運営会社の質問：題名は運営される側（ブランド・施設）そのもの。
+  // 「モーリーファンタジーの運営会社は…」の尾を残すと記事が見つからない。
+  if (/運営/.test(t)) {
+    const cut = t.replace(/(の|を)運営.*$/, "");
+    if (cut.length >= 2) t = cut;
+  }
   // 属性の末尾：「日本の国歌は？」は日本（のインフォボックスに国歌が
   // ある）の質問、「大阪の名物は？」は大阪の質問。これを落とさないと
   // 題名が「日本の国歌」「大阪の名物」になって記事が見つからない。
@@ -2027,13 +2317,23 @@ function topicFromQuestion(q) {
   // ただし題名そのもの（「人口」等）を消してしまわないよう、
   // 落とした結果が2文字未満になる場合は落とさない。
   const tailNouns =
-    /(の)?(本社所在地|本店所在地|本社|本店|所在地|住所|場所|社長|会長|代表者|創業者|創立者|作者|著者|高さ|標高|海抜|全長|長さ|重さ|重量|面積|人口|値段|価格|年齢|設立|創立|創業)$/;
+    /(の)?(本社所在地|本店所在地|庁所在地|本社|本店|所在地|住所|場所|社長|会長|代表者|創業者|創立者|作者|著者|高さ|標高|海抜|全長|長さ|重さ|重量|面積|人口|値段|価格|年齢|設立|創立|創業|社名)$/;
   for (let i = 0; i < 3; i += 1) {
     const before = t;
     t = t.replace(/(は|が|の|って|について)$/, "");
     const stripped = t.replace(tailNouns, "");
     if (stripped.length >= 2) t = stripped;
     if (t === before) break;
+  }
+  // 庁所在地の質問では上の置換で「宮城県の県庁」までしか落ちない：
+  // 題名は都道府県そのものなので、尾の「の県庁」も落とす。
+  const hallStripped = t.replace(/(の)?[都道府県]庁$/, "");
+  if (hallStripped.length >= 2) t = hallStripped;
+  // 現職者の質問の先頭の「現／現在の」：「現福島県知事は誰ですか」の
+  // 題名は「福島県知事」で、「現福島県知事」という記事は無い。
+  if (/(知事|総理大臣|首相|大統領|社長|会長|市長|町長|村長)/.test(q)) {
+    const stripped = t.replace(/^(現在の|現|今の)/, "");
+    if (stripped.length >= 2) t = stripped;
   }
   t = t.trim();
   return t.length >= 2 ? t : null;
@@ -2061,7 +2361,11 @@ async function wikiFetchWikitext(title) {
   }
 }
 
-/** 一番内側の {{template|a|b}} を引数を並べた形に置換する。 */
+/** 一番内側の {{template|a|b}} を引数を並べた形に置換する。
+ *  名前つき引数（key=value / key:value）は値そのものではないので落とす：
+ *  都道府県の所在地欄の {{Coord|format=dms|type:adm1st_region:JP-07|
+ *  display=inline,title}} が「format=dms type:adm1st_region:JP-07
+ *  display=inline,title」というゴミとして答えに混入していた。 */
 function unwrapTemplates(s) {
   let cur = s;
   for (let guard = 0; guard < 12; guard += 1) {
@@ -2069,7 +2373,7 @@ function unwrapTemplates(s) {
       const parts = String(inner).split("|");
       return parts
         .slice(1)
-        .filter((p) => !/^\s*(class|style|id)\s*=/.test(p))
+        .filter((p) => !/^\s*[A-Za-z_][\w-]*\s*[=:]/.test(p))
         .join(" ");
     });
     if (next === cur) break;
@@ -2090,6 +2394,13 @@ function cleanFieldValue(v) {
   s = s.replace(/\[\[(?:File|ファイル|Image|画像):[^\]]*\]\]/gi, "");
   s = s.replace(/<br\s*\/?>/gi, " ");
   s = unwrapTemplates(s);
+  // 座標テンプレートの引数ゴミの残り（名前つき引数を落としても形を変えて
+  // 残った場合の保険）：「format=dms」「type:adm1st_region:JP-07」
+  // 「display=inline,title」のような語は住所の一部ではありえない。
+  s = s.replace(
+    /\b(?:format|type|display|scale|region|globe|dim)\s*[=:][^\s]*/g,
+    " ",
+  );
   s = s.replace(/\[\[(?:File|ファイル|Image|画像):[^\]]*\]\]/gi, "");
   s = s.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2");
   s = s.replace(/\[\[([^\]]+)\]\]/g, "$1");
@@ -2195,6 +2506,8 @@ const FACT_FIELD_KEYS = new Set([
   "重量", "重さ", "質量", "面積", "人口",
   "社長", "会長", "創業者", "創立者", "設立者",
   "代表者", "代表取締役", "代表取締役社長",
+  "現職者", "現職", "知事",
+  "運営会社", "運営元", "運営者", "社名",
   "国歌", "首都", "名物", "特産品", "名産品",
 ]);
 
@@ -2271,6 +2584,7 @@ function hasUsableFact(s) {
   const keys = [
     "作者", "著者", "本社所在地", "本店所在地", "所在地", "標高", "高さ",
     "設立", "創立", "創業", "代表者", "社長", "会長", "創業者",
+    "現職者", "現職", "運営会社", "運営元", "社名",
     "竣工", "開業", "全長", "面積", "人口", "国歌", "首都", "名物",
   ];
   if (keys.some((k) => s.fields[k])) return true;
@@ -2282,6 +2596,8 @@ function hasUsableFact(s) {
 /** この質問に答えるのに要る欄のキー（候補記事どうしの優先づけ用）。 */
 function questionFieldKeys(q) {
   if (/作者|著者|書いた|描いた/.test(q)) return ["作者", "著者"];
+  if (/知事/.test(q)) return ["現職者", "現職", "知事"];
+  if (/運営/.test(q)) return ["運営会社", "運営元", "運営者", "社名"];
   if (/国歌/.test(q)) return ["国歌"];
   if (/首都/.test(q)) return ["首都"];
   if (/名物|特産|名産|郷土料理|有名な食べ物/.test(q)) {
@@ -2794,6 +3110,7 @@ const KIND_LABELS = {
   date: "日付",
   measure: "数値",
   person: "人物",
+  operator: "運営会社",
   specialty: "名物",
   attribute: "国歌・首都",
   definition: "定義",
@@ -3358,10 +3675,21 @@ const App = {
 
     // 5) 種類つき事実が取れなかった：モデルの答えは未確認として出すか、
     // 正直に「確認できませんでした」と言う（関係ありそうな文は貼らない）。
+    // ただし未確認で出す前に、答えの種類が質問と合っているか確かめる：
+    // 知事を聞いたのに名物や作者の答えが出るような、種類の食い違う
+    // 答えは出さない（「未確認」と断っても質問への答えになっていない）。
     // モデルが何も出さなかった場合は、その理由も注記に言う。
     // 検索に接続できなかった場合は、その理由を必ず添える。
     this.setPhase("idle");
-    if (modelAnswer) {
+    if (modelAnswer && !modelAnswerFitsQuestion(question, modelAnswer)) {
+      this.pushAssistant({
+        text: "確認できませんでした。",
+        badge: "unknown",
+        note: searchError
+          ? `検索に接続できなかったため、記事の事実では確認できませんでした（理由：${searchError}）。Cubeの答えは質問の種類と合っていなかったため、表示しませんでした。設定の「検索テスト」で接続を確かめられます。`
+          : "記事の事実では確認できませんでした。Cubeの答えは質問の種類と合っていなかったため、表示しませんでした。",
+      });
+    } else if (modelAnswer) {
       this.pushAssistant({
         text: modelAnswer,
         badge: "unverified",
@@ -3590,6 +3918,7 @@ if (typeof module !== "undefined" && module.exports) {
     resolveArticleSource, searchWikipedia, topicFromQuestion,
     canonicalTensorName, expectedTensors, modelAgreesWithFact,
     isCorroborated, answerContentTerms, numbersMatchLoose,
+    modelAnswerFitsQuestion, answerClaimKind,
     parseWeatherQuery, fetchWeather, normalizeQuestion,
   };
 }
