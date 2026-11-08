@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Cube</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <!-- モデル状態バー：状態は常に正直に表示する -->
+      <header class="statusbar">
+        <div class="bar-inner">
+          <span id="model-status" class="model-status mono" aria-label="モデル状態">
+            <span class="dot" aria-hidden="true"></span>
+            <span id="model-status-text">モデル未配置</span>
+          </span>
+          <span id="model-note" class="model-note">回答は検索のみで行います</span>
+          <nav class="tabs" aria-label="画面切り替え">
+            <button type="button" class="tab-btn" data-tab="chat" aria-pressed="true">チャット</button>
+            <button type="button" class="tab-btn" data-tab="notebook" aria-pressed="false">知識メモ帳<span id="nb-tab-count"></span></button>
+            <button type="button" class="tab-btn" data-tab="settings" aria-pressed="false">設定</button>
+          </nav>
+        </div>
+      </header>
+
+      <!-- チャット -->
+      <section id="view-chat" class="view">
+        <div id="chat-scroll" class="chat-scroll">
+          <div class="chat-inner">
+            <div id="empty-state" class="empty">
+              <p class="big">Cubeに質問してみよう</p>
+              <p class="desc">
+                Cubeは、約3,177万パラメータの自作LLMです。
+                答えには必ず「出どころ」のラベルがつきます。基本はCubeの
+                答えを主表示し、ネット検索は裏づけとして添えます。Cubeと
+                ネットで食い違ったら、ネットの事実を正として表示し、
+                Cubeの答えも消さずに併記します。計算は検算で確かめます。
+              </p>
+              <ul class="legend" aria-label="出どころラベルの説明">
+                <li><span class="badge mono badge-notebook">知識メモ帳の答え</span></li>
+                <li><span class="badge mono badge-calc">検算の答え</span></li>
+                <li><span class="badge mono badge-weather">天気情報（Open-Meteo）</span></li>
+                <li><span class="badge mono badge-model">Cubeの答え（ネットで確認済み）</span></li>
+                <li><span class="badge mono badge-net">ネット検索の答え</span></li>
+                <li><span class="badge mono badge-unverified">ネットで確認できなかった（未確認）</span></li>
+              </ul>
+              <div class="suggestions">
+                <button type="button" class="suggestion-btn" data-q="『こころ』の作者は誰ですか？">『こころ』の作者は誰ですか？</button>
+                <button type="button" class="suggestion-btn" data-q="富士山の高さは？">富士山の高さは？</button>
+                <button type="button" class="suggestion-btn" data-q="68×11はいくつですか？">68×11はいくつですか？</button>
+                <button type="button" class="suggestion-btn" data-q="明日の郡山の天気は？">明日の郡山の天気は？</button>
+              </div>
+            </div>
+            <ul id="msg-list" class="msg-list"></ul>
+            <div id="phase-row" class="phase-row mono" aria-live="polite" hidden>
+              <span class="dot" aria-hidden="true"></span>
+              <span id="phase-text">考え中…</span>
+            </div>
+          </div>
+        </div>
+        <form id="ask-form" class="composer-wrap">
+          <div class="composer-inner">
+            <div class="composer">
+              <label class="sr-only" for="question-input">質問を入力</label>
+              <textarea id="question-input" rows="1" placeholder="質問を入力…"></textarea>
+              <button id="send-btn" type="submit" class="send-btn" disabled>送信</button>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <!-- 知識メモ帳 -->
+      <section id="view-notebook" class="view" hidden>
+        <div class="page-scroll">
+          <div class="page-inner">
+            <h2>知識メモ帳</h2>
+            <p class="lead">
+              検索で確認できた答えが、質問の種類と事実に分けてここに吸収されます。
+              同じ質問には即答し、たまった知識はあとでモデルの重みへ追加学習します。
+              CodePen版では、この端末のブラウザの中に保存されます。
+            </p>
+            <p id="nb-counts" class="nb-counts mono" hidden></p>
+            <p id="nb-empty" class="nb-empty">
+              まだ何も保存されていません。チャットで質問すると、
+              検索で確認できた答えがここに残ります。
+            </p>
+            <ul id="nb-list" class="nb-list"></ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- 設定 -->
+      <section id="view-settings" class="view" hidden>
+        <div class="page-scroll">
+          <div class="page-inner">
+            <h2>設定</h2>
+
+            <section class="card">
+              <h3><label for="base-url">モデルの重みベースURL</label></h3>
+              <p class="desc">
+                manifest.json / bpe.json / weights-*.bin が置いてある場所を指定します。
+                この端末に保存され、次回から自動で読み込みます。
+              </p>
+              <div class="url-row">
+                <input id="base-url" class="mono" type="url" />
+                <button id="load-model-btn" type="button" class="primary-btn">読み込む</button>
+              </div>
+              <p id="settings-model-status" class="status-line mono">状態: モデル未配置</p>
+              <p class="status-line">現在のベースURL: <span id="current-url" class="mono"></span></p>
+            </section>
+            <section class="card">
+              <h3><label for="weather-place">天気の既定の場所</label></h3>
+              <p class="desc">
+                「今日の天気は？」のように場所を指定しない天気の質問で使う場所です。
+                質問の中で場所を指定したとき（「仙台の天気は？」）はそちらが優先されます。
+                この端末に保存されます。
+              </p>
+              <div class="url-row">
+                <input id="weather-place" type="text" />
+                <button id="weather-place-save" type="button" class="primary-btn">保存する</button>
+              </div>
+              <p class="status-line">現在の既定の場所: <span id="weather-place-current">福島県郡山市</span>（天気データの出典は Open-Meteo）</p>
+            </section>
+
+
+            <section class="card">
+              <h3>ネット検索</h3>
+              <p class="desc">
+                照合のための検索が、この端末・この画面からWikipediaに届くかを
+                テストします。検索は通常は直接接続で、届かないときは予備の経路に
+                自動で切り替わります。検索できないときは、理由もここに表示されます。
+              </p>
+              <div class="btn-row">
+                <button id="search-test-btn" type="button" class="primary-btn">検索をテスト</button>
+              </div>
+              <p id="search-test-result" class="status-line" aria-live="polite">まだテストしていません。</p>
+            </section>
+
+            <!-- SLOT:codepen-files -->
+
+            <section class="card">
+              <h3>学習データ</h3>
+              <p class="desc">
+                知識メモ帳に吸収した知識を、モデルの重みへ追加学習するための
+                受け渡し欄です。書き出したJSONを Muse に渡すと追加学習に使われます。
+              </p>
+              <p id="training-counts" class="count-line mono"></p>
+              <div class="btn-row">
+                <button id="export-download" type="button" class="primary-btn">学習用データを書き出す（ダウンロード）</button>
+                <button id="export-copy" type="button" class="ghost-btn">学習用データをコピー</button>
+              </div>
+              <p id="export-note" class="note-line" aria-live="polite"></p>
+              <div class="hr">
+                <p class="desc">
+                  追加学習が終わったら、未学習のエントリをまとめて
+                  「学習済み」に切り替えます（次回の書き出しで二重に学習しないため）。
+                </p>
+                <div class="btn-row">
+                  <button id="mark-all-btn" type="button" class="ghost-btn">未学習をすべて学習済みにする</button>
+                  <span id="mark-all-confirm" hidden>
+                    <span id="mark-all-text"></span>
+                    <button id="mark-all-yes" type="button" class="primary-btn">学習済みにする</button>
+                    <button id="mark-all-no" type="button" class="ghost-btn">やめる</button>
+                  </span>
+                </div>
+                <p id="mark-all-done" class="note-line" hidden>学習済みに切り替えました。</p>
+              </div>
+            </section>
+
+            <section class="card">
+              <h3>このAIについて</h3>
+              <p class="desc">
+                このAIの名前はCubeです。
+                GPT方式Transformer（12層・幅448・語彙6,000の自作BPE、約3,177万パラメータ）を
+                ブラウザの中で直接動かしています。外部AIのAPIは使っていません。
+                回答は表示前にウェブ検索と照合し、計算は検算します。
+                事実の答えは、対象記事のインフォボックスや定義文から質問の種類に合った
+                事実だけを抜き、決まった文の形に組み立てて作ります。事実が抜けない
+                質問では、関係ありそうな文を貼らず「確認できませんでした」と表示します。
+                確認できた知識は知識メモ帳に構造化して吸収され、たまった分は
+                「設定」の学習データから書き出して、モデルの重みへの追加学習に
+                渡せます。追加学習が済んだエントリは「学習済み」になります。
+                天気の質問には、無料の天気API「Open-Meteo」の実データで答えます
+                （場所を指定しない場合は上の「天気の既定の場所」を使います）。
+                天気は変わる情報なので、知識メモ帳には保存しません。
+                この版では、照合のための検索はブラウザから日本語Wikipediaを
+                呼び、直接届かないときは予備の経路に切り替えて行い、
+                知識メモ帳はこの端末のブラウザ内に保存します。
+              </p>
+            </section>
+          </div>
+        </div>
+      </section>
+    </div>
+    <script src="script.js"></script>
+  </body>
+</html>
