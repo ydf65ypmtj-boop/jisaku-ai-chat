@@ -1,4 +1,4 @@
-/* 自作AIチャット（CodePen版） style.css
+/* 自作AIチャット（GitHub版） style.css
    ChatGPT風：白＋ニュートラルグレーの画面、近黒のアクセント。
    ダークモードはチャコールグレー基調。回答の「出どころ」バッジだけは
    見分けのために色分けを残す。 */
@@ -175,6 +175,7 @@ a { color: var(--accent); }
 }
 .badge-notebook { background: #3f7038; color: #ffffff; }
 .badge-calc { background: #26706b; color: #ffffff; }
+.badge-self { background: #7a4a56; color: #ffffff; }
 .badge-weather { background: #1f6fb2; color: #ffffff; }
 .badge-model { background: #a84e2f; color: #ffffff; }
 .badge-net { background: #3e6390; color: #ffffff; }
@@ -182,6 +183,7 @@ a { color: var(--accent); }
 @media (prefers-color-scheme: dark) {
   .badge-notebook { background: #8fbc7a; color: #1d1a15; }
   .badge-calc { background: #6fbfb8; color: #1d1a15; }
+  .badge-self { background: #d59aa7; color: #1d1a15; }
   .badge-weather { background: #7db3dd; color: #1d1a15; }
   .badge-model { background: #e08a6d; color: #1d1a15; }
   .badge-net { background: #8fb0cc; color: #1d1a15; }
