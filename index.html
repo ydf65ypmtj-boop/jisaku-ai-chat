@@ -44,7 +44,7 @@
               <ul class="legend" aria-label="出どころラベルの説明">
                 <li><span class="badge mono badge-notebook">知識メモ帳の答え</span></li>
                 <li><span class="badge mono badge-calc">検算の答え</span></li>
-                <li><span class="badge mono badge-weather">天気情報（Open-Meteo）</span></li>
+                <li><span class="badge mono badge-weather">天気情報（気象庁・Open-Meteo）</span></li>
                 <li><span class="badge mono badge-model">Cubeの答え（ネットで確認済み）</span></li>
                 <li><span class="badge mono badge-net">ネット検索の答え</span></li>
                 <li><span class="badge mono badge-unverified">ネットで確認できなかった（未確認）</span></li>
@@ -125,7 +125,7 @@
                 <input id="weather-place" type="text" />
                 <button id="weather-place-save" type="button" class="primary-btn">保存する</button>
               </div>
-              <p class="status-line">現在の既定の場所: <span id="weather-place-current">福島県郡山市</span>（天気データの出典は Open-Meteo）</p>
+              <p class="status-line">現在の既定の場所: <span id="weather-place-current">福島県郡山市</span>（予報の出典は気象庁、現在の状況は Open-Meteo）</p>
             </section>
 
 
@@ -200,7 +200,10 @@
                 確認できた知識は知識メモ帳に構造化して吸収され、たまった分は
                 「設定」の学習データから書き出して、モデルの重みへの追加学習に
                 渡せます。追加学習が済んだエントリは「学習済み」になります。
-                天気の質問には、無料の天気API「Open-Meteo」の実データで答えます
+                天気の質問には、実データで答えます。予報（今日・明日・明後日と
+                週間予報）は気象庁の公式データから、現在の気温・現在の天気は
+                無料の天気API「Open-Meteo」から取り、出典は分けて表示します。
+                気象庁のデータが取れないときは、Open-Meteoのみで答えます
                 （場所を指定しない場合は上の「天気の既定の場所」を使います）。
                 天気は変わる情報なので、知識メモ帳には保存しません。
                 この版では、照合のための検索はブラウザから日本語Wikipediaを
