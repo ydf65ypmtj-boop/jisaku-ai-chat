@@ -3415,11 +3415,15 @@ async function resolveArticleSource(q) {
 }
 
 /* ================================================================== */
-/* 天気クライアント（Open-Meteo：無料・キー不要、ブラウザから直接）    */
+/* 天気クライアント（気象庁＋Open-Meteo：無料・キー不要、直接取得）    */
 /*                                                                    */
-/* 聞かれた時点の実データを読む：質問の場所（無ければ設定の既定の      */
-/* 場所）をジオコーディングし、その地点の予報を取る。何も保存しない   */
-/* ——天気は変わるので、昨日の答えを今日の答えとして出してはいけない。 */
+/* 予報（今日・明日・明後日・週間）は気象庁の公式JSONから取り、        */
+/* 現在の気温・現在の天気のような細かい情報は Open-Meteo から取る。    */
+/* 出典は分けて表示する（予報：気象庁／現在の状況：Open-Meteo）。      */
+/* 気象庁が取れないときは Open-Meteo のみにフォールバックし、出典      */
+/* 表示もそれに合わせる。聞かれた時点の実データを読むだけで、何も      */
+/* 保存しない——天気は変わるので、昨日の答えを今日の答えとして          */
+/* 出してはいけない。                                                  */
 /* ================================================================== */
 
 /**
@@ -3511,24 +3515,11 @@ function formatForecastDate(iso, index) {
 }
 
 /**
- * 天気を取る。Muse版の weather アクションと同じ形で返す：
- * { ok, error, place_label, current_temp, current_text, days, source_url }。
- * 失敗は ok:false ＋理由で返し、天気をでっち上げない。
+ * Open-Meteo から現在の状況と日ごとの予報を取る（従来の実装）。
+ * 成功時は { current_temp, current_text, days }、失敗時は null。
+ * days の形は呼び出し側で気象庁の予報と差し替えられるよう共通にする。
  */
-async function fetchWeather(place, defaultPlace, day) {
-  const empty = {
-    ok: false,
-    error: "",
-    place_label: "",
-    current_temp: null,
-    current_text: "",
-    days: [],
-    source_url: "https://open-meteo.com/",
-  };
-  const wanted = (place || "").trim() || (defaultPlace || "").trim();
-  const geo = await geocodePlace(wanted);
-  if (!geo) return { ...empty, error: "place_not_found" };
-  const placeLabel = geo.admin1 ? `${geo.admin1} ${geo.name}` : geo.name;
+async function fetchOpenMeteoWeather(geo, day) {
   try {
     const params = new URLSearchParams({
       latitude: String(geo.latitude),
@@ -3540,18 +3531,18 @@ async function fetchWeather(place, defaultPlace, day) {
       forecast_days: "7",
     });
     const res = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`);
-    if (!res.ok) return { ...empty, error: "fetch_failed" };
+    if (!res.ok) return null;
     const data = await res.json();
     const daily = data.daily;
     const times = daily?.time ?? [];
-    if (times.length === 0) return { ...empty, error: "fetch_failed" };
+    if (times.length === 0) return null;
     const indices =
       day === "week"
         ? times.map((_, i) => i)
         : [day === "today" ? 0 : day === "tomorrow" ? 1 : 2].filter(
             (i) => i < times.length,
           );
-    if (indices.length === 0) return { ...empty, error: "fetch_failed" };
+    if (indices.length === 0) return null;
     const days = indices.map((i) => ({
       date_label: formatForecastDate(times[i] ?? "", i),
       text: weatherCodeText(daily?.weather_code?.[i] ?? -1),
@@ -3560,9 +3551,6 @@ async function fetchWeather(place, defaultPlace, day) {
       precip_prob: daily?.precipitation_probability_max?.[i] ?? null,
     }));
     return {
-      ok: true,
-      error: "",
-      place_label: placeLabel,
       current_temp:
         typeof data.current?.temperature_2m === "number"
           ? data.current.temperature_2m
@@ -3572,11 +3560,473 @@ async function fetchWeather(place, defaultPlace, day) {
           ? weatherCodeText(data.current.weather_code)
           : "",
       days,
-      source_url: "https://open-meteo.com/",
     };
   } catch {
-    return { ...empty, error: "fetch_failed" };
+    return null;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* 気象庁の予報（公式JSON：無料・キー不要、CORS許可あり）               */
+/*                                                                    */
+/* 予報JSONは都道府県コード（office）単位で公開される：                */
+/*   https://www.jma.go.jp/bosai/forecast/data/forecast/{office}.json */
+/* 地点の解決には地域階層 area.json を使う：                           */
+/*   https://www.jma.go.jp/bosai/common/const/area.json               */
+/* 市区町村（class20）→ 細分区域（class15）→ 予報区（class10）→       */
+/* 都道府県（office）とたどる（例：郡山市→中通り→福島県 070000）。     */
+/* area.json は大きいので、セッション内で1回だけ取りに行く。           */
+/* ------------------------------------------------------------------ */
+
+const JMA_AREA_URL = "https://www.jma.go.jp/bosai/common/const/area.json";
+const JMA_FORECAST_BASE =
+  "https://www.jma.go.jp/bosai/forecast/data/forecast/";
+const JMA_FORECAST_PAGE = "https://www.jma.go.jp/bosai/forecast/";
+
+let jmaAreasPromise = null;
+
+/** area.json をセッション内で1回だけ取得する。失敗したら次回再試行できるよう忘れる。 */
+function loadJmaAreas() {
+  if (!jmaAreasPromise) {
+    jmaAreasPromise = (async () => {
+      const res = await fetch(JMA_AREA_URL);
+      if (!res.ok) throw new Error(`area.json HTTP ${res.status}`);
+      return await res.json();
+    })().catch((e) => {
+      jmaAreasPromise = null;
+      throw e;
+    });
+  }
+  return jmaAreasPromise;
+}
+
+/**
+ * 場所の文字列とジオコーディング結果から、気象庁の
+ * { officeCode, officeName, class10Code, class10Name } を解決する。
+ * 解決できなければ null（呼び出し側は Open-Meteo にフォールバックする）。
+ */
+async function resolveJmaArea(place, geo) {
+  let areas;
+  try {
+    areas = await loadJmaAreas();
+  } catch {
+    return null;
+  }
+  const { offices, class10s, class15s, class20s } = areas ?? {};
+  if (!offices || !class10s || !class15s || !class20s) return null;
+  const names = [];
+  const push = (s) => {
+    const v = (s ?? "").trim();
+    if (v && !names.includes(v)) names.push(v);
+  };
+  push(geo?.name);
+  push(place);
+  for (const s of [...names]) push(s.replace(/^.+?(?:都|道|府|県)/, ""));
+  const fromClass20 = (entry) => {
+    const c15 = class15s[entry.parent];
+    const c10 = c15 ? class10s[c15.parent] : null;
+    const off = c10 ? offices[c10.parent] : null;
+    if (!c10 || !off || !c10.parent) return null;
+    return {
+      officeCode: c10.parent,
+      officeName: off.name,
+      class10Code: c15.parent,
+      class10Name: c10.name,
+    };
+  };
+  // 市区町村の完全一致を最優先する（大和郡山市と郡山市を取り違えない）。
+  let hit = null;
+  for (const n of names) {
+    for (const [code, v] of Object.entries(class20s)) {
+      if (v.name === n) {
+        hit = { code, ...v };
+        break;
+      }
+    }
+    if (hit) break;
+  }
+  // 前方一致（「札幌市」→「札幌市中央区」など、区に分かれる政令市）。
+  if (!hit) {
+    let best = null;
+    for (const n of names) {
+      if (n.length < 2) continue;
+      for (const [code, v] of Object.entries(class20s)) {
+        if (v.name.startsWith(n) && (!best || v.name.length < best.name.length)) {
+          best = { code, ...v };
+        }
+      }
+    }
+    hit = best;
+  }
+  if (hit) {
+    const resolved = fromClass20(hit);
+    if (resolved) return resolved;
+  }
+  // 都道府県だけ分かった場合：その office の予報区から、地名に名前が
+  // 含まれるものを優先し、無ければ先頭の予報区を使う。
+  const prefName =
+    (geo?.admin1 ?? "").trim() ||
+    (place.match(/^.+?(?:都|道|府|県)/)?.[0] ?? "");
+  for (const [code, off] of Object.entries(offices)) {
+    if (off.name !== prefName && off.name !== place) continue;
+    const children = off.children ?? [];
+    if (children.length === 0) return null;
+    let c10code = children[0];
+    for (const ch of children) {
+      const nm = class10s[ch]?.name ?? "";
+      if (nm && place.includes(nm)) {
+        c10code = ch;
+        break;
+      }
+    }
+    const c10 = class10s[c10code];
+    if (!c10) return null;
+    return {
+      officeCode: code,
+      officeName: off.name,
+      class10Code: c10code,
+      class10Name: c10.name,
+    };
+  }
+  return null;
+}
+
+/** 気象庁の天気コード（週間予報用）→ 日本語の天気文。 */
+const JMA_WEATHER_TEXT = {
+  100: "晴れ", 101: "晴れ時々くもり", 102: "晴れ一時雨", 103: "晴れ時々雨",
+  104: "晴れ一時雪", 105: "晴れ時々雪", 106: "晴れ一時雨か雪",
+  107: "晴れ時々雨か雪", 108: "晴れ一時雨か雷雨",
+  110: "晴れ後時々くもり", 111: "晴れ後くもり", 112: "晴れ後一時雨",
+  113: "晴れ後時々雨", 114: "晴れ後雨", 115: "晴れ後一時雪",
+  116: "晴れ後時々雪", 117: "晴れ後雪", 118: "晴れ後雨か雪",
+  119: "晴れ後雨か雷雨", 120: "晴れ朝夕一時雨", 121: "晴れ朝の内一時雨",
+  122: "晴れ夕方一時雨", 123: "晴れ山沿い雷雨", 124: "晴れ山沿い雪",
+  125: "晴れ午後は雷雨", 126: "晴れ昼頃から雨", 127: "晴れ夕方から雨",
+  128: "晴れ夜は雨", 130: "朝の内霧後晴れ", 131: "晴れ明け方霧",
+  132: "晴れ朝夕くもり", 140: "晴れ時々雨で雷を伴う",
+  160: "晴れ一時雨か雪", 170: "晴れ時々雨か雪", 181: "晴れ後雪か雨",
+  200: "くもり", 201: "くもり時々晴れ", 202: "くもり一時雨",
+  203: "くもり時々雨", 204: "くもり一時雪", 205: "くもり時々雪",
+  206: "くもり一時雨か雪", 207: "くもり時々雨か雪",
+  208: "くもり一時雨か雷雨", 209: "霧", 210: "くもり後時々晴れ",
+  211: "くもり後晴れ", 212: "くもり後一時雨", 213: "くもり後時々雨",
+  214: "くもり後雨", 215: "くもり後一時雪", 216: "くもり後時々雪",
+  217: "くもり後雪", 218: "くもり後雨か雪", 219: "くもり後雨か雷雨",
+  220: "くもり朝夕一時雨", 221: "くもり朝の内一時雨",
+  222: "くもり夕方一時雨", 223: "くもり日中時々晴れ",
+  224: "くもり昼頃から雨", 225: "くもり夕方から雨", 226: "くもり夜は雨",
+  228: "くもり昼頃から雪", 229: "くもり夕方から雪", 230: "くもり夜は雪",
+  231: "くもり海・海岸は霧か霧雨のち晴れ",
+  240: "くもり時々雨で雷を伴う", 250: "くもり時々雪で雷を伴う",
+  260: "くもり一時雨か雪", 270: "くもり時々雨か雪", 281: "くもり後雪か雨",
+  300: "雨", 301: "雨時々晴れ", 302: "雨時々止む", 303: "雨時々雪",
+  304: "雨か雪", 306: "大雨", 308: "雨で暴風を伴う", 309: "雨一時雪",
+  311: "雨後晴れ", 313: "雨後くもり", 314: "雨後時々雪", 315: "雨後雪",
+  316: "雨か雪後晴れ", 317: "雨か雪後くもり", 320: "朝の内雨後晴れ",
+  321: "朝の内雨後くもり", 322: "雨朝晩一時雪", 323: "雨昼頃から晴れ",
+  324: "雨夕方から晴れ", 325: "雨夜は晴れ", 326: "雨夕方から雪",
+  327: "雨夜は雪", 328: "雨一時強く降る", 329: "雨一時みぞれ",
+  340: "雪か雨", 350: "雨で雷を伴う", 361: "雨か雪後晴れ",
+  371: "雨か雪後くもり",
+  400: "雪", 401: "雪時々晴れ", 402: "雪時々止む", 403: "雪時々雨",
+  405: "大雪", 406: "風雪強い", 407: "暴風雪", 409: "雪一時雨",
+  411: "雪後晴れ", 413: "雪後くもり", 414: "雪後雨",
+  420: "朝の内雪後晴れ", 421: "朝の内雪後くもり", 422: "雪昼頃から雨",
+  423: "雪夕方から雨", 424: "雪夜は雨", 425: "雪一時強く降る",
+  426: "雪後みぞれ", 427: "雪一時みぞれ", 430: "みぞれ",
+  450: "雪で雷を伴う",
+};
+
+function jmaWeatherText(code) {
+  const n = Number(code);
+  if (Number.isFinite(n) && JMA_WEATHER_TEXT[n]) return JMA_WEATHER_TEXT[n];
+  const head = { 1: "晴れ", 2: "くもり", 3: "雨", 4: "雪" }[
+    Math.floor(n / 100)
+  ];
+  return head ?? "不明";
+}
+
+/** 気象庁JSONの数値文字列（"" は欠測）→ 数値 or null。 */
+function jmaNum(v) {
+  if (v === "" || v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** "2026-11-10" 同士の日数差（今日=0、明日=1、明後日=2）。 */
+function jmaDayDiff(iso, todayIso) {
+  const p = (s) => s.split("-").map(Number);
+  const [y1, m1, d1] = p(iso);
+  const [y2, m2, d2] = p(todayIso);
+  return Math.round(
+    (Date.UTC(y1, m1 - 1, d1) - Date.UTC(y2, m2 - 1, d2)) / 86400000,
+  );
+}
+
+function localTodayIso() {
+  const now = new Date();
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  return `${now.getFullYear()}-${mm}-${dd}`;
+}
+
+/**
+ * 気象庁の予報を取る。成功時は
+ * { officeName, areaName, detailed: Map<日付, day>, weekly: [day] }、
+ * 失敗時は null（呼び出し側は Open-Meteo のみにフォールバックする）。
+ * day は { date, text, temp_max, temp_min, precip_prob }（date は ISO日付）。
+ * 詳細予報（3日間）は天気文・降水確率・気温（地点別）を、週間予報は
+ * 天気コード・降水確率・気温（代表地点）を使う。
+ */
+async function fetchJmaForecast(place, geo) {
+  const area = await resolveJmaArea(place, geo);
+  if (!area) return null;
+  let data;
+  try {
+    const res = await fetch(`${JMA_FORECAST_BASE}${area.officeCode}.json`);
+    if (!res.ok) return null;
+    data = await res.json();
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(data) || data.length === 0) return null;
+  // 気温地点の名前候補：市区町村名から接尾（市など）を外した形を優先する
+  // （例：郡山市→「郡山」、仙台市→「仙台」）。
+  const cityName = (geo?.name ?? "").trim();
+  const stem = cityName.replace(/(?:市|区|町|村)$/, "");
+  const pickPoint = (areasList) => {
+    if (!Array.isArray(areasList) || areasList.length === 0) return null;
+    return (
+      areasList.find((a) => a.area?.name === stem) ??
+      areasList.find((a) => a.area?.name === cityName) ??
+      null
+    );
+  };
+  const det = data[0];
+  const detailed = new Map();
+  const weeklyTemps = new Map();
+  const wk = data[1];
+  if (wk) {
+    const wkTemps = wk.timeSeries?.[1];
+    const pt = wkTemps
+      ? (pickPoint(wkTemps.areas) ?? wkTemps.areas?.[0] ?? null)
+      : null;
+    if (pt && wkTemps) {
+      (wkTemps.timeDefines ?? []).forEach((td, i) => {
+        weeklyTemps.set(td.slice(0, 10), {
+          temp_max: jmaNum(pt.tempsMax?.[i]),
+          temp_min: jmaNum(pt.tempsMin?.[i]),
+        });
+      });
+    }
+  }
+  if (det) {
+    const tsW = det.timeSeries?.[0];
+    const tsP = det.timeSeries?.[1];
+    const tsT = det.timeSeries?.[2];
+    const wArea =
+      tsW?.areas?.find((a) => a.area?.code === area.class10Code) ??
+      tsW?.areas?.find((a) => a.area?.name === area.class10Name);
+    if (tsW && wArea) {
+      // 降水確率：6時間ごとの値を日ごとにまとめ、その日の最大値を使う。
+      const popsByDate = new Map();
+      const pArea =
+        tsP?.areas?.find((a) => a.area?.code === area.class10Code) ??
+        tsP?.areas?.find((a) => a.area?.name === area.class10Name);
+      if (tsP && pArea) {
+        (tsP.timeDefines ?? []).forEach((td, i) => {
+          const date = td.slice(0, 10);
+          const v = jmaNum(pArea.pops?.[i]);
+          if (v === null) return;
+          const cur = popsByDate.get(date);
+          if (cur === undefined || v > cur) popsByDate.set(date, v);
+        });
+      }
+      // 気温：地点別の予報。9時の値がその日の最高、0時の値が最低。
+      const tempsByDate = new Map();
+      const tPt = tsT ? pickPoint(tsT.areas) : null;
+      if (tsT && tPt) {
+        (tsT.timeDefines ?? []).forEach((td, i) => {
+          const date = td.slice(0, 10);
+          const hour = td.slice(11, 13);
+          const v = jmaNum(tPt.temps?.[i]);
+          if (v === null) return;
+          const cur = tempsByDate.get(date) ?? {};
+          if (hour === "09") cur.temp_max = v;
+          else if (hour === "00") cur.temp_min = v;
+          tempsByDate.set(date, cur);
+        });
+      }
+      (tsW.timeDefines ?? []).forEach((td, i) => {
+        const date = td.slice(0, 10);
+        const text = (wArea.weathers?.[i] ?? "")
+          .replace(/[\s　]+/g, " ")
+          .trim();
+        if (!text) return;
+        const dt = tempsByDate.get(date) ?? {};
+        const wt = weeklyTemps.get(date) ?? {};
+        detailed.set(date, {
+          date,
+          text,
+          temp_max: dt.temp_max ?? wt.temp_max ?? null,
+          temp_min: dt.temp_min ?? wt.temp_min ?? null,
+          precip_prob: popsByDate.get(date) ?? null,
+        });
+      });
+    }
+  }
+  const weekly = [];
+  if (wk) {
+    const tsW = wk.timeSeries?.[0];
+    // 週間予報の地域は詳細予報とコードが違うことがある（例：福島県の
+    // 「中通り・浜通り」070100）。コード完全一致→名前の含み合い→先頭、で選ぶ。
+    const wArea =
+      tsW?.areas?.find((a) => a.area?.code === area.class10Code) ??
+      tsW?.areas?.find(
+        (a) =>
+          a.area?.name &&
+          (a.area.name.includes(area.class10Name) ||
+            area.class10Name.includes(a.area.name)),
+      ) ??
+      tsW?.areas?.[0];
+    if (tsW && wArea) {
+      (tsW.timeDefines ?? []).forEach((td, i) => {
+        const date = td.slice(0, 10);
+        const wt = weeklyTemps.get(date) ?? {};
+        weekly.push({
+          date,
+          text: jmaWeatherText(wArea.weatherCodes?.[i]),
+          temp_max: wt.temp_max ?? null,
+          temp_min: wt.temp_min ?? null,
+          precip_prob: jmaNum(wArea.pops?.[i]),
+        });
+      });
+    }
+  }
+  if (detailed.size === 0 && weekly.length === 0) return null;
+  return {
+    officeName: area.officeName,
+    areaName: area.class10Name,
+    detailed,
+    weekly,
+  };
+}
+
+/** 気象庁の予報から、聞かれた日に使う分だけを date_label つきで返す。 */
+function selectJmaDays(jma, day) {
+  const todayIso = localTodayIso();
+  const toLabeled = (d) => ({
+    date_label: formatForecastDate(d.date, jmaDayDiff(d.date, todayIso)),
+    text: d.text,
+    temp_max: d.temp_max,
+    temp_min: d.temp_min,
+    precip_prob: d.precip_prob,
+  });
+  if (day === "week") {
+    return jma.weekly.length > 0
+      ? jma.weekly.map(toLabeled)
+      : [...jma.detailed.values()].map(toLabeled);
+  }
+  const offset = day === "today" ? 0 : day === "tomorrow" ? 1 : 2;
+  const target = new Date();
+  target.setDate(target.getDate() + offset);
+  const mm = String(target.getMonth() + 1).padStart(2, "0");
+  const dd = String(target.getDate()).padStart(2, "0");
+  const targetIso = `${target.getFullYear()}-${mm}-${dd}`;
+  const found =
+    jma.detailed.get(targetIso) ??
+    jma.weekly.find((d) => d.date === targetIso);
+  return found ? [toLabeled(found)] : [];
+}
+
+/**
+ * 天気を取る。予報は気象庁、現在の状況は Open-Meteo から取り、
+ * { ok, error, place_label, current_temp, current_text, days,
+ *   forecast_source, jma_area_label, source_url } を返す。
+ * 気象庁が取れない場合は Open-Meteo のみ（forecast_source は
+ * "open-meteo"）にフォールバックする。失敗は ok:false ＋理由で返し、
+ * 天気をでっち上げない。
+ */
+async function fetchWeather(place, defaultPlace, day) {
+  const empty = {
+    ok: false,
+    error: "",
+    place_label: "",
+    current_temp: null,
+    current_text: "",
+    days: [],
+    forecast_source: "open-meteo",
+    jma_area_label: "",
+    source_url: "https://open-meteo.com/",
+  };
+  const wanted = (place || "").trim() || (defaultPlace || "").trim();
+  const geo = await geocodePlace(wanted);
+  if (!geo) {
+    // Open-Meteo のジオコーディングで見つからなくても、気象庁の地域
+    // 階層（area.json）だけで市区町村→予報区が解決できれば、予報だけは
+    // 答える（現在の状況は Open-Meteo が必要なため出ない）。
+    let jmaOnly = null;
+    try {
+      jmaOnly = await fetchJmaForecast(wanted, null);
+    } catch {
+      jmaOnly = null;
+    }
+    if (jmaOnly) {
+      const days = selectJmaDays(jmaOnly, day);
+      if (days.length > 0) {
+        return {
+          ok: true,
+          error: "",
+          place_label: `${jmaOnly.officeName} ${wanted}`,
+          current_temp: null,
+          current_text: "",
+          days,
+          forecast_source: "jma",
+          jma_area_label: `${jmaOnly.officeName}・${jmaOnly.areaName}`,
+          source_url: JMA_FORECAST_PAGE,
+        };
+      }
+    }
+    return { ...empty, error: "place_not_found" };
+  }
+  const placeLabel = geo.admin1 ? `${geo.admin1} ${geo.name}` : geo.name;
+  const om = await fetchOpenMeteoWeather(geo, day);
+  let jma = null;
+  try {
+    jma = await fetchJmaForecast(wanted, geo);
+  } catch {
+    jma = null;
+  }
+  if (jma) {
+    const days = selectJmaDays(jma, day);
+    if (days.length > 0) {
+      return {
+        ok: true,
+        error: "",
+        place_label: placeLabel,
+        current_temp: om?.current_temp ?? null,
+        current_text: om?.current_text ?? "",
+        days,
+        forecast_source: "jma",
+        jma_area_label: `${jma.officeName}・${jma.areaName}`,
+        source_url: JMA_FORECAST_PAGE,
+      };
+    }
+  }
+  if (om) {
+    return {
+      ok: true,
+      error: "",
+      place_label: placeLabel,
+      current_temp: om.current_temp,
+      current_text: om.current_text,
+      days: om.days,
+      forecast_source: "open-meteo",
+      jma_area_label: "",
+      source_url: "https://open-meteo.com/",
+    };
+  }
+  return { ...empty, error: "fetch_failed" };
 }
 
 /** article の形（{title,url,lead,fields}）だけを返す。 */
@@ -3675,7 +4125,11 @@ const BADGES = {
     label: "Cube自身のこと（アプリ固定の情報）",
     className: "badge-self",
   },
-  weather: { label: "天気情報（Open-Meteo）", className: "badge-weather" },
+  weather: {
+    label: "天気情報（気象庁・Open-Meteo）",
+    className: "badge-weather",
+  },
+  "weather-om": { label: "天気情報（Open-Meteo）", className: "badge-weather" },
   model: {
     label: "Cubeの答え（ネットで確認済み）",
     className: "badge-model",
@@ -3951,7 +4405,8 @@ const App = {
   },
 
   /* 質問への回答の流れ：
-     0) 天気 → Open-Meteoの実データ 0.5) Cube自身の質問 → 固定情報
+     0) 天気 → 気象庁の予報＋Open-Meteoの現在の状況（実データ）
+     0.5) Cube自身の質問 → 固定情報
      1) 知識メモ帳 → 即答＋裏で再確認
      2) 計算 → 検算 3) モデル生成 → 対象記事の事実で照合 */
   async ask(rawQuestion) {
@@ -3980,10 +4435,12 @@ const App = {
       }
       this.setPhase("idle");
       if (w && w.ok) {
+        const fromJma = w.forecast_source === "jma";
+        const showCurrent = wq.day === "today" && w.current_temp !== null;
         const lines = [`${w.place_label}の天気`];
-        if (wq.day === "today" && w.current_temp !== null) {
+        if (showCurrent) {
           lines.push(
-            `現在: ${w.current_text ? `${w.current_text}、` : ""}気温 ${w.current_temp}°C`,
+            `現在${fromJma ? "（Open-Meteo）" : ""}: ${w.current_text ? `${w.current_text}、` : ""}気温 ${w.current_temp}°C`,
           );
         }
         for (const d of w.days) {
@@ -3992,18 +4449,30 @@ const App = {
             parts.push(`最高 ${d.temp_max}°C / 最低 ${d.temp_min}°C`);
           } else if (d.temp_max !== null) {
             parts.push(`最高 ${d.temp_max}°C`);
+          } else if (d.temp_min !== null) {
+            parts.push(`最低 ${d.temp_min}°C`);
           }
           if (d.precip_prob !== null) {
             parts.push(`降水確率 ${d.precip_prob}%`);
           }
           lines.push(`${d.date_label}: ${parts.join("、")}`);
         }
+        // 出典は分けて書く：予報は気象庁、現在の状況は Open-Meteo。
+        // 気象庁が取れず Open-Meteo だけのときは、その旨だけを書く。
+        const noteParts = [];
+        if (fromJma) {
+          noteParts.push(`予報：気象庁（${w.jma_area_label}）`);
+          if (showCurrent) noteParts.push("現在の状況：Open-Meteo");
+        }
+        noteParts.push(
+          "天気はその時点の予報です（変わる情報なので知識メモ帳には保存しません）",
+        );
         this.pushAssistant({
           text: lines.join("\n"),
-          badge: "weather",
-          sourceTitle: "Open-Meteo",
+          badge: fromJma ? "weather" : "weather-om",
+          sourceTitle: fromJma ? "予報：気象庁" : "Open-Meteo",
           sourceUrl: w.source_url,
-          note: "天気はその時点の予報です（変わる情報なので知識メモ帳には保存しません）。",
+          note: `${noteParts.join("。")}。`,
         });
       } else if (w && w.error === "place_not_found") {
         const asked = wq.place ?? this.weatherPlace;
@@ -4537,6 +5006,7 @@ if (typeof module !== "undefined" && module.exports) {
     cubeSelfAnswer, isTautologicalAnswer,
     isUsableEvidenceResult, resultAnchoredToQuestion, resultSupportsAnswer,
     modelAnswerFitsQuestion, answerClaimKind,
-    parseWeatherQuery, fetchWeather, normalizeQuestion,
+    parseWeatherQuery, fetchWeather, fetchJmaForecast, resolveJmaArea,
+    jmaWeatherText, normalizeQuestion,
   };
 }
