@@ -17,6 +17,10 @@
             <span id="model-status-text">モデル未配置</span>
           </span>
           <span id="model-note" class="model-note">回答は検索のみで行います</span>
+          <div class="model-switch" role="group" aria-label="モデルの切り替え">
+            <button type="button" class="model-switch-btn" data-model="v1" aria-pressed="true">Cube v1</button>
+            <button type="button" class="model-switch-btn" data-model="v2" aria-pressed="false">Cube v2</button>
+          </div>
           <nav class="tabs" aria-label="画面切り替え">
             <button type="button" class="tab-btn" data-tab="chat" aria-pressed="true">チャット</button>
             <button type="button" class="tab-btn" data-tab="notebook" aria-pressed="false">知識メモ帳<span id="nb-tab-count"></span></button>
@@ -32,7 +36,8 @@
             <div id="empty-state" class="empty">
               <p class="big">Cubeに質問してみよう</p>
               <p class="desc">
-                Cubeは、約3,177万パラメータの自作LLMです。
+                Cubeは自作LLMです（Cube v1：約3,177万パラメータ／
+                Cube v2：約5,995万パラメータ。ヘッダーで切り替えられます）。
                 答えには必ず「出どころ」のラベルがつきます。基本はCubeの
                 答えを主表示し、ネット検索は裏づけとして添えます。Cubeと
                 ネットで食い違ったら、ネットの事実を正として表示し、
@@ -105,7 +110,9 @@
               <h3><label for="base-url">モデルの重みベースURL</label></h3>
               <p class="desc">
                 manifest.json / bpe.json / weights-*.bin が置いてある場所を指定します。
-                この端末に保存され、次回から自動で読み込みます。
+                このURLは選択中のモデル（Cube v1 / Cube v2）ごとの上書きとして
+                この端末に保存され、次回から自動で読み込みます。ヘッダーでモデルを
+                切り替えると、そのモデルのURLに切り替わります。
               </p>
               <div class="url-row">
                 <input id="base-url" class="mono" type="url" />
@@ -178,8 +185,12 @@
               <h3>このAIについて</h3>
               <p class="desc">
                 このAIの名前はCubeです。
-                GPT方式Transformer（12層・幅448・語彙6,000の自作BPE、約3,177万パラメータ）を
-                ブラウザの中で直接動かしています。外部AIのAPIは使っていません。
+                GPT方式Transformerの自作LLMをブラウザの中で直接動かしています。
+                モデルは2つあり、ヘッダーで切り替えられます。Cube v1は
+                12層・幅448・語彙6,000の自作BPEで約3,177万パラメータ、
+                Cube v2は18層・幅512・語彙6,000の自作BPEで約5,995万
+                パラメータです（BPEはモデルごとに別物なので、必ず選択中の
+                モデルの場所から読み込みます）。外部AIのAPIは使っていません。
                 回答は表示前にウェブ検索と照合し、計算は検算します。
                 照合で「確認済み」になるのは、その質問の対象についての
                 日本語Wikipediaの1記事だけが裏づけたときだけです

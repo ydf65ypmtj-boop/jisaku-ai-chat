@@ -411,12 +411,81 @@ function pruneModelCache(db, basePrefix, keepPrefix) {
   });
 }
 
-/* モデル本体の薄いラッパ：状態表示つきで読み込み、質問文から生成する */
+/* ================================================================== */
+/* モデル定義（Cube v1 / v2 切り替え）                                 */
+/*                                                                    */
+/* v1 と v2 は語彙数こそ同じ 6000 だが BPE ファイルが別物でトークン   */
+/* IDに互換性がない。そのため BPE は必ず選択中モデルのベースパスから  */
+/* 読み込む（LocalModel.load はモデルのベースURL配下からしか取らない）。*/
+/* manifest の期待値はファイル取り違え防止の照合用で、エンジンを構築  */
+/* する前に total_params・層数・幅が一致しなければ読み込みエラーに    */
+/* する。重みの端末キャッシュ（IndexedDB）のキーはベースURLを含む    */
+/* ので、v1 と v2 の重みが混ざることはない。                          */
+/* ================================================================== */
+
+const MODEL_ID_KEY = "jisaku-ai-model-id";
+
+const MODELS = {
+  v1: {
+    id: "v1",
+    label: "Cube v1",
+    defaultBaseUrl: "https://ydf65ypmtj-boop.github.io/llm-chat/",
+    urlKey: "jisaku-ai-model-base-url",
+    maxNew: 48,
+    expect: { totalParams: 31774848, nLayer: 12, nEmbd: 448 },
+  },
+  v2: {
+    id: "v2",
+    label: "Cube v2",
+    defaultBaseUrl: "https://ydf65ypmtj-boop.github.io/llm-chat/v2/",
+    urlKey: "jisaku-ai-model-base-url-v2",
+    maxNew: 96,
+    expect: { totalParams: 59947008, nLayer: 18, nEmbd: 512 },
+  },
+};
+
+function modelDef(id) {
+  return MODELS[id] || MODELS.v1;
+}
+
+/**
+ * manifest が選択中モデルの期待値と一致するか検証する。
+ * 一致すれば null、一致しなければ理由の文字列を返す。
+ */
+function validateManifest(manifest, def) {
+  const cfg = manifest.config || {};
+  const problems = [];
+  if (manifest.total_params !== def.expect.totalParams) {
+    problems.push(`パラメータ数 ${manifest.total_params} ≠ 期待値 ${def.expect.totalParams}`);
+  }
+  if (cfg.n_layer !== def.expect.nLayer) {
+    problems.push(`層数 ${cfg.n_layer} ≠ 期待値 ${def.expect.nLayer}`);
+  }
+  if (cfg.n_embd !== def.expect.nEmbd) {
+    problems.push(`幅 ${cfg.n_embd} ≠ 期待値 ${def.expect.nEmbd}`);
+  }
+  if (problems.length === 0) return null;
+  return `${def.label} の重みではありません（${problems.join("、")}）。別のモデルのファイルが置かれている可能性があるため、読み込みを中止しました`;
+}
+
+/* モデル本体の薄いラッパ：状態表示つきで読み込み、質問文から生成する。
+   保持するエンジンはアクティブな1つだけ。読み込みを始めた時点で前の
+   エンジンは破棄するので、切り替え先の読み込みに失敗しても、前の
+   モデルが新しいモデルの名前で回答することは絶対にない。「回答可能」
+   の判定（readyFor）は、読み込み済みのモデルIDと選択中のIDが一致
+   するときだけ真になる。 */
 const LocalModel = {
   engine: null,
+  loadedId: null, // 読み込み済みエンジンのモデルID（未読み込みは null）
   paramCount: 0,
   get ready() { return this.engine !== null; },
-  async load(baseUrl, onProgress) {
+  readyFor(id) { return this.engine !== null && this.loadedId === id; },
+  async load(baseUrl, modelId, onProgress) {
+    const def = modelDef(modelId);
+    // 切り替え開始時点で前のエンジンは破棄する。
+    this.engine = null;
+    this.loadedId = null;
+    this.paramCount = 0;
     const base = baseUrl.replace(/\/?$/, "/");
     // manifest.json は常に取り直す（小さい）。その本文の指紋が重みの
     // 世代を決めるので、上げ直された重みを古いキャッシュで開くことはない。
@@ -426,6 +495,10 @@ const LocalModel = {
     }
     const manifestText = await manifestRes.text();
     const manifest = JSON.parse(manifestText);
+    // ファイル取り違え防止：エンジンを構築する前に、manifest が
+    // 選択中モデルの期待値と一致するか検証する。
+    const mismatch = validateManifest(manifest, def);
+    if (mismatch) throw new Error(mismatch);
 
     const cache = await openModelCache();
     const cachePrefix = `${base}|${manifestFingerprint(manifestText)}|`;
@@ -507,10 +580,13 @@ const LocalModel = {
       this.generate("テスト", 1);
     } catch (e) {
       this.engine = null;
+      this.loadedId = null;
       throw new Error(
         `試し生成に失敗しました: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
+    // ここまで来て初めて、このエンジンは選択中モデルのものになる。
+    this.loadedId = def.id;
     return this.engine;
   },
   /* 学習時のQA形式「質問：…\n答え：」で貪欲生成し、答えの文字列を返す */
@@ -4178,15 +4254,25 @@ const el = (id) => document.getElementById(id);
 const App = {
   phase: "idle", // idle | thinking | searching | saving
   modelStatus: { kind: "not_loaded" },
+  modelId: "v1", // 選択中のモデルID（localStorage に保存。初期値は v1）
+  modelBusy: false, // モデル読み込み中は切り替えボタンを無効化する
   baseUrl: DEFAULT_BASE_URL,
   weatherPlace: DEFAULT_WEATHER_PLACE,
   confirmMarkAll: false,
 
   init() {
     Notebook.load();
-    this.baseUrl = store.get(URL_KEY) || DEFAULT_BASE_URL;
+    // 選択中のモデルを復元する（初期値は v1）。ベースURLはモデルごとの
+    // 上書きとして読み込む（v1 は従来キー、v2 は専用キー）。
+    this.modelId = store.get(MODEL_ID_KEY) === "v2" ? "v2" : "v1";
+    const def = modelDef(this.modelId);
+    this.baseUrl = store.get(def.urlKey) || def.defaultBaseUrl;
     el("base-url").value = this.baseUrl;
     el("current-url").textContent = this.baseUrl;
+    for (const btn of document.querySelectorAll(".model-switch-btn")) {
+      btn.addEventListener("click", () => void this.switchModel(btn.dataset.model));
+    }
+    this.renderModelSwitch();
     this.weatherPlace = store.get(WEATHER_PLACE_KEY) || DEFAULT_WEATHER_PLACE;
     const wpInput = el("weather-place");
     if (wpInput) wpInput.value = this.weatherPlace;
@@ -4264,8 +4350,33 @@ const App = {
     if (name === "settings") this.renderSettings();
   },
 
+  /* 切り替えボタンの見た目：選択中のモデルを押し込み表示にし、
+     読み込み中は両方とも無効化する。 */
+  renderModelSwitch() {
+    for (const btn of document.querySelectorAll(".model-switch-btn")) {
+      btn.setAttribute("aria-pressed", String(btn.dataset.model === this.modelId));
+      btn.disabled = this.modelBusy;
+    }
+  },
+
+  /* モデルの切り替え：選択を保存し、そのモデルのベースURL（保存済みの
+     上書きがあればそれ、無ければ既定値）で読み込み直す。v2 は最初に
+     選択されたときにだけ読み込む（初期表示では先読みしない）。 */
+  async switchModel(id) {
+    if (!MODELS[id] || id === this.modelId || this.modelBusy) return;
+    this.modelId = id;
+    store.set(MODEL_ID_KEY, id);
+    const def = modelDef(id);
+    this.baseUrl = store.get(def.urlKey) || def.defaultBaseUrl;
+    el("base-url").value = this.baseUrl;
+    el("current-url").textContent = this.baseUrl;
+    this.renderModelSwitch();
+    await this.loadModel(this.baseUrl);
+  },
+
   setModelStatus(st) {
     this.modelStatus = st;
+    const label = modelDef(this.modelId).label;
     const box = el("model-status");
     const dot = box.querySelector(".dot");
     const text = el("model-status-text");
@@ -4274,10 +4385,10 @@ const App = {
     dot.className = "dot";
     if (st.kind === "not_loaded") text.textContent = "モデル未配置";
     if (st.kind === "loading") {
-      text.textContent = `読み込み中… ${formatBytes(st.loadedBytes)}${st.totalBytes > 0 ? ` / ${formatBytes(st.totalBytes)}` : ""}（${st.label}）`;
+      text.textContent = `${label} 読み込み中… ${formatBytes(st.loadedBytes)}${st.totalBytes > 0 ? ` / ${formatBytes(st.totalBytes)}` : ""}（${st.label}）`;
     }
     if (st.kind === "ready") {
-      text.textContent = `読み込み完了（パラメータ数 ${formatParams(st.paramCount)}）`;
+      text.textContent = `${label} 読み込み完了（パラメータ数 ${formatParams(st.paramCount)}）`;
     }
     if (st.kind === "error") text.textContent = `モデル未配置（${st.message}）`;
     el("model-note").hidden = st.kind === "ready" || st.kind === "loading";
@@ -4286,9 +4397,9 @@ const App = {
     if (s) {
       s.textContent = "状態: " + (
         st.kind === "ready"
-          ? `読み込み完了（パラメータ数 ${formatParams(st.paramCount)}）`
+          ? `${label} 読み込み完了（パラメータ数 ${formatParams(st.paramCount)}）`
           : st.kind === "loading"
-            ? "読み込み中…"
+            ? `${label} 読み込み中…`
             : st.kind === "error"
               ? `エラー: ${st.message}`
               : "モデル未配置"
@@ -4297,18 +4408,29 @@ const App = {
   },
 
   async loadModel(url) {
-    store.set(URL_KEY, url);
+    const def = modelDef(this.modelId);
+    // ベースURLの上書きは選択中モデルごとのキーに保存する
+    // （v1 は従来の jisaku-ai-model-base-url、v2 は専用キー）。
+    store.set(def.urlKey, url);
+    this.modelBusy = true;
+    this.renderModelSwitch();
     this.setModelStatus({ kind: "loading", loadedBytes: 0, totalBytes: 0, label: "manifest.json" });
     try {
-      await LocalModel.load(url, (loaded, total, label) => {
+      await LocalModel.load(url, def.id, (loaded, total, label) => {
         this.setModelStatus({ kind: "loading", loadedBytes: loaded, totalBytes: total, label });
       });
       this.setModelStatus({ kind: "ready", paramCount: LocalModel.paramCount });
     } catch (e) {
-      this.setModelStatus({
-        kind: "error",
-        message: e instanceof Error ? e.message : String(e),
-      });
+      let message = e instanceof Error ? e.message : String(e);
+      // v2 の重みがまだアップロードされていない場合の案内を添える
+      // （黙って v1 で回答することは絶対にしない）。
+      if (def.id === "v2" && message.includes("manifest.json")) {
+        message += "。Cube v2 の重みはまだ GitHub にアップロードされていない可能性があります。Cube v1 に戻すと今まで通り使えます";
+      }
+      this.setModelStatus({ kind: "error", message });
+    } finally {
+      this.modelBusy = false;
+      this.renderModelSwitch();
     }
   },
 
@@ -4415,7 +4537,10 @@ const App = {
     this.pushUser(question);
     el("question-input").value = "";
     this.syncSend();
-    const modelReady = LocalModel.ready;
+    // 「回答可能」は、読み込み済みのモデルIDと選択中のIDが一致する
+    // ときだけ真。切り替え先の読み込みに失敗した状態では、前のモデル
+    // のエンジンで（新しいモデルの名前で）回答することはない。
+    const modelReady = LocalModel.readyFor(this.modelId);
     const normalized = normalizeQuestion(question);
     // 今回の検索の失敗理由はここから集める（前の質問の理由を持ち越さない）。
     WikiNet.lastError = "";
@@ -4564,7 +4689,8 @@ const App = {
         this.setPhase("thinking");
         await new Promise((r) => setTimeout(r, 30)); // 「考え中…」を先に描く
         try {
-          const modelAns = LocalModel.generate(question);
+          // 検算経路のモデル生成にも、選択中モデルの生成上限を渡す。
+          const modelAns = LocalModel.generate(question, modelDef(this.modelId).maxNew);
           const modelNums = numbersIn(modelAns);
           if (
             modelAns &&
@@ -4621,7 +4747,9 @@ const App = {
       this.setPhase("thinking");
       await new Promise((r) => setTimeout(r, 30));
       try {
-        modelAnswer = LocalModel.generate(question);
+        // 通常の質問応答の生成にも、選択中モデルの生成上限
+        // （v1: 48 / v2: 96）を明示的に渡す。
+        modelAnswer = LocalModel.generate(question, modelDef(this.modelId).maxNew);
         if (!modelAnswer) modelIssue = "empty";
       } catch (e) {
         modelAnswer = "";
@@ -4998,6 +5126,7 @@ if (typeof document !== "undefined") {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     BPE, GPT, QTensor, buildEngine, LocalModel,
+    MODELS, modelDef, validateManifest,
     evalArithmetic, extractFact, classifyQuestion,
     resolveArticleSource, searchWikipedia, topicFromQuestion, kindSearchPhrase,
     canonicalTensorName, expectedTensors, modelAgreesWithFact,

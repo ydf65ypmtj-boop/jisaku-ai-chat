@@ -94,6 +94,30 @@ body {
 }
 .model-note { font-size: 12px; color: var(--dim); }
 
+/* モデル切り替え（セグメント型：選択中が押し込み表示になる） */
+.model-switch {
+  display: inline-flex;
+  gap: 2px;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  border-radius: 999px;
+  padding: 2px;
+}
+.model-switch-btn {
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.model-switch-btn[aria-pressed="true"] { background: var(--accent); color: var(--accent-text); }
+.model-switch-btn:disabled { opacity: 0.45; cursor: default; }
+
 .tabs { margin-left: auto; display: flex; gap: 4px; }
 .tab-btn {
   border: 0;
@@ -121,6 +145,12 @@ body {
 .chat-inner { max-width: 768px; margin: 0 auto; padding: 24px 16px; width: 100%; }
 
 .empty { padding: 40px 0; text-align: center; }
+/* 狭い画面ではヘッダーにモデル切り替えの行が増える分、余白を詰めて
+   提案ボタンが入力欄に隠れないようにする */
+@media (max-width: 480px) {
+  .empty { padding: 12px 0; }
+  .chat-inner { padding: 12px 16px; }
+}
 .empty .big { font-size: 16px; font-weight: 600; margin: 0; }
 .empty .desc {
   max-width: 448px; margin: 8px auto 0;
