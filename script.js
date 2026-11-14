@@ -824,6 +824,19 @@ const LocalModel = {
 /* generated_text（メッセージ配列）の最後の assistant メッセージ。    */
 /* pipeline は Ultra が選択中の間だけ保持し、他のモデルへ切り替えた   */
 /* ら破棄する（アクティブなエンジンは常に1つだけ）。                  */
+/*                                                                    */
+/* ダウンロード完了直後のブラウザ再読み込み対策：約1.2GBの本体が      */
+/* そろった直後は、ブラウザキャッシュへの保存コピーと WebGPU          */
+/* セッション構築が重なってメモリ使用量が跳ね上がり、メモリの少ない   */
+/* 端末（iPad 等）ではブラウザがタブごと再読み込みすることがある。     */
+/* このページ自体はリロードを一切呼ばないが、再読み込みされると        */
+/* App.init が保存済みの Ultra を自動で読み直すため、落ちる→再読み     */
+/* 込み→また落ちる、の繰り返しになってしまう。そこで読み込みの試行    */
+/* 回数を sessionStorage に印として残す（タブを閉じれば消える）。      */
+/* 1回落ちたら、次回はキャッシュ済みのファイルから再試行する          */
+/* （保存コピーの重なりが無く、ピークが低い）。2回続けて落ちたら       */
+/* 自動の再試行を止め、理由をエラー表示にする。ユーザーがモデルを      */
+/* 選び直したときだけ印を消し、最初から試せるようにする。             */
 /* ================================================================== */
 
 const TRANSFORMERS_ESM_URL =
@@ -839,11 +852,40 @@ const ULTRA_PARAM_COUNT = 1543714304;
 const ULTRA_SYSTEM_PROMPT =
   "あなたは親切なAIアシスタントです。質問には日本語で分かりやすく答えてください。";
 
+/* Ultra 読み込みの試行の印（sessionStorage）。値は "build"（1回目の
+   試行中）→ "build2"（落ちた後の再試行中）。読み込みが成功するか、
+   通常の例外で失敗したら消す。タブが落ちたときだけ印が残るので、
+   次にページが開いたときに「前回は途中でブラウザが再読み込みされた」
+   と分かる。sessionStorage はタブを閉じれば消えるので、端末に
+   残り続けることはない。 */
+const ULTRA_STAGE_KEY = "cube-ultra-load-stage";
+function readUltraStage() {
+  try {
+    return sessionStorage.getItem(ULTRA_STAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+function writeUltraStage(value) {
+  try {
+    if (value === null) sessionStorage.removeItem(ULTRA_STAGE_KEY);
+    else sessionStorage.setItem(ULTRA_STAGE_KEY, value);
+  } catch {
+    /* 印が残せなくても読み込み自体は続ける */
+  }
+}
+
 const UltraModel = {
   generator: null,
   generatorPromise: null,
+  /* 前回の試行が途中でブラウザの再読み込みに遭い、今回がその
+     再試行かどうか（表示の出し分けに使う）。 */
+  recoveredFromCrash: false,
   get ready() { return this.generator !== null; },
   readyFor(id) { return id === "ultra" && this.generator !== null; },
+  /* 前回の試行の印が残っているか（＝前回は読み込み完了前に
+     ブラウザが再読み込みされた）。 */
+  previousAttemptCrashed() { return readUltraStage() === "build"; },
   /**
    * FMA03/cube-ultra から pipeline を読み込む（dtype q4f16・device
    * webgpu）。progress_callback の進捗（ファイル名と、そのファイルの
@@ -851,11 +893,35 @@ const UltraModel = {
    * 初回は onnx/model_q4f16.onnx（約1.23GB）を含む約1.2GBの
    * ダウンロードがある。失敗（WebGPU非対応・通信エラー等）は例外に
    * して、呼び出し側の読み込みエラー表示に渡す。
+   * 読み込みの試行には sessionStorage の印（ULTRA_STAGE_KEY）を残し、
+   * 途中でブラウザが再読み込みされたら次回に検知する。再試行でも
+   * 落ちた場合は例外にして自動の再試行を止める（上のセクション
+   * コメント参照）。
    */
   async load(onProgress) {
     if (this.generator) return;
     if (!this.generatorPromise) {
       const self = this;
+      // 前回の試行の印を確認する。"build2" が残っているのは、
+      // 再試行でもう一度タブが落ちたということなので、自動の
+      // 再試行をここで止める（再読み込みの無限ループ防止）。
+      // ユーザーがモデルを選び直すと印は消え、また試せる。
+      const prevStage = readUltraStage();
+      if (prevStage === "build2") {
+        throw new Error(
+          "Cube Ultra の起動中にブラウザが繰り返し再読み込みされたため、自動の再試行を止めました。" +
+          "この端末ではメモリが足りず Ultra を起動できない可能性があります。" +
+          "他のタブやアプリを閉じるか、他のモデルをお使いください。" +
+          "他のモデルを選んでから Ultra を選び直すと、もう一度試せます",
+        );
+      }
+      // "build" が残っている＝前回は読み込みの途中でブラウザが
+      // 再読み込みされた。今回はキャッシュ済みのファイルから
+      // 読み直す再試行になる（ダウンロードと保存コピーが無い分、
+      // メモリのピークが低い）。
+      const isRetry = prevStage === "build";
+      this.recoveredFromCrash = isRetry;
+      writeUltraStage(isRetry ? "build2" : "build");
       this.generatorPromise = (async () => {
         const mod = await import(TRANSFORMERS_ESM_URL);
         const gen = await mod.pipeline("text-generation", ULTRA_REPO, {
@@ -870,11 +936,15 @@ const UltraModel = {
           },
         });
         self.generator = gen;
+        // 起動できたので印を消す。
+        writeUltraStage(null);
         return gen;
       })();
-      // 失敗した読み込みで次回の再試行まで塞がない。
+      // 失敗した読み込みで次回の再試行まで塞がない。通常の例外で
+      // 失敗したときも印を消す（印が残るのはタブが落ちたときだけ）。
       this.generatorPromise.catch(() => {
         this.generatorPromise = null;
+        writeUltraStage(null);
       });
     }
     await this.generatorPromise;
@@ -4838,6 +4908,11 @@ const App = {
      選択されたときにだけ読み込む（初期表示では先読みしない）。 */
   async switchModel(id) {
     if (!MODELS[id] || id === this.modelId || this.modelBusy) return;
+    // ユーザーが自分でモデルを選び直したときは、Ultra 読み込みの
+    // 試行の印を消す（起動中の再読み込みで自動再試行が止まって
+    // いても、選び直せば最初から試せるようにする）。起動時の
+    // 自動読み込み（init）はこの関数を通らないので印は残る。
+    writeUltraStage(null);
     this.modelId = id;
     store.set(MODEL_ID_KEY, id);
     const def = modelDef(id);
@@ -4910,7 +4985,9 @@ const App = {
         kind: "loading",
         loadedBytes: 0,
         totalBytes: 0,
-        label: "Cube Ultra（初回は約1.2GBのダウンロードがあります）",
+        label: UltraModel.previousAttemptCrashed()
+          ? "Cube Ultra（前回は起動の途中でブラウザが再読み込みされました。キャッシュから再試行しています）"
+          : "Cube Ultra（初回は約1.2GBのダウンロードがあります）",
       });
       try {
         await loadUltra((loaded, total, label) => {
