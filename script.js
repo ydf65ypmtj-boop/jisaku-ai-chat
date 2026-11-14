@@ -3681,6 +3681,39 @@ async function resolveArticleSource(q) {
 /* 出してはいけない。                                                  */
 /* ================================================================== */
 
+/* ------------------------------------------------------------------ */
+/* 天気取得の時間制限と並列化                                          */
+/*                                                                    */
+/* 以前はジオコーディング→Open-Meteo予報→気象庁area.json→気象庁予報   */
+/* の4リクエストを直列に、しかもタイムアウトなしで待っていたため、    */
+/* 遅い回線では回答まで10秒以上かかり、どれか1つの応答が止まると      */
+/* 「検索で確認中…」のまま返ってこなかった。対策として、すべての      */
+/* 天気リクエストに制限時間を付け、独立した取得は並列に走らせ、       */
+/* 場所の解決結果（座標は変わらない）はセッション内で覚える。         */
+/* ------------------------------------------------------------------ */
+
+const WEATHER_TIMEOUT_MS = 8000;
+
+/** 天気系のJSON取得。制限時間を過ぎたら諦めて null を返す（例外にしない）。 */
+async function fetchWeatherJson(url, timeoutMs = WEATHER_TIMEOUT_MS) {
+  const ctrl =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+  try {
+    const res = await fetch(url, ctrl ? { signal: ctrl.signal } : undefined);
+    if (!res || !res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** 解決できた場所（座標）はセッション内で覚え、2回目以降の天気質問では
+ *  ジオコーディング（実測で一番遅いリクエスト）を飛ばす。 */
+const geocodeCache = new Map();
+
 /**
  * Open-Meteoの無料ジオコーディングで場所を探す。日本語の入力は
  * 都道府県と市区町村がくっついている（「福島県郡山市」）ことが多く、
@@ -3694,6 +3727,8 @@ async function resolveArticleSource(q) {
  * 日本の結果だけを使う。失敗時は null。
  */
 async function geocodePlace(place) {
+  const cached = geocodeCache.get(place);
+  if (cached) return cached;
   const noPref = place.replace(/^.+?(?:都|道|府|県)/, "");
   const noCity = place.replace(/(?:市|区|町|村)$/, "");
   const bare = noPref.replace(/(?:市|区|町|村)$/, "");
@@ -3727,11 +3762,13 @@ async function geocodePlace(place) {
   let fallback = null;
   for (const v of variants) {
     try {
-      const res = await fetch(
+      const data = await fetchWeatherJson(
         `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(v)}&count=10&language=ja&format=json`,
       );
-      if (!res.ok) continue;
-      const data = await res.json();
+      // 通信自体が失敗・時間切れのときは、同じサーバーへの別の形の
+      // 試行も同じように失敗するだけなので、ここで打ち切る
+      // （結果が空だった場合は次の形を試す）。
+      if (!data) break;
       const list = (data.results ?? []).filter(
         (r) =>
           typeof r.latitude === "number" &&
@@ -3744,12 +3781,19 @@ async function geocodePlace(place) {
         list[0],
       );
       if (!fallback || popOf(best) > popOf(fallback)) fallback = best;
-      if (popOf(best) >= 100000) return toGeo(best, v);
+      if (popOf(best) >= 100000) {
+        const g = toGeo(best, v);
+        geocodeCache.set(place, g);
+        return g;
+      }
     } catch {
       /* 次の形を試す */
     }
   }
-  return fallback ? toGeo(fallback, place) : null;
+  if (!fallback) return null;
+  const g = toGeo(fallback, place);
+  geocodeCache.set(place, g);
+  return g;
 }
 
 /** WMO天気コード（Open-Meteo）→ 平易な日本語。 */
@@ -3816,9 +3860,10 @@ async function fetchOpenMeteoWeather(geo, day) {
       timezone: "auto",
       forecast_days: "7",
     });
-    const res = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`);
-    if (!res.ok) return null;
-    const data = await res.json();
+    const data = await fetchWeatherJson(
+      `https://api.open-meteo.com/v1/forecast?${params}`,
+    );
+    if (!data) return null;
     const daily = data.daily;
     const times = daily?.time ?? [];
     if (times.length === 0) return null;
@@ -3875,9 +3920,9 @@ let jmaAreasPromise = null;
 function loadJmaAreas() {
   if (!jmaAreasPromise) {
     jmaAreasPromise = (async () => {
-      const res = await fetch(JMA_AREA_URL);
-      if (!res.ok) throw new Error(`area.json HTTP ${res.status}`);
-      return await res.json();
+      const data = await fetchWeatherJson(JMA_AREA_URL, 12000);
+      if (!data) throw new Error("area.json を取得できませんでした");
+      return data;
     })().catch((e) => {
       jmaAreasPromise = null;
       throw e;
@@ -4082,14 +4127,10 @@ function localTodayIso() {
 async function fetchJmaForecast(place, geo) {
   const area = await resolveJmaArea(place, geo);
   if (!area) return null;
-  let data;
-  try {
-    const res = await fetch(`${JMA_FORECAST_BASE}${area.officeCode}.json`);
-    if (!res.ok) return null;
-    data = await res.json();
-  } catch {
-    return null;
-  }
+  const data = await fetchWeatherJson(
+    `${JMA_FORECAST_BASE}${area.officeCode}.json`,
+  );
+  if (!data) return null;
   if (!Array.isArray(data) || data.length === 0) return null;
   // 気温地点の名前候補：市区町村名から接尾（市など）を外した形を優先する
   // （例：郡山市→「郡山」、仙台市→「仙台」）。
@@ -4268,6 +4309,9 @@ async function fetchWeather(place, defaultPlace, day) {
     source_url: "https://open-meteo.com/",
   };
   const wanted = (place || "").trim() || (defaultPlace || "").trim();
+  // 気象庁の地域階層（area.json、約260KBで一番大きい）は、場所探しと
+  // 並行して先に読み始める（読み込み結果はセッション内で共有される）。
+  loadJmaAreas().catch(() => {});
   const geo = await geocodePlace(wanted);
   if (!geo) {
     // Open-Meteo のジオコーディングで見つからなくても、気象庁の地域
@@ -4301,13 +4345,12 @@ async function fetchWeather(place, defaultPlace, day) {
     geo.admin1 && geo.admin1 !== geo.name
       ? `${geo.admin1} ${geo.name}`
       : geo.name;
-  const om = await fetchOpenMeteoWeather(geo, day);
-  let jma = null;
-  try {
-    jma = await fetchJmaForecast(wanted, geo);
-  } catch {
-    jma = null;
-  }
+  // Open-Meteo の予報と気象庁の予報は互いに独立なので並列に取る
+  // （以前は直列で、両方の待ち時間がそのまま積み上がっていた）。
+  const [om, jma] = await Promise.all([
+    fetchOpenMeteoWeather(geo, day),
+    fetchJmaForecast(wanted, geo).catch(() => null),
+  ]);
   if (jma) {
     // 人口情報のない弱いジオコーディング（同名の小さい地名など）と
     // 気象庁の解決した都道府県が食い違うときは、混ぜて答えず
