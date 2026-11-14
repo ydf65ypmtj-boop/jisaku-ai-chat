@@ -3,8 +3,8 @@
  * Cube（GitHub Pages版） script.js
  *
  * 全部ブラウザの中で動く版：
- * - 自作LLMの推論エンジン（Cube Nano / Flash は int8量子化、Cube Twin は
- *   グループ単位 int4量子化。KVキャッシュ付き。Python版とNodeで
+ * - 自作LLMの推論エンジン（Cube Nano / Flash は int8量子化、Cube Twin /
+ *   Cube Pro はグループ単位 int4量子化。KVキャッシュ付き。Python版とNodeで
  *   10問全一致を検証済みのエンジンと同一計算）
  * - Cube Ultra は自作エンジンではなく、Hugging Face（FMA03/cube-ultra）
  *   のモデルを @huggingface/transformers（WebGPU）で動かす。ライブラリと
@@ -113,7 +113,7 @@ function fp16ToFloat32(h) {
   return sign * 2 ** (exp - 15) * (1 + frac / 1024);
 }
 
-// ---------- int4 量子化テンソル（Cube Twin） ----------
+// ---------- int4 量子化テンソル（Cube Twin / Pro） ----------
 /**
  * グループ単位 int4 の2次元重み。packed はダウンロードしたシャードへの
  * ビューのまま保持し、fp32 へは絶対に展開しない（233Mパラメータを
@@ -390,7 +390,7 @@ function buildEngine(manifest, bpeJson, fileBuffers) {
       tensors[canonicalTensorName(t.name)] = new QTensor(bytes, t.scale, t.shape);
     }
   } else {
-    // int4形式（Cube Twin）：2次元重みはニブル詰めのまま保持し、
+    // int4形式（Cube Twin / Pro）：2次元重みはニブル詰めのまま保持し、
     // 1次元テンソルは raw.bin の fp32 をそのまま使う。
     if (!manifest.scales_file || !manifest.raw_file) {
       throw new Error("int4形式の manifest に scales_file / raw_file がありません");
@@ -569,10 +569,11 @@ function pruneModelCache(db, basePrefix, keepPrefix) {
 }
 
 /* ================================================================== */
-/* モデル定義（Cube Nano / Flash / Twin / Ultra 切り替え）             */
+/* モデル定義（Cube Nano / Flash / Twin / Pro / Ultra 切り替え）      */
 /*                                                                    */
 /* Nano と Flash と Twin は語彙数こそ同じ 6000 だが BPE ファイルが    */
-/* 別物でトークンIDに互換性がない。そのため BPE は必ず選択中モデル   */
+/* 別物でトークンIDに互換性がない。Pro の BPE は語彙32,000（bpe_v3）  */
+/* で、他の自作モデルとは互換性がない。そのため BPE は必ず選択中モデル   */
 /* のベースパスから読み込む（LocalModel.load はモデルのベースURL配下  */
 /* からしか取らない）。manifest の期待値はファイル取り違え防止の照合  */
 /* 用で、エンジンを構築する前に total_params・層数・幅が一致しなけ   */
@@ -619,6 +620,22 @@ const MODELS = {
     urlKey: "jisaku-ai-model-base-url-twin",
     maxNew: 96,
     expect: { totalParams: 233140224, nLayer: 18, nEmbd: 1024 },
+  },
+  // Cube Pro：v3モデル（約2億9,781万パラメータ、21層・幅1024、
+  // 語彙32,000のBPE）の蒸留第3弾（r3。全ゲート合格で公開）。
+  // Twin とまったく同じグループ単位 int4 形式（グループ128、
+  // lm_head は tok_emb と tied）で書き出したものなので、読み込み
+  // 経路は Twin と同一で、違うのはベースURL・manifest の照合値・
+  // 生成上限だけ。生成設定は v3 の評価時と同一（greedy、最大48
+  // トークン）。ホスト上の大きさは約156MB。
+  pro: {
+    id: "pro",
+    label: "Cube Pro",
+    engine: "local",
+    defaultBaseUrl: "https://ydf65ypmtj-boop.github.io/llm-chat/pro/",
+    urlKey: "jisaku-ai-model-base-url-pro",
+    maxNew: 48,
+    expect: { totalParams: 297815040, nLayer: 21, nEmbd: 1024 },
   },
   // Cube Ultra：Qwen2.5-1.5B に LoRA を統合したモデルを Hugging Face
   // （FMA03/cube-ultra）で公開したもの。自作エンジンではなく
@@ -2845,6 +2862,1738 @@ function parseWeatherQuery(q) {
 }
 
 /* ================================================================== */
+/* ブラウザ内Wikipedia索引（検索レーン：索引優先・ウェブ予備）         */
+/*                                                                    */
+/* 全記事の索引を Hugging Face から Range 取得で引く検索エンジン       */
+/* （BrowserSearch）と、その転送＋アダプタ（CubeIndexLane）をこの節に  */
+/* 取り込む。Wikipedia 情報の取得元だけを「索引優先・ウェブ予備」に    */
+/* 切り替えるためのもので、回答ポリシーは一切変えない。索引で成功      */
+/* したら WikiNet.via は "index" になる（ディスパッチャ側で記録）。    */
+/* 自作モデル用の推論エンジンとは別物で、公開名は BrowserSearch /      */
+/* CubeIndexLane のみ。                                               */
+/* ================================================================== */
+
+"use strict";
+/* Browser/Node search engine replicating hybrid/search.py (INDEX_FIX2
+ * final, md5 64fb744c3066ecf62887986420fc543c) over the format-2
+ * Range-fetch shards in this directory (see ../BROWSER_INDEX_FULL.md).
+ *
+ * The ranking pipeline (title lanes -> FTS pool -> evidence lanes ->
+ * best-paragraph re-rank) is a line-by-line port of search.py. The one
+ * deliberate approximation is the FTS5 bm25 pool: postings are
+ * doc-level, so per-term candidates are gathered by trigram
+ * intersection, verified against the fetched title/lead text, and
+ * scored with the Okapi bm25 formula (k1=1.2, b=0.75, column weights
+ * 10/1, per-source avgdl from meta.json). search.py only uses bm25 to
+ * *select* its pools (LIMIT 12/20/30/100 per source); final order is
+ * the deterministic paragraph re-rank, which is ported exactly.
+ *
+ * String indexing follows Python (code points) where search.py slices
+ * leads/bodies; a few hot paths use UTF-16 code units, which coincide
+ * for BMP text (virtually all of jawiki).
+ *
+ * Transport is pluggable: any object with
+ *   range(file, a, b) -> Promise<Uint8Array>   (b inclusive)
+ *   whole(file)       -> Promise<Uint8Array>
+ * where `file` is a shard name for index files, or a body file name
+ * (wiki_full.txt / supplement_corpus.txt) for article bodies.
+ */
+(function (global) {
+  /* Cube integration copy: fetch loops parallelized with bounded
+   * concurrency (indexed mapLimit, insertion order preserved) and bulk
+   * record priming with coalesced Range fetches. Ranking logic is
+   * byte-identical to the master engine; only IO scheduling changed. */
+  async function mapLimit(items, limit, fn) {
+    const out = new Array(items.length);
+    let next = 0;
+    const n = Math.min(limit, items.length);
+    const workers = [];
+    for (let w = 0; w < n; w++) {
+      workers.push((async () => {
+        while (next < items.length) {
+          const i = next++;
+          out[i] = await fn(items[i], i);
+        }
+      })());
+    }
+    await Promise.all(workers);
+    return out;
+  }
+  const te = new TextEncoder();
+  const td = new TextDecoder("utf-8"); // non-fatal ~= errors="replace"
+
+  // ------------------------------------------------------------ helpers
+  const cps = (s) => [...s];
+  const cpLen = (s) => [...s].length;
+  const cpSlice = (s, a, b) => [...s].slice(a, b).join("");
+  const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  function cmpBytes(a, b) {
+    const n = Math.min(a.length, b.length);
+    for (let i = 0; i < n; i++) {
+      if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+    }
+    return a.length === b.length ? 0 : (a.length < b.length ? -1 : 1);
+  }
+  function readVarint(buf, pos) {
+    let val = 0, shift = 0;
+    while (pos < buf.length) {
+      const b = buf[pos++];
+      val += (b & 0x7f) * Math.pow(2, shift);
+      if (!(b & 0x80)) break;
+      shift += 7;
+    }
+    return [val, pos];
+  }
+  function countOverlap(s, sub) {
+    if (!sub) return 0;
+    let n = 0, i = 0;
+    while ((i = s.indexOf(sub, i)) >= 0) { n++; i += 1; }
+    return n;
+  }
+  function countNonOverlap(s, sub) {
+    if (!sub) return 0;
+    let n = 0, i = 0;
+    while ((i = s.indexOf(sub, i)) >= 0) { n++; i += sub.length; }
+    return n;
+  }
+  function trigramsOf(s) {
+    const a = cps(s), out = [];
+    for (let i = 0; i + 3 <= a.length; i++) out.push(a.slice(i, i + 3).join(""));
+    return out;
+  }
+
+  // --------------------------------------- search.py constants (verbatim)
+  const STOP_SPLIT = /[はがをにのへとやもだですますか？?、。・\s「」『』（）()]+/;
+  const SYNONYMS = { "作者": ["作者", "著者"], "高さ": ["高さ", "標高"] };
+  const KANA_MAP = { "ヰ": "ウィ", "ヱ": "エ", "ヲ": "オ", "ヶ": "ケ",
+                     "ヵ": "カ", "ヂ": "ジ", "ヅ": "ズ" };
+  const VOICED = { "か": "が", "き": "ぎ", "く": "ぐ", "け": "げ", "こ": "ご",
+    "さ": "ざ", "し": "じ", "す": "ず", "せ": "ぜ", "そ": "ぞ",
+    "た": "だ", "ち": "ぢ", "つ": "づ", "て": "で", "と": "ど",
+    "は": "ば", "ひ": "び", "ふ": "ぶ", "へ": "べ", "ほ": "ぼ",
+    "カ": "ガ", "キ": "ギ", "ク": "グ", "ケ": "ゲ", "コ": "ゴ",
+    "サ": "ザ", "シ": "ジ", "ス": "ズ", "セ": "ゼ", "ソ": "ゾ",
+    "タ": "ダ", "チ": "ヂ", "ツ": "ヅ", "テ": "デ", "ト": "ド",
+    "ハ": "バ", "ヒ": "ビ", "フ": "ブ", "ヘ": "ベ", "ホ": "ボ" };
+  const WORD_VARIANTS = { "珈琲": "コーヒー" };
+  const CHAR_SWAPS = [["冨", "富"]];
+  const GENERIC_TITLES = new Set(["高さ", "標高", "面積", "人口", "全長",
+    "長さ", "深さ", "水深", "速さ", "速度", "名前", "名称", "国歌",
+    "競技", "世界遺産", "都道府県", "監督", "化学式", "世界", "砂漠",
+    "日本人", "首都"]);
+  const NEVER_TITLES = new Set(["どこ", "誰", "何"]);
+  const SCOPE_TITLES = new Set(["日本", "世界", "地球", "太陽系", "国内",
+    "太陽"]);
+  const FTS_JUNK = ["ですか", "ますか", "ください", "教えて", "でしょう",
+    "は何", "の名前", "ありますか"];
+  const FTS_STOP = new Set(["起きた", "始まった", "終わった", "あります",
+    "います", "された", "なった", "アメリカ", "イギリス", "フランス",
+    "ドイツ", "イタリア", "スペイン", "中国", "韓国", "ロシア",
+    "カナダ", "オーストラリア"]);
+  const SUBSTRING_STOP = new Set(["メートル", "キロメートル",
+    "センチメートル", "ミリメートル", "キログラム", "グラム", "キロ",
+    "メー", "リットル", "トン", "カロリー"]);
+  const SUPER_RE = /一番|最も|最大|最小|最高|最古|最新|最初|世界一|日本一|第[0-9一二三四五六七八九十]+位|[0-9一二三四五六七八九十]+番目/;
+  const SUPER_FRAGMENT_RE = /^(世界|日本|地球|国内|太陽系|全)?(最大|最小|最高|最低|最古|最新|最長|最短|最速|最深|世界一|日本一|一番|最も|最初|最後)$/;
+  const ORDINAL_RE = /([0-9]+|[一二三四五六七八九十]+)番目|第([0-9]+|[一二三四五六七八九十]+)位/;
+  const KANJI_NUM = { "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                      "六": 6, "七": 7, "八": 8, "九": 9, "十": 10 };
+  const ATTR_SYNONYMS = [
+    [["高い", "高さ"], ["標高", "高い", "最高峰", "高峰", "高さ"], "高い"],
+    [["大きい", "大きな", "広い"], ["面積", "大きい", "最大", "広い"], "大きい"],
+    [["長い", "最長"], ["全長", "長い", "最長"], "長い"],
+    [["深い", "最深"], ["水深", "深い", "最深"], "深い"],
+    [["近い"], ["近い", "最も近い"], "近い"],
+    [["遠い"], ["遠い", "最も遠い"], "遠い"],
+    [["古い", "最古"], ["最古", "古い"], "古い"],
+    [["多い"], ["多い", "最大"], "多い"],
+    [["重い"], ["質量", "重い", "最大"], "重い"],
+    [["速い", "早い"], ["速さ", "速度", "速い"], "速い"],
+    [["新しい"], ["新しい", "最新"], "新しい"],
+    [["強い"], ["強い", "最強"], "強い"],
+  ];
+  const CATEGORY_SUFFIX = {
+    "山": ["山", "岳", "峰"], "湖": ["湖", "沼", "池"],
+    "川": ["川", "河"], "砂漠": ["砂漠"], "城": ["城"],
+    "寺": ["寺"], "橋": ["橋"], "島": ["島"], "滝": ["滝"],
+    "海": ["海"], "渓谷": ["渓谷"], "半島": ["半島"],
+  };
+  const CREATOR_RE = /作者|著者|原作者|描いた|描き|監督|作曲|作詞/;
+  const ATTRIBUTION_RE = /『[^』]+』(（[^）]*）)?は、[^。]{0,60}?(による|の)(短編小説|長編小説|中編小説|小説|漫画|絵画|戯曲|詩集|楽曲)/;
+  const SUPER_WORD_RE = /最も|一番|最大|最高|最古|最長|最小|最高峰|世界一|日本一|最初|第一/;
+  const STEM_FAMILY = { "最古": "古", "最大": "大", "最高": "高",
+    "最高峰": "高", "最長": "長", "最深": "深", "最速": "速",
+    "最新": "新", "最初": "初", "第一": "位", "最小": "小" };
+  const ATTR_FAMILY = { "高い": "高", "大きい": "大", "長い": "長",
+    "深い": "深", "古い": "古", "速い": "速", "新しい": "新" };
+  const ADJ_SET = new Set(["高い", "大きい", "長い", "深い", "近い",
+    "遠い", "古い", "多い", "重い", "速い", "新しい", "強い"]);
+  const CLAIM_SCOPES = { "世界": ["世界", "地球"], "地球": ["地球", "世界"],
+    "日本": ["日本", "世界", "地球"], "太陽": ["太陽", "太陽系"],
+    "太陽系": ["太陽系"] };
+
+  // ------------------------------------- search.py pure functions (port)
+  function normalizeTerm(s) {
+    const out = [];
+    for (const ch of s) {
+      if (ch === "ゝ" || ch === "ヽ") out.push(out.length ? out[out.length - 1] : ch);
+      else if (ch === "ゞ" || ch === "ヾ") {
+        const prev = out.length ? out[out.length - 1] : ch;
+        out.push(VOICED[prev] || prev);
+      } else out.push(KANA_MAP[ch] || ch);
+    }
+    return out.join("");
+  }
+  function oldIterationForms(s) {
+    const a = cps(s), forms = [];
+    for (let i = 1; i < a.length; i++) {
+      if (a[i] === a[i - 1] && "ぁ" <= a[i] && a[i] <= "ゖ") {
+        forms.push(a.slice(0, i).join("") + "ゝ" + a.slice(i + 1).join(""));
+      }
+    }
+    return forms;
+  }
+  function termVariants(t) {
+    let vs = [t];
+    const n = normalizeTerm(t);
+    if (n !== t) vs.push(n);
+    const w = WORD_VARIANTS[t] || WORD_VARIANTS[n];
+    if (w && !vs.includes(w)) vs.push(w);
+    for (const base of [...vs]) {
+      if (base.includes("ヰ")) vs.push(base.split("ヰ").join("ウイ"));
+    }
+    for (const f of oldIterationForms(n)) if (!vs.includes(f)) vs.push(f);
+    for (const [a, b] of CHAR_SWAPS) {
+      for (const base of [...vs]) {
+        if (base.includes(a)) vs.push(base.split(a).join(b));
+        if (base.includes(b)) vs.push(base.split(b).join(a));
+      }
+    }
+    return [...new Set(vs)].slice(0, 6);
+  }
+  function splitParts(q, minlen) {
+    return q.split(STOP_SPLIT).filter((p) => cpLen(p) >= minlen);
+  }
+  function paraKeys(q) {
+    let keys = [];
+    for (const k of splitParts(q, 2)) {
+      for (const v of termVariants(k)) keys = keys.concat(SYNONYMS[v] || [v]);
+    }
+    return [...new Set(keys)];
+  }
+  function bestParagraph(body, keys) {
+    const paras = body.split("\n").map((p) => p.trim()).filter((p) => p);
+    if (!paras.length) return [body.slice(0, 300), 0, 0];
+    const score = (p) => keys.reduce((n, k) => n + (p.includes(k) ? 1 : 0), 0);
+    let best = paras[0], bs = score(best);
+    for (const p of paras) {
+      const s = score(p);
+      if (s > bs) { best = p; bs = s; }
+    }
+    const s = bs;
+    const occ = Math.min(keys.reduce((n, k) => n + countNonOverlap(best, k), 0), 9);
+    if (cpLen(best) > 420) {
+      const present = keys.filter((k) => best.includes(k));
+      let anchor = null, aKey = null;
+      for (const k of present) {
+        const cand = [countNonOverlap(best, k), best.indexOf(k)];
+        if (aKey === null || cand[0] < aKey[0] ||
+            (cand[0] === aKey[0] && cand[1] < aKey[1])) {
+          aKey = cand; anchor = k;
+        }
+      }
+      const pos = anchor ? best.indexOf(anchor) : 0;
+      const st = best.slice(0, pos).lastIndexOf("。") + 1;
+      best = cpSlice(best, st, st + 420);
+    }
+    return [best, s, occ];
+  }
+  function ordinalOf(q) {
+    const m = q.match(ORDINAL_RE);
+    if (!m) return null;
+    const s = m[1] !== undefined ? m[1] : m[2];
+    if (s === undefined || s === null) return null;
+    if (/^[0-9]+$/.test(s)) return parseInt(s, 10);
+    return KANJI_NUM[s] !== undefined ? KANJI_NUM[s] : null;
+  }
+  function scopeOf(q) {
+    for (const w of ["太陽系", "世界", "日本", "地球", "国内", "太陽"]) {
+      if (q.includes(w)) return w === "国内" ? "日本" : w;
+    }
+    return null;
+  }
+  function attrOf(q) {
+    for (const [words, syns, base] of ATTR_SYNONYMS) {
+      if (words.some((w) => q.includes(w))) return [syns, base];
+    }
+    return [[], null];
+  }
+  function categoryOf(q) {
+    for (const cat of Object.keys(CATEGORY_SUFFIX)) {
+      if (q.includes(cat)) return cat;
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------- engine
+  const MAX_POSTING_BYTES = 1 << 20; // per-trigram fetch cap
+  const FTS_FETCH_CAP = 600;         // leads scored per (term, source)
+
+  class SearchEngine {
+    /** transport: {range(file,a,b), whole(file)}.
+     * opts: {bodyFiles:[f0,f1]} overrides meta body file names
+     * (transport resolves them). */
+    constructor(transport, opts = {}) {
+      this.tr = transport;
+      this.opts = opts;
+      this.meta = null;
+      this.titleIdx = null;   // [{key, off, firstId, firstLeadOff}]
+      this.triSuper = null;   // [{key, off}]
+      this.titleTriSuper = null;
+      this.redirIdx = null;   // [{key, off}]
+      this.claims = null;     // [[gid, scope], ...]
+      this.categories = null; // {cat: [gid, ...]}
+      this._blocks = new Map();   // file@off -> Uint8Array
+      this._leads = new Map();    // gid -> {title, lead}
+      this._idRecs = new Map();   // gid -> rec|null
+      this._termCache = new Map(); // src|term -> Map(gid -> score)
+      this.stats = { requests: 0, bytes: 0 };
+    }
+
+    async _range(file, a, b) {
+      const buf = await this.tr.range(file, a, b);
+      this.stats.requests += 1; this.stats.bytes += buf.length;
+      return buf;
+    }
+    async _whole(file) {
+      const buf = await this.tr.whole(file);
+      this.stats.requests += 1; this.stats.bytes += buf.length;
+      return buf;
+    }
+    async _block(file, off, size) {
+      const key = file + "@" + off;
+      const hit = this._blocks.get(key);
+      if (hit) return hit;
+      const buf = await this._range(file, off, off + size - 1);
+      if (this._blocks.size > 256) this._blocks.clear();
+      this._blocks.set(key, buf);
+      return buf;
+    }
+
+    async init() {
+      if (this.meta) return this;
+      this.meta = JSON.parse(td.decode(await this._whole("meta.json")));
+      const parseIdx = (buf, withIds) => {
+        const dv = new DataView(buf.buffer, buf.byteOffset);
+        const out = [];
+        let p = 0;
+        while (p < buf.length) {
+          const kl = dv.getUint16(p, true); p += 2;
+          const key = buf.slice(p, p + kl); p += kl;
+          const off = Number(dv.getBigUint64(p, true)); p += 8;
+          if (withIds) {
+            const firstId = dv.getUint32(p, true); p += 4;
+            const firstLeadOff = Number(dv.getBigUint64(p, true)); p += 8;
+            out.push({ key, off, firstId, firstLeadOff });
+          } else out.push({ key, off });
+        }
+        return out;
+      };
+      const parseSuper = (buf) => {
+        const dv = new DataView(buf.buffer, buf.byteOffset);
+        const out = [];
+        let p = 0;
+        while (p < buf.length) {
+          const kl = buf[p++];
+          const key = buf.slice(p, p + kl); p += kl;
+          const off = Number(dv.getBigUint64(p, true)); p += 8;
+          out.push({ key, off });
+        }
+        return out;
+      };
+      this.titleIdx = parseIdx(await this._whole("titles.idx"), true);
+      this.triSuper = parseSuper(await this._whole("tri_super.idx"));
+      this.titleTriSuper = parseSuper(await this._whole("title_tri_super.idx"));
+      this.redirIdx = parseIdx(await this._whole("redir.idx"), false);
+      this.claims = JSON.parse(td.decode(await this._whole("claims.json")));
+      this.categories = JSON.parse(td.decode(await this._whole("categories.json")));
+      return this;
+    }
+
+    _findBlock(idx, targetBytes) {
+      let lo = 0, hi = idx.length - 1, ans = 0;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (cmpBytes(idx[mid].key, targetBytes) <= 0) { ans = mid; lo = mid + 1; }
+        else hi = mid - 1;
+      }
+      return ans;
+    }
+    _blockEnd(idx, i, fileSize) {
+      return i + 1 < idx.length ? idx[i + 1].off : fileSize;
+    }
+    _scanTitleBlock(buf, firstLeadOff) {
+      const dv = new DataView(buf.buffer, buf.byteOffset);
+      const out = [];
+      let p = 0, leadOff = firstLeadOff;
+      while (p < buf.length) {
+        const tl = dv.getUint16(p, true); p += 2;
+        if (p + tl > buf.length) break;
+        const title = td.decode(buf.slice(p, p + tl)); p += tl;
+        let id, bodyOff, bodyLen, leadDelta, leadLen;
+        [id, p] = readVarint(buf, p);
+        [bodyOff, p] = readVarint(buf, p);
+        [bodyLen, p] = readVarint(buf, p);
+        [leadDelta, p] = readVarint(buf, p);
+        [leadLen, p] = readVarint(buf, p);
+        const bodyId = buf[p++];
+        leadOff += leadDelta;
+        out.push({ title, id, src: bodyId, bodyOff, bodyLen, bodyId,
+                   leadOff, leadLen });
+      }
+      return out;
+    }
+    /** All title records whose title bytes lie in [loB, hiB). */
+    async _titleRange(loB, hiB) {
+      await this.init();
+      const size = this.meta.files["titles.bin"];
+      let bi = this._findBlock(this.titleIdx, loB);
+      const startBi = bi;
+      const out = [];
+      for (; bi < this.titleIdx.length; bi++) {
+        const blk = this.titleIdx[bi];
+        if (bi > startBi && cmpBytes(blk.key, hiB) >= 0) break;
+        const end = this._blockEnd(this.titleIdx, bi, size);
+        const buf = await this._block("titles.bin", blk.off, end - blk.off);
+        const recs = this._scanTitleBlock(buf, blk.firstLeadOff);
+        if (!recs.length) break;
+        let blockMax = null;
+        for (const r of recs) {
+          const kb = te.encode(r.title);
+          blockMax = kb;
+          if (cmpBytes(kb, loB) >= 0 && cmpBytes(kb, hiB) < 0) out.push(r);
+        }
+        if (blockMax && cmpBytes(blockMax, hiB) >= 0) break;
+      }
+      return out;
+    }
+    /** search.py exact_all: title == t, first 2 per source. */
+    async exactAll(title) {
+      const tb = te.encode(title);
+      const hi = new Uint8Array(tb.length + 1); // tb + 0x00: strict bound
+      hi.set(tb);
+      const rows = await this._titleRange(tb, hi);
+      const per = { 0: 0, 1: 0 };
+      const out = [];
+      for (const r of rows) {
+        if (r.title !== title) continue;
+        if (per[r.src] >= 2) continue;
+        per[r.src]++; out.push(r);
+      }
+      return out;
+    }
+    /** search.py variant_all: 'title (...)' ranges, LIMIT 6 per source
+     * per range. */
+    async variantAll(title) {
+      const out = [];
+      for (const [loS, hiS] of [[title + " (", title + " )"],
+                                [title + "（", title + "）"]]) {
+        const rows = await this._titleRange(te.encode(loS), te.encode(hiS));
+        const per = { 0: 0, 1: 0 };
+        for (const r of rows) {
+          if (per[r.src] >= 6) continue;
+          per[r.src]++; out.push(r);
+        }
+      }
+      return out;
+    }
+    async titleRows(title) {
+      return (await this.exactAll(title)).concat(await this.variantAll(title));
+    }
+    /** search.py prefix_all: titles starting with prefix, LIMIT 6 per
+     * source. hi bound = prefix with last code point incremented. */
+    async prefixAll(prefix) {
+      const a = cps(prefix);
+      const last = a[a.length - 1];
+      const hiS = a.slice(0, -1).join("") +
+        String.fromCodePoint(last.codePointAt(0) + 1);
+      const rows = await this._titleRange(te.encode(prefix), te.encode(hiS));
+      const per = { 0: 0, 1: 0 };
+      const out = [];
+      for (const r of rows) {
+        if (per[r.src] >= 6) continue;
+        per[r.src]++; out.push(r);
+      }
+      return out;
+    }
+    async redirectTarget(title) {
+      await this.init();
+      const tb = te.encode(title);
+      const size = this.meta.files["redir.bin"];
+      const bi = this._findBlock(this.redirIdx, tb);
+      const blk = this.redirIdx[bi];
+      const end = this._blockEnd(this.redirIdx, bi, size);
+      const buf = await this._block("redir.bin", blk.off, end - blk.off);
+      const dv = new DataView(buf.buffer, buf.byteOffset);
+      let p = 0;
+      while (p < buf.length) {
+        const fl = dv.getUint16(p, true); p += 2;
+        if (p + fl > buf.length) break;
+        const from = td.decode(buf.slice(p, p + fl)); p += fl;
+        const tl = dv.getUint16(p, true); p += 2;
+        const tgt = td.decode(buf.slice(p, p + tl)); p += tl;
+        if (from === title) return tgt;
+        if (cmpBytes(te.encode(from), tb) > 0) return null;
+      }
+      return null;
+    }
+    async redirectRows(title) {
+      const tgt = await this.redirectTarget(title);
+      return tgt ? this.titleRows(tgt) : [];
+    }
+
+    // ------------------------------------------------------------ records
+    async idRecord(gid) {
+      if (this._idRecs.has(gid)) return this._idRecs.get(gid);
+      const stride = this.meta.id_stride;
+      const buf = await this._range("ids.bin", gid * stride,
+                                    gid * stride + stride - 1);
+      const dv = new DataView(buf.buffer, buf.byteOffset);
+      const leadLen = dv.getUint16(4, true);
+      let rec = null;
+      if (leadLen !== 0) {
+        rec = { id: gid, src: buf[18],
+                leadOff: dv.getUint32(0, true), leadLen,
+                bodyOff: Number(dv.getBigUint64(6, true)),
+                bodyLen: dv.getUint32(14, true), bodyId: buf[18] };
+      }
+      if (this._idRecs.size > 8192) this._idRecs.clear();
+      this._idRecs.set(gid, rec);
+      return rec;
+    }
+    async leadOf(rec) {
+      const gid = rec.id;
+      if (gid !== undefined && this._leads.has(gid)) return this._leads.get(gid);
+      const buf = await this._range("leads.bin", rec.leadOff,
+                                    rec.leadOff + rec.leadLen - 1);
+      const text = td.decode(buf);
+      const nl = text.indexOf("\n");
+      const out = { title: nl >= 0 ? text.slice(0, nl) : text,
+                    lead: nl >= 0 ? text.slice(nl + 1) : "" };
+      if (gid !== undefined) {
+        if (this._leads.size > 8192) this._leads.clear();
+        this._leads.set(gid, out);
+      }
+      return out;
+    }
+    /** Batch-fill _idRecs/_leads for many gids with coalesced Range
+     * fetches (ids.bin is fixed-stride; leads.bin offsets grow with
+     * gid). Produces exactly the records leadOf/idRecord would. */
+    async _primeRecords(gids) {
+      if (!gids.length) return;
+      const stride = this.meta.id_stride;
+      const missing = [...new Set(gids)].filter((g) => !this._idRecs.has(g));
+      if (missing.length) {
+        missing.sort((a, b) => a - b);
+        const spans = [];
+        let s = missing[0], prev = missing[0];
+        for (let i = 1; i < missing.length; i++) {
+          if (missing[i] - s > 8192) { spans.push([s, prev]); s = missing[i]; }
+          prev = missing[i];
+        }
+        spans.push([s, prev]);
+        await mapLimit(spans, 4, async ([lo, hi]) => {
+          const buf = await this._range("ids.bin", lo * stride,
+                                        hi * stride + stride - 1);
+          const dv = new DataView(buf.buffer, buf.byteOffset);
+          for (let g = lo; g <= hi; g++) {
+            const o = (g - lo) * stride;
+            const leadLen = dv.getUint16(o + 4, true);
+            let rec = null;
+            if (leadLen !== 0) {
+              rec = { id: g, src: buf[o + 18],
+                      leadOff: dv.getUint32(o, true), leadLen,
+                      bodyOff: Number(dv.getBigUint64(o + 6, true)),
+                      bodyLen: dv.getUint32(o + 14, true),
+                      bodyId: buf[o + 18] };
+            }
+            this._idRecs.set(g, rec);
+          }
+        });
+      }
+      const needLead = [];
+      for (const g of new Set(gids)) {
+        const rec = this._idRecs.get(g);
+        if (rec && !this._leads.has(g)) needLead.push(rec);
+      }
+      if (!needLead.length) return;
+      needLead.sort((a, b) => a.leadOff - b.leadOff);
+      const spans = [];
+      let cur = [needLead[0]];
+      let curEnd = needLead[0].leadOff + needLead[0].leadLen;
+      for (let i = 1; i < needLead.length; i++) {
+        const r = needLead[i];
+        const gap = r.leadOff - curEnd;
+        const spanLen = (r.leadOff + r.leadLen) - cur[0].leadOff;
+        if (gap <= 8192 && spanLen <= (1 << 20)) {
+          cur.push(r);
+          curEnd = Math.max(curEnd, r.leadOff + r.leadLen);
+        } else { spans.push(cur); cur = [r]; curEnd = r.leadOff + r.leadLen; }
+      }
+      spans.push(cur);
+      await mapLimit(spans, 6, async (recs) => {
+        const lo = recs[0].leadOff;
+        let hi = 0;
+        for (const r of recs) hi = Math.max(hi, r.leadOff + r.leadLen);
+        const buf = await this._range("leads.bin", lo, hi - 1);
+        for (const r of recs) {
+          const text = td.decode(buf.subarray(
+            r.leadOff - lo, r.leadOff - lo + r.leadLen));
+          const nl = text.indexOf("\n");
+          this._leads.set(r.id, {
+            title: nl >= 0 ? text.slice(0, nl) : text,
+            lead: nl >= 0 ? text.slice(nl + 1) : "" });
+        }
+      });
+    }
+    _bodyFile(rec) {
+      const files = this.opts.bodyFiles || this.meta.body_files;
+      return files[rec.bodyId];
+    }
+    /** search.py read_article: full stored block -> [title, body]. */
+    async readArticle(rec) {
+      const buf = await this._range(this._bodyFile(rec), rec.bodyOff,
+                                    rec.bodyOff + rec.bodyLen - 1);
+      const text = td.decode(buf).split("&nbsp;").join(" ");
+      const nl = text.indexOf("\n");
+      return [nl >= 0 ? text.slice(0, nl).trim() : text.trim(),
+              nl >= 0 ? text.slice(nl + 1) : ""];
+    }
+    /** Body head: enough bytes for the first `chars` body characters
+     * (used by the ordinal/descriptive lanes, which read body heads). */
+    async readBodyHead(rec, chars) {
+      const want = Math.min(rec.bodyLen, chars * 3 + 1024);
+      const buf = await this._range(this._bodyFile(rec), rec.bodyOff,
+                                    rec.bodyOff + want - 1);
+      const text = td.decode(buf).split("&nbsp;").join(" ");
+      const nl = text.indexOf("\n");
+      return nl >= 0 ? text.slice(nl + 1) : "";
+    }
+
+    // ------------------------------------------------------------ FTS pool
+    async _trigramEntry(tg, titleOnly) {
+      const superIdx = titleOnly ? this.titleTriSuper : this.triSuper;
+      const dirFile = titleOnly ? "title_tri_dir.bin" : "tri_dir.bin";
+      const kb = te.encode(tg);
+      const bi = this._findBlock(superIdx, kb);
+      const blk = superIdx[bi];
+      const end = this._blockEnd(superIdx, bi, this.meta.files[dirFile]);
+      const buf = await this._block(dirFile, blk.off, end - blk.off);
+      let p = 0;
+      while (p < buf.length) {
+        const kl = buf[p++];
+        if (p + kl > buf.length) break;
+        const key = buf.slice(p, p + kl); p += kl;
+        let off, len, df;
+        [off, p] = readVarint(buf, p);
+        [len, p] = readVarint(buf, p);
+        [df, p] = readVarint(buf, p);
+        const c = cmpBytes(key, kb);
+        if (c === 0) return { off, len, df };
+        if (c > 0) return null;
+      }
+      return null;
+    }
+    async _postings(entry, titleOnly) {
+      const file = titleOnly ? "title_postings.bin" : "postings.bin";
+      const len = Math.min(entry.len, MAX_POSTING_BYTES);
+      const buf = await this._range(file, entry.off, entry.off + len - 1);
+      const ids = [];
+      let p = 0, cur = 0;
+      while (p < buf.length) {
+        let d;
+        [d, p] = readVarint(buf, p);
+        if (p > buf.length || (buf[p - 1] & 0x80)) break; // truncated tail
+        cur += d;
+        ids.push(cur);
+      }
+      return ids;
+    }
+    async _intersect(term, titleOnly) {
+      const tris = [...new Set(trigramsOf(term))];
+      if (!tris.length) return [];
+      const entries = await mapLimit(tris, 12,
+        (tg) => this._trigramEntry(tg, titleOnly));
+      if (entries.some((e) => !e)) return [];
+      const lists = await mapLimit(entries, 12,
+        (e) => this._postings(e, titleOnly));
+      lists.sort((a, b) => a.length - b.length);
+      let cur = lists[0];
+      for (let i = 1; i < lists.length && cur.length; i++) {
+        const other = new Set(lists[i]);
+        cur = cur.filter((id) => other.has(id));
+      }
+      return cur;
+    }
+    srcOf(gid) { return gid < this.meta.main_total ? 0 : 1; }
+
+    /** Approximate FTS5 bm25 for one term in one source:
+     * Map(gid -> score) over verified docs (see header note). */
+    async termScores(src, term) {
+      const ck = src + "|" + term;
+      if (this._termCache.has(ck)) return this._termCache.get(ck);
+      const out = new Map();
+      const all = await this._intersect(term, false);
+      const inSrc = all.filter((g) => this.srcOf(g) === src);
+      if (inSrc.length) {
+        const titleHits = new Set(
+          (await this._intersect(term, true)).filter(
+            (g) => this.srcOf(g) === src));
+        const order = [...inSrc].sort((a, b) =>
+          (titleHits.has(b) ? 1 : 0) - (titleHits.has(a) ? 1 : 0) || a - b);
+        const pick = order.slice(0, FTS_FETCH_CAP);
+        const N = this.meta.sources[src].n;
+        const df = Math.max(inSrc.length, 1);
+        const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
+        const avgT = Math.max(this.meta.sources[src].avg_title_tokens, 1e-9);
+        const avgL = Math.max(this.meta.sources[src].avg_lead_tokens, 1e-9);
+        const k1 = 1.2, b = 0.75;
+        const col = (tf, dl, avg) =>
+          tf <= 0 ? 0 : (tf * (k1 + 1)) / (tf + k1 * (1 - b + (b * dl) / avg));
+        await this._primeRecords(pick);
+        await mapLimit(pick, 16, async (gid) => {
+          const rec = await this.idRecord(gid);
+          if (!rec) return;
+          const { title, lead } = await this.leadOf(rec);
+          const tfT = countOverlap(title, term);
+          const tfL = countOverlap(lead, term);
+          if (!tfT && !tfL) return;
+          const dlT = Math.max(cpLen(title) - 2, 0);
+          const dlL = Math.max(cpLen(lead) - 2, 0);
+          const sc = idf * (10 * col(tfT, dlT, avgT) + col(tfL, dlL, avgL));
+          if (sc > 0) out.set(gid, sc);
+        });
+      }
+      if (this._termCache.size > 512) this._termCache.clear();
+      this._termCache.set(ck, out);
+      return out;
+    }
+    /** search.py's per-source MATCH ... ORDER BY bm25 LIMIT n, as a
+     * ranked gid list (OR over terms, scores summed). */
+    async ftsQuery(src, terms, limit) {
+      const total = new Map();
+      for (const term of terms) {
+        const m = await this.termScores(src, term);
+        for (const [gid, sc] of m) total.set(gid, (total.get(gid) || 0) + sc);
+      }
+      return [...total.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0] - b[0])
+        .slice(0, limit).map(([gid]) => gid);
+    }
+    async _recWithLead(gid) {
+      const rec = await this.idRecord(gid);
+      if (!rec) return null;
+      const { title, lead } = await this.leadOf(rec);
+      return { rec, title, lead };
+    }
+
+    // ---------------------------------------------------- search.py search()
+    async search(q, n = 5, opts = {}) {
+      await this.init();
+      const keys0 = paraKeys(q);
+      let keys = keys0;
+      const cand = new Map(); // "src:gid" -> {prio, rec, compound, evidence}
+      const add = (rows, prio, compound = 0, evidence = 0) => {
+        for (const rec of rows) {
+          const k = rec.src + ":" + rec.id;
+          const cur = cand.get(k);
+          if (!cur || prio < cur.prio) {
+            cand.set(k, { prio, rec, compound, evidence });
+          } else if (prio === cur.prio && evidence > cur.evidence) {
+            cur.evidence = evidence;
+          }
+        }
+      };
+      const titleRows = (t) => this.titleRows(t);
+      const redirectRows = (t) => this.redirectRows(t);
+
+      const quoted = [...q.matchAll(/『([^』]+)』/g)].map((m) => m[1]);
+      const quotedNorms = quoted.map(normalizeTerm);
+      const isCreatorQ = CREATOR_RE.test(q);
+
+      // 1) quoted titles and their variants
+      for (const title of quoted) {
+        let hit = false;
+        const stubRows = [];
+        for (const v of termVariants(title)) {
+          const rows = await titleRows(v);
+          if (rows.length) {
+            hit = true;
+            for (const r of rows) if (r.bodyLen <= 3000) stubRows.push(r);
+          }
+          add(rows, 0);
+        }
+        if (!hit) {
+          for (const v of termVariants(title)) {
+            const rows = await redirectRows(v);
+            if (rows.length) { hit = true; add(rows, 0); break; }
+          }
+        }
+        if (isCreatorQ) {
+          const prio0 = [...cand.values()].filter((c) => c.prio === 0);
+          await mapLimit(prio0, 8, async (c) => {
+            const [, body] = await this.readArticle(c.rec);
+            const first = body.split("。")[0];
+            if (ATTRIBUTION_RE.test(first)) {
+              c.evidence = Math.max(c.evidence, 1);
+            }
+          });
+        }
+        const gn = normalizeTerm(title);
+        for (const r of stubRows.slice(0, 2)) {
+          const [, stubBody] = await this.readArticle(r);
+          for (const line of stubBody.split("\n").slice(0, 60)) {
+            const m = line.trim().match(/^『([^』]+)』\s*[-–—]/);
+            if (!m) continue;
+            const candTitle = m[1];
+            const cn = normalizeTerm(candTitle);
+            if (gn.includes(cn) || cn.includes(gn)) {
+              add(await titleRows(candTitle), 0);
+            }
+          }
+        }
+        if (!hit) {
+          if (cpLen(gn) >= 3) {
+            for (let src = 0; src < 2; src++) {
+              const gids = await this.ftsQuery(src, [gn], 20);
+              for (const gid of gids) {
+                const got = await this._recWithLead(gid);
+                if (!got) continue;
+                const prio = normalizeTerm(got.title).includes(gn) ? 0 : 2;
+                add([got.rec], prio);
+              }
+            }
+          }
+        }
+      }
+
+      // 2) bare question terms that are exact article titles
+      const parts = splitParts(q, 2);
+      const genericRows = [];
+      let entityFound = false;
+      const entityTitles = new Set();
+      const bareTitles = new Set();
+      for (const t of parts) {
+        if (NEVER_TITLES.has(t)) continue;
+        if ((t === "名前" || t === "名称") &&
+            /(名前|名称)は(何|なん)/.test(q)) continue;
+        const isGeneric =
+          GENERIC_TITLES.has(t) || SUPER_FRAGMENT_RE.test(t) ||
+          new RegExp("の" + escRe(t) + "(は|が|を|に|の|です|ですか)").test(q) ||
+          GENERIC_TITLES.has(normalizeTerm(t));
+        let termHit = false;
+        for (const v of termVariants(t)) {
+          const rows = await this.exactAll(v);
+          if (!rows.length) continue;
+          termHit = true;
+          bareTitles.add(t);
+          if (isGeneric) genericRows.push(...rows);
+          else {
+            entityFound = true;
+            entityTitles.add(t);
+            add(rows, v === t ? 0 : 1);
+          }
+        }
+        if (!termHit && !isGeneric) {
+          for (const v of termVariants(t)) {
+            const rows = await redirectRows(v);
+            if (rows.length) {
+              entityFound = true;
+              entityTitles.add(t);
+              add(rows, 0);
+              break;
+            }
+          }
+        }
+      }
+      // 2b) 'AのB' compound titles
+      const parts1 = splitParts(q, 1);
+      for (let i = 0; i + 1 < parts1.length; i++) {
+        const a = parts1[i], b = parts1[i + 1];
+        if (cpLen(a) + cpLen(b) < 3 || GENERIC_TITLES.has(b) ||
+            GENERIC_TITLES.has(normalizeTerm(b))) continue;
+        const comp = a + "の" + b;
+        let hit = false;
+        for (const v of termVariants(comp)) {
+          const rows = await this.exactAll(v);
+          if (rows.length) {
+            hit = true;
+            entityFound = true;
+            entityTitles.add(comp);
+            add(rows, 0, 1);
+          }
+        }
+        if (!hit) {
+          for (const v of termVariants(comp)) {
+            const rows = await redirectRows(v);
+            if (rows.length) {
+              entityFound = true;
+              entityTitles.add(comp);
+              add(rows, 0, 1);
+              break;
+            }
+          }
+        }
+      }
+      // 2d) year siblings
+      const wantsFirst = /最初|初めて|第1回|第一回/.test(q);
+      const wantsLast = /最新|最近|最後|前回/.test(q);
+      if ((wantsFirst || wantsLast) &&
+          (entityTitles.size || bareTitles.size)) {
+        for (const t of [...entityTitles, ...bareTitles]) {
+          if (t.includes("(") || t.includes("（") || t.includes("の")) continue;
+          const yearList = [];
+          for (let y = 1800; y <= 2030; y++) yearList.push(y);
+          const yearHits = await mapLimit(yearList, 12, async (y) => {
+            const prefix = `${y}年${t}`;
+            const plen = cpLen(prefix);
+            const rows = (await this.prefixAll(prefix)).filter((r) =>
+              r.title === prefix ||
+              "・(（".includes(cpSlice(r.title, plen, plen + 1)));
+            return rows.length ? [y, rows] : null;
+          });
+          const years = yearHits.filter((x) => x !== null);
+          if (years.length >= 2) {
+            years.forEach(([_y, rows], i) => {
+              let ev = 1;
+              if (wantsFirst && i === 0) ev = 3;
+              if (wantsLast && i === years.length - 1) ev = 3;
+              add(rows, ev === 3 ? 0 : 1, 0, ev);
+            });
+          }
+        }
+      }
+      // 2c) titles hidden inside the particle-stripped question
+      let substringFound = false;
+      const foundTitles = [];
+      if (!entityFound && !quoted.length) {
+        const parts1Set = splitParts(q, 1);
+        const titleParts = new Set();
+        const partHits = await mapLimit(parts1Set, 12,
+          async (p) => (await this.exactAll(p)).length > 0);
+        parts1Set.forEach((p, i) => { if (partHits[i]) titleParts.add(p); });
+        const stripped = normalizeTerm(q.replace(
+          /[はがをにのへとやもだですますか？?、。・\s「」『』（）()]+/g, ""));
+        const sa = cps(stripped);
+        const subs = new Set();
+        for (let ln = 1; ln <= 8; ln++) {
+          for (let i = 0; i + ln <= sa.length; i++) {
+            const s = sa.slice(i, i + ln).join("");
+            if (!GENERIC_TITLES.has(s) && !NEVER_TITLES.has(s) &&
+                !SUBSTRING_STOP.has(s) &&
+                !FTS_JUNK.some((j) => s.includes(j))) subs.add(s);
+          }
+        }
+        const sortedSubs = [...subs].sort((x, y) => cpLen(y) - cpLen(x));
+        const subList = sortedSubs.slice(0, 200);
+        const subRows = await mapLimit(subList, 12,
+          (s) => this.exactAll(s));
+        for (let si = 0; si < subList.length; si++) {
+          const s = subList[si];
+          const rows = subRows[si];
+          if (!rows.length) continue;
+          const counted = (cpLen(s) === 1 && parts1Set.includes(s)) ||
+            (cpLen(s) >= 2 && ![...titleParts].some(
+              (p) => s !== p && p.includes(s)));
+          if (counted) {
+            substringFound = true;
+            foundTitles.push(s);
+            add(rows, 1);
+          } else add(rows, 2);
+        }
+      }
+      // 3) FTS pool
+      const nBeforeFts = cand.size;
+      let terms = [];
+      for (const srcQ of [q, normalizeTerm(q)]) {
+        for (const t of splitParts(srcQ, 3)) {
+          if (NEVER_TITLES.has(t) || FTS_STOP.has(t) ||
+              FTS_JUNK.some((j) => t.includes(j))) continue;
+          terms.push(t);
+        }
+      }
+      terms = [...new Set(terms)].slice(0, 6);
+      if (terms.length &&
+          !(terms.length === 1 && FTS_STOP.has(terms[0]))) {
+        for (let src = 0; src < 2; src++) {
+          const gids = await this.ftsQuery(src, terms, 12);
+          const gots = await mapLimit(gids, 12,
+            (gid) => this._recWithLead(gid));
+          for (let gi = 0; gi < gids.length; gi++) {
+            const got = gots[gi];
+            if (!got) continue;
+            let prio = 2;
+            const tnorm = normalizeTerm(got.title);
+            if (quotedNorms.some((gn2) => gn2 && cpLen(gn2) >= 3 &&
+                (tnorm.includes(gn2) || gn2.includes(tnorm)))) prio = 0;
+            add([got.rec], prio);
+          }
+        }
+      }
+      const ftsAdded = cand.size > nBeforeFts;
+      add(genericRows,
+          (entityFound || quoted.length || substringFound || ftsAdded)
+            ? 3 : 0);
+
+      // 4) evidence lanes
+      const laneOk = !quoted.length &&
+        (!entityFound || [...entityTitles].every((t) => SCOPE_TITLES.has(t)));
+      if (laneOk) await this._evidenceLanes(q, add, terms);
+
+      if (foundTitles.length) {
+        keys = [...new Set(keys.concat(foundTitles))];
+      }
+      const candArr = [...cand.values()];
+      const scored = await mapLimit(candArr, 12, async (c) => {
+        const [t, body] = await this.readArticle(c.rec);
+        const [para, s, occ] = bestParagraph(body, keys);
+        return { prio: c.prio, compound: c.compound, ev: c.evidence,
+                 s, occ, len: c.rec.bodyLen, title: t, para, body };
+      });
+      scored.sort((a, b) => a.prio - b.prio || b.compound - a.compound ||
+                    b.ev - a.ev || b.s - a.s || b.occ - a.occ ||
+                    b.len - a.len);
+      return scored.slice(0, n).map((x) => opts.withBody
+        ? { title: x.title, para: x.para, body: x.body }
+        : { title: x.title, para: x.para });
+    }
+
+    // ------------------------------------------- search.py _evidence_lanes()
+    async _evidenceLanes(q, add, ftsTerms) {
+      const isSuper = SUPER_RE.test(q);
+      const ordinal = ordinalOf(q);
+      const scope = scopeOf(q);
+      const [attrSyns, attrBase] = attrOf(q);
+      const category = categoryOf(q);
+      const pool = new Map(); // "src:gid" -> {rec, title, lead}
+      const poolSet = async (gid) => {
+        const src = this.srcOf(gid);
+        const k = src + ":" + gid;
+        if (pool.has(k)) return;
+        const got = await this._recWithLead(gid);
+        if (got) pool.set(k, { rec: got.rec, title: got.title, lead: got.lead });
+      };
+
+      let laneTerms = [];
+      if (scope && attrBase) {
+        laneTerms.push(scope + "に最も" + attrBase, scope + "で最も" + attrBase);
+      }
+      if (scope) {
+        laneTerms.push(...attrSyns
+          .filter((s) => cpLen(s) >= 3 && s !== attrBase &&
+                  !s.startsWith("最も"))
+          .map((s) => scope + s));
+      }
+      laneTerms.push(...attrSyns.filter((s) => cpLen(s) >= 3));
+      laneTerms.push(...ftsTerms);
+      const segs = splitParts(q, 1);
+      const crossTerms = [];
+      for (let i = 0; i + 1 < segs.length; i++) {
+        const a = segs[i], b = segs[i + 1];
+        if (a && b) {
+          crossTerms.push(cpSlice(a, cpLen(a) - 1) + "を" + cpSlice(b, 0, 1));
+        }
+      }
+      laneTerms.push(...crossTerms);
+      if (attrBase) laneTerms.push("最も" + attrBase);
+      if (scope && isSuper) laneTerms.push(scope + "最大", scope + "最高");
+      laneTerms = [...new Set(laneTerms.filter((t) => cpLen(t) >= 3 &&
+        !GENERIC_TITLES.has(t) && !SCOPE_TITLES.has(t)))].slice(0, 12);
+      for (const term of laneTerms) {
+        const lim = crossTerms.includes(term) ? 100 : 30;
+        for (let src = 0; src < 2; src++) {
+          const gids = await this.ftsQuery(src, [term], lim);
+          await this._primeRecords(gids);
+          for (const gid of gids) await poolSet(gid);
+        }
+      }
+      // claim cache pool
+      if (isSuper && ordinal === null) {
+        const cm2 = q.match(/(?:一番|最も|最大|最高|最古|最長|最小|第一|最初)の([^\s、。がはをにへと]{2,8})/);
+        let cnoun = cm2 ? cm2[1] : null;
+        if (cnoun) cnoun = cnoun.split(/[のはがをにへと]/)[0] || null;
+        const okScopes = CLAIM_SCOPES[scope] || (scope ? [scope] : []);
+        await this._primeRecords(this.claims
+          .filter(([, cs]) => okScopes.includes(cs)).map(([g]) => g));
+        for (const [gid, cscope] of this.claims) {
+          if (!okScopes.includes(cscope)) continue;
+          if (category) {
+            const got = await this._recWithLead(gid);
+            if (!got) continue;
+            const lead200 = cpSlice(got.lead || "", 0, 200);
+            if (!got.title.includes(category) &&
+                !lead200.includes(category) &&
+                !(cnoun && lead200.includes(cnoun))) continue;
+          }
+          await poolSet(gid);
+        }
+      }
+      // category cache pool
+      if (category) {
+        await this._primeRecords(this.categories[category] || []);
+        for (const gid of this.categories[category] || []) {
+          const got = await this._recWithLead(gid);
+          if (!got) continue;
+          const lead = got.lead || "";
+          if ((scope && lead.includes(scope)) ||
+              attrSyns.some((s) => lead.includes(s)) ||
+              /最も|最大|最高|最古|一番|最高峰/.test(lead)) {
+            const k = got.rec.src + ":" + gid;
+            if (!pool.has(k)) {
+              pool.set(k, { rec: got.rec, title: got.title, lead });
+            }
+          }
+        }
+      }
+      if (!pool.size) return;
+
+      const focusWords = [...GENERIC_TITLES].filter((g) => q.includes(g) &&
+        !SCOPE_TITLES.has(g) && !["名前", "名称", "日本人"].includes(g));
+      const scopes = CLAIM_SCOPES[scope] || (scope ? [scope] : []);
+      let cm = q.match(/(?:一番|最も|最大|最高|最古|最長|最小|第一|最初)の([^\s、。がはをにへと]{2,8})/);
+      let claimNoun = cm ? cm[1] : null;
+      if (!claimNoun) {
+        cm = q.match(/(?:高い|大きい|大きな|長い|深い|近い|遠い|古い|多い|重い|速い|新しい|強い)([^\s、。がはをにへと]{1,6})/);
+        claimNoun = cm ? cm[1] : null;
+      }
+      if (claimNoun) {
+        claimNoun = claimNoun.split(/[のはがをにへと]/)[0] || null;
+      }
+      let qFamily = null;
+      for (const [stem, fam] of Object.entries(STEM_FAMILY)) {
+        if (q.includes(stem)) { qFamily = fam; break; }
+      }
+      if (qFamily === null && ATTR_FAMILY[attrBase] !== undefined) {
+        qFamily = ATTR_FAMILY[attrBase];
+      }
+
+      const superEvidence = (title, lead) => {
+        let ev = 0;
+        let claimM = null;
+        let weakClaim = false;
+        const claimRe = (cs) => new RegExp(escRe(cs) +
+          ".{0,3}(最も|一番|最大|最高峰|最高|最古|最長|最小|第一|最初)");
+        for (const cs of scopes) {
+          const m = lead.match(claimRe(cs));
+          if (m) {
+            const stem = m[1];
+            if (stem === "最も" || stem === "一番" || qFamily === null ||
+                STEM_FAMILY[stem] === qFamily) {
+              claimM = m; ev += 3; weakClaim = false; break;
+            }
+            if (!weakClaim) { weakClaim = true; ev += 1; }
+          }
+        }
+        if (!claimM && !weakClaim) {
+          for (const cs of scopes) {
+            if (claimRe(cs).test(lead)) { ev += 1; break; }
+          }
+        }
+        if (claimM) {
+          const endCh = cpLen(lead.slice(0, claimM.index)) +
+            cpLen(claimM[0]);
+          const tail = cpSlice(lead, endCh, endCh + 12);
+          const headCtx = cpSlice(lead,
+            Math.max(0, cpLen(lead.slice(0, claimM.index)) - 12),
+            cpLen(lead.slice(0, claimM.index)));
+          const bounded = [...attrSyns];
+          if (category && !(claimNoun && claimNoun !== category)) {
+            bounded.push(category);
+          }
+          const stem = claimM[1];
+          const ADJ_FORMS = attrSyns.filter((s) => ADJ_SET.has(s));
+          const tail8 = cpSlice(tail, 0, 8);
+          const cond1 = claimNoun && (
+            tail.startsWith("の" + claimNoun) ||
+            (stem !== "最も" && stem !== "一番" &&
+             tail8.includes(claimNoun)) ||
+            ADJ_FORMS.some((a) => tail8.includes(a + claimNoun)) ||
+            new RegExp(escRe(claimNoun) + "の中|のうち").test(headCtx));
+          const cond2 = bounded.some((t) => t && new RegExp(
+            "^の?" + escRe(t) + "(の|は|が|を|に|と|、|。|で|$)").test(tail));
+          if (cond1 || cond2) ev += 2;
+        }
+        if (scope && lead.includes(scope)) ev += 1;
+        if (SUPER_WORD_RE.test(lead)) ev += 1;
+        if (attrSyns.some((s) => lead.includes(s))) ev += 1;
+        if (focusWords.some((f) => lead.includes(f))) {
+          ev += SUPER_WORD_RE.test(lead) ? 3 : 2;
+        }
+        if (category) {
+          if (CATEGORY_SUFFIX[category].some((s) => title.endsWith(s))) {
+            ev += 2;
+          } else if (title.includes(category) || lead.includes(category)) {
+            ev += 1;
+          }
+        }
+        return ev;
+      };
+
+      let promoted = [];
+      if (isSuper && ordinal === null) {
+        const ranked = [];
+        for (const p of pool.values()) {
+          if (SCOPE_TITLES.has(p.title)) continue;
+          if (attrSyns.includes(p.title) ||
+              GENERIC_TITLES.has(p.title)) continue;
+          const ev = superEvidence(p.title, p.lead || "");
+          if (ev >= 5) ranked.push({ ev, ...p });
+        }
+        ranked.sort((a, b) => b.ev - a.ev || b.rec.bodyLen - a.rec.bodyLen);
+        promoted = ranked.slice(0, 2);
+        if (ranked.length > 2 && ranked[2].ev === ranked[0].ev) {
+          promoted = ranked.slice(0, 3);
+        }
+        promoted = promoted.map((p) => ({ ...p, prio: 0 }));
+      } else if (isSuper && ordinal !== null && ordinal >= 2) {
+        const num = String(ordinal);
+        const pat = new RegExp("は[^。]{0,40}?(第" + num + "位|" + num +
+                               "番目|" + num + "番)");
+        const stage = [];
+        for (const p of pool.values()) {
+          if (SCOPE_TITLES.has(p.title)) continue;
+          const lead = p.lead || "";
+          if ((scope && lead.includes(scope)) ||
+              attrSyns.some((s) => lead.includes(s))) {
+            const leadOrd = /第[0-9一二三四五六七八九十]+位|[0-9一二三四五六七八九十]+番目/.test(lead) ? 1 : 0;
+            const leadHit = new RegExp("第" + num + "位|" + num +
+                                        "番目|" + num + "番").test(lead) ? 1 : 0;
+            stage.push({ leadHit, leadOrd,
+                         ev: superEvidence(p.title, lead), ...p });
+          }
+        }
+        stage.sort((a, b) => b.leadHit - a.leadHit ||
+                     b.leadOrd - a.leadOrd || b.ev - a.ev ||
+                     b.rec.bodyLen - a.rec.bodyLen);
+        const NOUN_SYNS = attrSyns.filter((s) => !ADJ_SET.has(s));
+        const ADJ_SYNS = attrSyns.filter((s) => ADJ_SET.has(s));
+        const checkOrdinal = (e, body) => {
+          const head = cpSlice(body, 0, 2500);
+          const m = pat.exec(head);
+          let unitOk = false;
+          if (m) {
+            const segRaw = cpSlice(head,
+              cpLen(head.slice(0, m.index)) + cpLen(m[0]),
+              cpLen(head.slice(0, m.index)) + cpLen(m[0]) + 12);
+            const seg = segRaw.replace(/^[にのは、]+/, "");
+            if (NOUN_SYNS.some((s) => seg.startsWith(s))) unitOk = true;
+            else {
+              for (const a of ADJ_SYNS) {
+                if (seg.startsWith(a)) {
+                  const rest = seg.slice(a.length);
+                  if ((claimNoun && rest.startsWith(claimNoun)) ||
+                      (category && rest.startsWith(category))) {
+                    unitOk = true;
+                  }
+                  break;
+                }
+              }
+            }
+          }
+          const scopeOk = !scope || (m && new RegExp(
+            "(?<![東西南北])" + escRe(scope)).test(cpSlice(head,
+              Math.max(0, cpLen(head.slice(0, m.index)) - 80),
+              cpLen(head.slice(0, m.index)) + cpLen(m[0]) + 40)));
+          return !!(m && unitOk &&
+            (cpSlice(head, Math.max(0, cpLen(head.slice(0, m.index)) - 45),
+                     cpLen(head.slice(0, m.index)) + 2).includes(e.title) ||
+             head.split("。")[0].includes(e.title)) && scopeOk);
+        };
+        const stageTop = stage.slice(0, 160);
+        for (let ci = 0; ci < stageTop.length && !promoted.length;
+             ci += 12) {
+          const chunk = stageTop.slice(ci, ci + 12);
+          const bodies = await mapLimit(chunk, 12,
+            (e) => this.readBodyHead(e.rec, 2600));
+          for (let j = 0; j < chunk.length; j++) {
+            if (checkOrdinal(chunk[j], bodies[j])) {
+              promoted = [{ ev: 6, ...chunk[j], prio: 0 }];
+              break;
+            }
+          }
+        }
+      }
+      if (!isSuper) {
+        const DK_PREFIX = ["一番", "最も", "大きな", "大きい", "伝統的な",
+          "有名な", "新しい", "古い", "多い", "少ない", "高い", "低い",
+          "長い", "短い", "深い", "浅い", "強い", "速い", "持つ"];
+        const DK_SUFFIX = ["を持つことで知られる", "ことで知られる",
+          "として知られる", "で知られる", "を持つ", "がある", "とされる",
+          "である"];
+        const families = [];
+        for (const p of splitParts(q, 1)) {
+          if (NEVER_TITLES.has(p) || GENERIC_TITLES.has(p) ||
+              SCOPE_TITLES.has(p) || p === "名前" || p === "名称" ||
+              FTS_STOP.has(p) || p.startsWith("何") ||
+              p.startsWith("どこ") || p.startsWith("誰")) continue;
+          const forms = [p];
+          let cur = p;
+          for (let i = 0; i < 3; i++) {
+            let nxt = cur;
+            for (const pre of DK_PREFIX) {
+              if (nxt.startsWith(pre) && cpLen(nxt) > cpLen(pre)) {
+                nxt = nxt.slice(pre.length); break;
+              }
+            }
+            for (const suf of DK_SUFFIX) {
+              if (nxt.endsWith(suf) && cpLen(nxt) > cpLen(suf)) {
+                nxt = nxt.slice(0, nxt.length - suf.length); break;
+              }
+            }
+            for (const sep of ["を持つことで知られる", "ことで知られる",
+                               "として知られる", "で知られる"]) {
+              if (nxt.includes(sep)) { nxt = nxt.split(sep).pop(); break; }
+            }
+            if (nxt === cur) break;
+            cur = nxt;
+            if (cur && !forms.includes(cur)) forms.push(cur);
+          }
+          families.push(forms);
+        }
+        const dkeys = families.flat();
+        if (families.length >= 2 && dkeys.length >= 3) {
+          const staged = [];
+          for (const p of pool.values()) {
+            if (SCOPE_TITLES.has(p.title)) continue;
+            const leadHits = dkeys.reduce(
+              (acc, k) => acc + ((p.lead || "").includes(k) ? 1 : 0), 0);
+            staged.push({ leadHits, ...p });
+          }
+          staged.sort((a, b) => b.leadHits - a.leadHits);
+          const stagedTop = staged.slice(0, 80);
+          const stagedBodies = await mapLimit(stagedTop, 12,
+            (e) => this.readBodyHead(e.rec, 1300));
+          let best = null;
+          for (let ei = 0; ei < stagedTop.length; ei++) {
+            const e = stagedTop[ei];
+            const body = stagedBodies[ei];
+            const text = (e.lead || "") + cpSlice(body, 0, 1200);
+            const cov = families.filter(
+              (fam) => fam.some((k) => text.includes(k))).length /
+              families.length;
+            if (!best || cov > best.cov) best = { cov, ...e };
+          }
+          if (best && best.cov >= 0.55) {
+            const dprio = best.cov >= 0.8 ? 0 : 1;
+            promoted = [{ ev: Math.trunc(best.cov * 10), ...best,
+                          prio: dprio }];
+          }
+        }
+      }
+      for (const e of promoted) {
+        add([e.rec], e.prio !== undefined ? e.prio : 0, 0, e.ev);
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ transports
+  function httpTransport(indexBase, bodyBase) {
+    const fetchRange = async (url, range) => {
+      const headers = {};
+      if (range) headers["Range"] = `bytes=${range[0]}-${range[1]}`;
+      const res = await fetch(url, { headers });
+      if (!res.ok && res.status !== 206) {
+        throw new Error(`fetch ${url} -> ${res.status}`);
+      }
+      return new Uint8Array(await res.arrayBuffer());
+    };
+    return {
+      range: (file, a, b) => fetchRange(
+        (file.endsWith(".txt") ? bodyBase : indexBase) + file, [a, b]),
+      whole: (file) => fetchRange(indexBase + file, null),
+    };
+  }
+
+  const api = { SearchEngine, httpTransport, normalizeTerm, termVariants,
+                splitParts, bestParagraph };
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = api;
+  }
+  global.BrowserSearch = api;
+})(typeof window !== "undefined" ? window : globalThis);
+
+"use strict";
+/* Cube index lane: managed transport + Cube-shaped adapter over the
+ * parallelized browser Wikipedia index engine
+ * (browser_search_cube.js, a fetch-parallelized copy of
+ * hybrid/browser_index_full/browser_search.js; ranking unchanged).
+ *
+ * The lane is the ONLY new networking surface: it talks to the public
+ * Hugging Face datasets FMA03/cube-index (shards) and
+ * FMA03/hybrid-ai-data (article bodies) with single Range GETs and no
+ * custom headers (CORS-simple), exactly like the design contract in
+ * BROWSER_INDEX_FULL.md.
+ *
+ * Guarantees for the host app:
+ * - bounded concurrency (default 12 in-flight requests),
+ * - a timeout on every request (default 20s, AbortController),
+ * - an in-session cache for fetched ranges (repeat questions are
+ *   fast; byte-capped, wholesale eviction like the engine's own),
+ * - a per-question budget (max requests / max wall time): when it is
+ *   exceeded the lane aborts with IndexBudgetError and the host falls
+ *   back to its existing web path, so no question can hang.
+ * Every adapter function resolves to null / [] / an empty Map on any
+ * failure instead of throwing.
+ *
+ * Host wiring (both Cube versions):
+ *   const lane = CubeIndexLane.create({
+ *     SearchEngine: globalThis.BrowserSearch.SearchEngine,
+ *     wikiUrl: (title) => ...,
+ *     disambiguationCandidates: (page, subject, extended) => [...],
+ *   });
+ *   lane.beginQuestion();            // at each question's search start
+ *   await lane.fetchExtract(title);  // {title,url,snippet,text} | null
+ *   await lane.searchTitles(q, n);   // [title, ...]
+ *   await lane.fetchExtractHeads(titles); // Map<title, headText>
+ *   await lane.articleSource(title); // {title,url,lead,fields:{},disambiguation,candidates} | null
+ *   await lane.searchResults(q, n);  // [{title,url,snippet,text}]
+ */
+(function (global) {
+  const INDEX_BASE =
+    "https://huggingface.co/datasets/FMA03/cube-index/resolve/main/";
+  const BODY_BASE =
+    "https://huggingface.co/datasets/FMA03/hybrid-ai-data/resolve/main/";
+
+  class IndexBudgetError extends Error {
+    constructor(msg) {
+      super(msg);
+      this.name = "IndexBudgetError";
+    }
+  }
+
+  async function mapLimit(items, limit, fn) {
+    const out = new Array(items.length);
+    let next = 0;
+    const n = Math.min(limit, items.length);
+    const workers = [];
+    for (let w = 0; w < n; w++) {
+      workers.push((async () => {
+        while (next < items.length) {
+          const i = next++;
+          out[i] = await fn(items[i], i);
+        }
+      })());
+    }
+    await Promise.all(workers);
+    return out;
+  }
+
+  function makeSemaphore(max) {
+    let active = 0;
+    const queue = [];
+    return {
+      acquire() {
+        if (active < max) {
+          active += 1;
+          return Promise.resolve();
+        }
+        return new Promise((res) => queue.push(res));
+      },
+      release() {
+        const next = queue.shift();
+        if (next) next();
+        else active -= 1;
+      },
+    };
+  }
+
+  function createIndexTransport(indexBase, bodyBase, opts = {}) {
+    const maxConc = opts.concurrency ?? 12;
+    const timeoutMs = opts.timeoutMs ?? 20000;
+    const cacheCapBytes = opts.cacheBytes ?? 96 * 1024 * 1024;
+    const sem = makeSemaphore(maxConc);
+    const cache = new Map(); // key -> {p, bytes}
+    let cacheBytes = 0;
+    const stats = { requests: 0, bytes: 0, cacheHits: 0 };
+    let budget = null;
+
+    function beginQuestion(qopts = {}) {
+      budget = {
+        count: 0,
+        maxRequests: qopts.maxRequests ?? 20000,
+        deadline: Date.now() + (qopts.maxMs ?? 120000),
+        aborted: false,
+      };
+    }
+    function budgetActive() {
+      return !!budget && !budget.aborted && Date.now() <= budget.deadline;
+    }
+    function autoBegin() {
+      if (!budgetActive()) beginQuestion();
+    }
+    function checkBudget() {
+      if (!budget) return;
+      if (budget.aborted) throw new IndexBudgetError("index-budget-aborted");
+      if (budget.count > budget.maxRequests || Date.now() > budget.deadline) {
+        budget.aborted = true;
+        throw new IndexBudgetError("index-budget-exceeded");
+      }
+    }
+
+    async function fetchRaw(url, range) {
+      checkBudget();
+      await sem.acquire();
+      try {
+        checkBudget();
+        if (budget) budget.count += 1;
+        const ctrl =
+          typeof AbortController !== "undefined"
+            ? new AbortController()
+            : null;
+        const timer = ctrl
+          ? setTimeout(() => ctrl.abort(), timeoutMs)
+          : null;
+        try {
+          const headers = {};
+          if (range) headers["Range"] = `bytes=${range[0]}-${range[1]}`;
+          const res = await fetch(
+            url,
+            ctrl ? { headers, signal: ctrl.signal } : { headers },
+          );
+          if (!res.ok && res.status !== 206) {
+            throw new Error(`index fetch HTTP ${res.status}`);
+          }
+          const buf = new Uint8Array(await res.arrayBuffer());
+          stats.requests += 1;
+          stats.bytes += buf.length;
+          return buf;
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      } finally {
+        sem.release();
+      }
+    }
+
+    function cached(key, make) {
+      const hit = cache.get(key);
+      if (hit) {
+        stats.cacheHits += 1;
+        return hit.p;
+      }
+      const entry = { p: null, bytes: 0 };
+      entry.p = make();
+      cache.set(key, entry);
+      entry.p.then(
+        (buf) => {
+          entry.bytes = buf.length;
+          cacheBytes += buf.length;
+          if (cacheBytes > cacheCapBytes) {
+            for (const [k, e] of cache) {
+              if (e !== entry && e.bytes > 0) {
+                cache.delete(k);
+                cacheBytes -= e.bytes;
+              }
+            }
+          }
+        },
+        () => {
+          if (cache.get(key) === entry) cache.delete(key);
+        },
+      );
+      return entry.p;
+    }
+
+    const transport = {
+      range(file, a, b) {
+        const url = (file.endsWith(".txt") ? bodyBase : indexBase) + file;
+        return cached(`${file}|${a}|${b}`, () => fetchRaw(url, [a, b]));
+      },
+      whole(file) {
+        const url = (file.endsWith(".txt") ? bodyBase : indexBase) + file;
+        return cached(`${file}|whole`, () => fetchRaw(url, null));
+      },
+    };
+    return {
+      transport,
+      stats,
+      beginQuestion,
+      budgetActive,
+      autoBegin,
+      isBudgetError: (e) => e instanceof IndexBudgetError,
+    };
+  }
+
+  function create(deps) {
+    const T = createIndexTransport(INDEX_BASE, BODY_BASE, deps.transportOpts);
+    let engine = null;
+    let enginePromise = null;
+    const lane = {
+      transport: T,
+      lastError: "",
+      beginQuestion: (o) => T.beginQuestion(o),
+      stats: () => ({ ...T.stats }),
+    };
+
+    async function ensureEngine() {
+      if (engine) return engine;
+      if (!enginePromise) {
+        enginePromise = (async () => {
+          const e = new deps.SearchEngine(T.transport);
+          await e.init();
+          engine = e;
+          return e;
+        })();
+        enginePromise.catch(() => {
+          enginePromise = null;
+        });
+      }
+      return enginePromise;
+    }
+
+    async function rowsForTitle(e, title) {
+      let rows = await e.titleRows(title);
+      if (!rows.length) rows = await e.redirectRows(title);
+      return rows;
+    }
+
+    /** Same shape as the host's wikiFetchExtract result. */
+    lane.fetchExtract = async (title) => {
+      try {
+        T.autoBegin();
+        const e = await ensureEngine();
+        const rows = await rowsForTitle(e, title);
+        if (!rows.length) return null;
+        const [t, body] = await e.readArticle(rows[0]);
+        if (!body) return null;
+        const text = body.slice(0, 6000);
+        return {
+          title: t,
+          url: deps.wikiUrl(t),
+          snippet: text.slice(0, 240),
+          text,
+        };
+      } catch (err) {
+        lane.lastError = err instanceof Error ? err.message : String(err);
+        return null;
+      }
+    };
+
+    /** Ranked article titles for a query (host's wikiSearchTitles). */
+    lane.searchTitles = async (q, limit) => {
+      try {
+        T.autoBegin();
+        const e = await ensureEngine();
+        const hits = await e.search(q, limit);
+        return hits.map((h) => h.title);
+      } catch (err) {
+        lane.lastError = err instanceof Error ? err.message : String(err);
+        return [];
+      }
+    };
+
+    /** Corroboration-ready results: ranked articles with full text. */
+    lane.searchResults = async (q, limit) => {
+      try {
+        T.autoBegin();
+        const e = await ensureEngine();
+        const hits = await e.search(q, limit, { withBody: true });
+        return hits.map((h) => ({
+          title: h.title,
+          url: deps.wikiUrl(h.title),
+          snippet: (h.para ?? "").slice(0, 240),
+          text: (h.body ?? "").slice(0, 6000),
+        }));
+      } catch (err) {
+        lane.lastError = err instanceof Error ? err.message : String(err);
+        return [];
+      }
+    };
+
+    /** Map of title -> lead head (~1200 chars), host's
+     * wikiFetchExtractHeads. Keyed by the requested title. */
+    lane.fetchExtractHeads = async (titles) => {
+      const out = new Map();
+      if (!titles.length) return out;
+      try {
+        T.autoBegin();
+        const e = await ensureEngine();
+        const heads = await mapLimit(titles, 8, async (title) => {
+          const rows = await rowsForTitle(e, title);
+          if (!rows.length) return null;
+          const head = await e.readBodyHead(rows[0], 1200);
+          return head ? head.slice(0, 1200) : null;
+        });
+        titles.forEach((t, i) => {
+          if (heads[i]) out.set(t, heads[i]);
+        });
+      } catch (err) {
+        lane.lastError = err instanceof Error ? err.message : String(err);
+      }
+      return out;
+    };
+
+    /** Same shape as the host's wikiArticleSource result. The index
+     * stores plain-text bodies (no wikitext), so infobox `fields` is
+     * empty and the host's lead-based extractors do the work — the
+     * same fallbacks used today for articles whose infobox lacks the
+     * field. Disambiguation is detected structurally (title suffix or
+     * a list-shaped lead), mirroring the host's own rule minus the
+     * wikitext template mark. */
+    lane.articleSource = async (title) => {
+      try {
+        T.autoBegin();
+        const e = await ensureEngine();
+        const rows = await rowsForTitle(e, title);
+        if (!rows.length) return null;
+        const [t, body] = await e.readArticle(rows[0]);
+        if (body == null) return null;
+        const candidates = deps.disambiguationCandidates
+          ? deps.disambiguationCandidates({ title: t, text: body }, title, true)
+          : [];
+        const firstLines = body
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0)
+          .slice(0, 6);
+        const listy =
+          firstLines.filter((l) => /^.+?\s-\s/.test(l)).length >= 2;
+        const templateMark = /[（(]曖昧さ回避[）)]$/.test(t);
+        return {
+          title: t,
+          url: deps.wikiUrl(t),
+          lead: body.slice(0, 5000),
+          fields: {},
+          disambiguation:
+            templateMark || (candidates.length > 0 && listy),
+          candidates,
+        };
+      } catch (err) {
+        lane.lastError = err instanceof Error ? err.message : String(err);
+        return null;
+      }
+    };
+
+    return lane;
+  }
+
+  const api = { create, createIndexTransport, IndexBudgetError, mapLimit };
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = api;
+  }
+  global.CubeIndexLane = api;
+})(typeof window !== "undefined" ? window : globalThis);
+
+/* 索引レーンはグローバルに1つだけ作る。wikiUrl と
+   disambiguationCandidates は既存の関数をそのまま渡す（どちらも
+   関数宣言なので、この時点でも参照できる）。 */
+const IndexLane = CubeIndexLane.create({
+  SearchEngine: globalThis.BrowserSearch.SearchEngine,
+  wikiUrl,
+  disambiguationCandidates,
+});
+
+/* ================================================================== */
 /* Wikipedia クライアント（ブラウザから直接呼ぶ）                       */
 /*                                                                    */
 /* 日本語Wikipedia API は origin=* を付けると CORS でブラウザから      */
@@ -2971,8 +4720,30 @@ function wikiUrl(title) {
   return `https://ja.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, "_"))}`;
 }
 
-/** 1記事の平文エキストラクトをタイトル完全指定で取る。失敗時は null。 */
+/**
+ * 1記事の平文エキストラクトをタイトル完全指定で取る（索引優先・
+ * ウェブ予備）。ブラウザ内Wikipedia索引（IndexLane）から取れたら
+ * それを使い、取れなければ従来のウェブ版に倒れる。索引で成功したら
+ * WikiNet.via を "index" にし、前の質問の失敗理由を持ち越さないよう
+ * lastError を空に戻す。索引が失敗してウェブに倒れた場合の WikiNet
+ * の記録はウェブ側に任せる。例外は外に漏らさない。
+ */
 async function wikiFetchExtract(title) {
+  try {
+    const hit = await IndexLane.fetchExtract(title);
+    if (hit) {
+      WikiNet.via = "index";
+      WikiNet.lastError = "";
+      return hit;
+    }
+  } catch {
+    /* 索引の例外は漏らさずウェブ版へ倒れる */
+  }
+  return wikiFetchExtractWeb(title);
+}
+
+/** 1記事の平文エキストラクトをタイトル完全指定で取る。失敗時は null。 */
+async function wikiFetchExtractWeb(title) {
   try {
     const data = await wikiApi({
       action: "query",
@@ -2997,8 +4768,28 @@ async function wikiFetchExtract(title) {
   }
 }
 
-/** Wikipedia検索のタイトル一覧（順位順）。失敗時は空。 */
+/**
+ * Wikipedia検索のタイトル一覧（索引優先・ウェブ予備）。索引から
+ * 取れたらそれを使い、空なら従来のウェブ版に倒れる。WikiNet の
+ * 扱いは wikiFetchExtract と同じ（索引で成功したら via を "index"
+ * にし lastError を空に戻す）。例外は外に漏らさない。
+ */
 async function wikiSearchTitles(q, limit) {
+  try {
+    const hits = await IndexLane.searchTitles(q, limit);
+    if (hits && hits.length > 0) {
+      WikiNet.via = "index";
+      WikiNet.lastError = "";
+      return hits;
+    }
+  } catch {
+    /* 索引の例外は漏らさずウェブ版へ倒れる */
+  }
+  return wikiSearchTitlesWeb(q, limit);
+}
+
+/** Wikipedia検索のタイトル一覧（順位順）。失敗時は空。 */
+async function wikiSearchTitlesWeb(q, limit) {
   try {
     const data = await wikiApi({
       action: "query",
@@ -3572,8 +5363,30 @@ function parseInfoboxFields(content) {
   return fields;
 }
 
-/** タイトル完全指定で1記事分の事実源データ。失敗時は null。 */
+/**
+ * タイトル完全指定で1記事分の事実源データ（索引優先・ウェブ予備）。
+ * 索引から取れたらそれを使い、取れなければ従来のウェブ版に倒れる。
+ * WikiNet の扱いは wikiFetchExtract と同じ。索引版はウィキテキストを
+ * 持たないため fields は空で、事実はリード文からの抽出で担う
+ * （ウェブ版でもインフォボックスに欄が無い記事は同じ経路になる）。
+ * 例外は外に漏らさない。
+ */
 async function wikiArticleSource(title) {
+  try {
+    const hit = await IndexLane.articleSource(title);
+    if (hit) {
+      WikiNet.via = "index";
+      WikiNet.lastError = "";
+      return hit;
+    }
+  } catch {
+    /* 索引の例外は漏らさずウェブ版へ倒れる */
+  }
+  return wikiArticleSourceWeb(title);
+}
+
+/** タイトル完全指定で1記事分の事実源データ。失敗時は null。 */
+async function wikiArticleSourceWeb(title) {
   const [wt, extract] = await Promise.all([
     wikiFetchWikitext(title),
     wikiFetchExtract(title),
@@ -3788,7 +5601,40 @@ async function resolveArticleSourceInner(q) {
  * 複数記事の冒頭（約1200字）を1回のリクエストで取る。候補記事の
  * ふるい分け用（名物探し）。失敗時は空のMap。
  */
+/**
+ * 複数記事の冒頭（索引優先・ウェブ予備）。索引で埋まったタイトルは
+ * 索引から取り、埋まらなかったタイトルだけ従来のウェブ版（引数は
+ * 不足分だけ）で補ってマージする。索引が全部埋めたらウェブ版は
+ * 呼ばない。索引から1件でも取れたら WikiNet.via を "index" にし
+ * lastError を空に戻す。例外は外に漏らさない。
+ */
 async function wikiFetchExtractHeads(titles) {
+  let fromIndex = null;
+  try {
+    fromIndex = await IndexLane.fetchExtractHeads(titles);
+  } catch {
+    fromIndex = null;
+  }
+  if (!fromIndex || fromIndex.size === 0) {
+    return wikiFetchExtractHeadsWeb(titles);
+  }
+  const missing = titles.filter((t) => !fromIndex.has(t));
+  if (missing.length > 0) {
+    try {
+      const extra = await wikiFetchExtractHeadsWeb(missing);
+      for (const [k, v] of extra) {
+        if (!fromIndex.has(k)) fromIndex.set(k, v);
+      }
+    } catch {
+      /* 索引で取れた分だけ返す */
+    }
+  }
+  WikiNet.via = "index";
+  WikiNet.lastError = "";
+  return fromIndex;
+}
+
+async function wikiFetchExtractHeadsWeb(titles) {
   const out = new Map();
   if (titles.length === 0) return out;
   try {
@@ -4803,7 +6649,7 @@ const App = {
   init() {
     Notebook.load();
     // 選択中のモデルを復元する（初期値は v1）。ベースURLはモデルごとの
-    // 上書きとして読み込む（v1 は従来キー、v2 / Twin は専用キー）。
+    // 上書きとして読み込む（v1 は従来キー、v2 / Twin / Pro は専用キー）。
     const savedId = store.get(MODEL_ID_KEY);
     this.modelId = MODELS[savedId] ? savedId : "v1";
     const def = modelDef(this.modelId);
@@ -5007,7 +6853,7 @@ const App = {
     // （アクティブなエンジンは常に1つだけ）。
     disposeUltra();
     // ベースURLの上書きは選択中モデルごとのキーに保存する
-    // （Nano は従来の jisaku-ai-model-base-url、Flash / Twin は専用キー）。
+    // （Nano は従来の jisaku-ai-model-base-url、Flash / Twin / Pro は専用キー）。
     store.set(def.urlKey, url);
     this.modelBusy = true;
     this.renderModelSwitch();
@@ -5019,9 +6865,9 @@ const App = {
       this.setModelStatus({ kind: "ready", paramCount: LocalModel.paramCount });
     } catch (e) {
       let message = e instanceof Error ? e.message : String(e);
-      // Flash / Twin の重みがまだアップロードされていない場合の案内を
-      // 添える（黙って Nano で回答することは絶対にしない）。
-      if ((def.id === "v2" || def.id === "twin") && message.includes("manifest.json")) {
+      // Flash / Twin / Pro の重みがまだアップロードされていない場合の
+      // 案内を添える（黙って Nano で回答することは絶対にしない）。
+      if ((def.id === "v2" || def.id === "twin" || def.id === "pro") && message.includes("manifest.json")) {
         message += `。${def.label} の重みはまだ GitHub にアップロードされていない可能性があります。Cube Nano に戻すと今まで通り使えます`;
       }
       this.setModelStatus({ kind: "error", message });
@@ -5244,6 +7090,7 @@ const App = {
         sourceUrl: hit.source_url || undefined,
       });
       void (async () => {
+        IndexLane.beginQuestion();
         let fact = null;
         try {
           const article = await fetchArticle(question);
@@ -5332,6 +7179,7 @@ const App = {
     // 開始する：生成はメインスレッドの重い処理だが、ネットワークは
     // その裏で進むため、Wikipediaの往復がモデルの思考の後ろに
     // 並ばずに済む。
+    IndexLane.beginQuestion();
     const articlePromise = fetchArticle(question).catch(() => null);
     const searchPromise = searchWikipedia(question).catch(() => []);
     // モデルが何も生まなかった理由を追う——未読み込み・空の生成・
@@ -5348,7 +7196,7 @@ const App = {
       await new Promise((r) => setTimeout(r, 30));
       try {
         // 通常の質問応答の生成にも、選択中モデルの生成上限
-        // （Nano: 48 / Flash・Twin: 96）を明示的に渡す。Ultra の生成は
+        // （Nano・Pro: 48 / Flash・Twin: 96）を明示的に渡す。Ultra の生成は
         // 非同期（transformers.js）で、上限は Ultra 固定の128。
         modelAnswer = this.modelId === "ultra"
           ? await generateUltra(question)
@@ -5742,6 +7590,6 @@ if (typeof module !== "undefined" && module.exports) {
     isUsableEvidenceResult, resultAnchoredToQuestion, resultSupportsAnswer,
     modelAnswerFitsQuestion, answerClaimKind,
     parseWeatherQuery, fetchWeather, fetchJmaForecast, resolveJmaArea,
-    jmaWeatherText, normalizeQuestion,
+    jmaWeatherText, normalizeQuestion, IndexLane,
   };
 }

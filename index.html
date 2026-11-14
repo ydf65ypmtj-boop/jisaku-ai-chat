@@ -21,6 +21,7 @@
             <button type="button" class="model-switch-btn" data-model="v1" aria-pressed="true">Cube Nano</button>
             <button type="button" class="model-switch-btn" data-model="v2" aria-pressed="false">Cube Flash</button>
             <button type="button" class="model-switch-btn" data-model="twin" aria-pressed="false">Cube Twin</button>
+            <button type="button" class="model-switch-btn" data-model="pro" aria-pressed="false">Cube Pro</button>
             <button type="button" class="model-switch-btn" data-model="ultra" aria-pressed="false">Cube Ultra</button>
           </div>
           <nav class="tabs" aria-label="画面切り替え">
@@ -40,7 +41,8 @@
               <p class="desc">
                 Cubeは自作LLMです（Cube Nano：約3,177万パラメータ／
                 Cube Flash：約5,995万パラメータ／Cube Twin：約2億3,314万
-                パラメータ。ヘッダーで切り替えられます）。4つ目の
+                パラメータ／Cube Pro：約2億9,781万パラメータ。
+                ヘッダーで切り替えられます）。5つ目の
                 Cube Ultraは、Qwen2.5-1.5Bに追加学習を統合したモデル
                 （約15億パラメータ）をHugging Faceから読み込んで動かす
                 もので、初回読み込みでは約1.2GBのダウンロードがあります。
@@ -116,7 +118,7 @@
               <h3><label for="base-url">モデルの重みベースURL</label></h3>
               <p class="desc">
                 manifest.json / bpe.json / weights-*.bin が置いてある場所を指定します。
-                このURLは選択中のモデル（Cube Nano / Cube Flash / Cube Twin）ごとの上書きとして
+                このURLは選択中のモデル（Cube Nano / Cube Flash / Cube Twin / Cube Pro）ごとの上書きとして
                 この端末に保存され、次回から自動で読み込みます。ヘッダーでモデルを
                 切り替えると、そのモデルのURLに切り替わります。
                 Cube Ultra は Hugging Face（FMA03/cube-ultra）から読み込むため、この上書きは適用されません（自作モデル専用です）。
@@ -193,7 +195,7 @@
               <p class="desc">
                 このAIの名前はCubeです。
                 GPT方式Transformerの自作LLMをブラウザの中で直接動かしています。
-                モデルは4つあり、ヘッダーで切り替えられます。Cube Nanoは
+                モデルは5つあり、ヘッダーで切り替えられます。Cube Nanoは
                 12層・幅448・語彙6,000の自作BPEで約3,177万パラメータ、
                 Cube Flashは18層・幅512・語彙6,000の自作BPEで約5,995万
                 パラメータ、Cube Twinは18層・幅1024・語彙6,000の自作BPEで
@@ -201,6 +203,11 @@
                 モデルを横並びに結合した1つのモデルを、グループ単位の
                 int4量子化で書き出したものです。BPEはモデルごとに別物
                 なので、必ず選択中のモデルの場所から読み込みます）。
+                Cube Proは21層・幅1024・語彙32,000の自作BPEで
+                約2億9,781万パラメータです（v3モデルに蒸留第3弾まで
+                行ったもので、Twinと同じグループ単位のint4量子化で
+                書き出しています。語彙が他の自作モデルと違うので、
+                BPEはProの場所から読み込みます）。
                 Cube Ultraは、Qwen2.5-1.5Bに追加学習（LoRA）を統合した
                 モデル（約15億パラメータ）で、自作エンジンではなく
                 @huggingface/transformers を使って Hugging Face
