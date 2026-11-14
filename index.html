@@ -18,9 +18,10 @@
           </span>
           <span id="model-note" class="model-note">回答は検索のみで行います</span>
           <div class="model-switch" role="group" aria-label="モデルの切り替え">
-            <button type="button" class="model-switch-btn" data-model="v1" aria-pressed="true">Cube v1</button>
-            <button type="button" class="model-switch-btn" data-model="v2" aria-pressed="false">Cube v2</button>
+            <button type="button" class="model-switch-btn" data-model="v1" aria-pressed="true">Cube Nano</button>
+            <button type="button" class="model-switch-btn" data-model="v2" aria-pressed="false">Cube Flash</button>
             <button type="button" class="model-switch-btn" data-model="twin" aria-pressed="false">Cube Twin</button>
+            <button type="button" class="model-switch-btn" data-model="ultra" aria-pressed="false">Cube Ultra</button>
           </div>
           <nav class="tabs" aria-label="画面切り替え">
             <button type="button" class="tab-btn" data-tab="chat" aria-pressed="true">チャット</button>
@@ -37,9 +38,12 @@
             <div id="empty-state" class="empty">
               <p class="big">Cubeに質問してみよう</p>
               <p class="desc">
-                Cubeは自作LLMです（Cube v1：約3,177万パラメータ／
-                Cube v2：約5,995万パラメータ／Cube Twin：約2億3,314万
-                パラメータ。ヘッダーで切り替えられます）。
+                Cubeは自作LLMです（Cube Nano：約3,177万パラメータ／
+                Cube Flash：約5,995万パラメータ／Cube Twin：約2億3,314万
+                パラメータ。ヘッダーで切り替えられます）。4つ目の
+                Cube Ultraは、Qwen2.5-1.5Bに追加学習を統合したモデル
+                （約15億パラメータ）をHugging Faceから読み込んで動かす
+                もので、初回読み込みでは約1.2GBのダウンロードがあります。
                 答えには必ず「出どころ」のラベルがつきます。基本はCubeの
                 答えを主表示し、ネット検索は裏づけとして添えます。Cubeと
                 ネットで食い違ったら、ネットの事実を正として表示し、
@@ -112,9 +116,10 @@
               <h3><label for="base-url">モデルの重みベースURL</label></h3>
               <p class="desc">
                 manifest.json / bpe.json / weights-*.bin が置いてある場所を指定します。
-                このURLは選択中のモデル（Cube v1 / Cube v2 / Cube Twin）ごとの上書きとして
+                このURLは選択中のモデル（Cube Nano / Cube Flash / Cube Twin）ごとの上書きとして
                 この端末に保存され、次回から自動で読み込みます。ヘッダーでモデルを
                 切り替えると、そのモデルのURLに切り替わります。
+                Cube Ultra は Hugging Face（FMA03/cube-ultra）から読み込むため、この上書きは適用されません（自作モデル専用です）。
               </p>
               <div class="url-row">
                 <input id="base-url" class="mono" type="url" />
@@ -188,14 +193,21 @@
               <p class="desc">
                 このAIの名前はCubeです。
                 GPT方式Transformerの自作LLMをブラウザの中で直接動かしています。
-                モデルは3つあり、ヘッダーで切り替えられます。Cube v1は
+                モデルは4つあり、ヘッダーで切り替えられます。Cube Nanoは
                 12層・幅448・語彙6,000の自作BPEで約3,177万パラメータ、
-                Cube v2は18層・幅512・語彙6,000の自作BPEで約5,995万
+                Cube Flashは18層・幅512・語彙6,000の自作BPEで約5,995万
                 パラメータ、Cube Twinは18層・幅1024・語彙6,000の自作BPEで
-                約2億3,314万パラメータです（Twinは、v2の蒸留モデルと読解
+                約2億3,314万パラメータです（Twinは、Flashの蒸留モデルと読解
                 モデルを横並びに結合した1つのモデルを、グループ単位の
                 int4量子化で書き出したものです。BPEはモデルごとに別物
                 なので、必ず選択中のモデルの場所から読み込みます）。
+                Cube Ultraは、Qwen2.5-1.5Bに追加学習（LoRA）を統合した
+                モデル（約15億パラメータ）で、自作エンジンではなく
+                @huggingface/transformers を使って Hugging Face
+                （FMA03/cube-ultra）から読み込み、WebGPUで動かします。
+                初めて選んだときにだけ読み込みが始まり、初回は約1.2GBの
+                ダウンロードがあります。ベースURLの上書きや manifest の
+                照合は自作モデル専用で、Ultraには適用されません。
                 外部AIのAPIは使っていません。
                 回答は表示前にウェブ検索と照合し、計算は検算します。
                 照合で「確認済み」になるのは、その質問の対象についての

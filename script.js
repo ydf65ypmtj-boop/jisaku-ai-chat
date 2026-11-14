@@ -3,9 +3,12 @@
  * Cube（GitHub Pages版） script.js
  *
  * 全部ブラウザの中で動く版：
- * - 自作LLMの推論エンジン（Cube v1 / v2 は int8量子化、Cube Twin は
+ * - 自作LLMの推論エンジン（Cube Nano / Flash は int8量子化、Cube Twin は
  *   グループ単位 int4量子化。KVキャッシュ付き。Python版とNodeで
  *   10問全一致を検証済みのエンジンと同一計算）
+ * - Cube Ultra は自作エンジンではなく、Hugging Face（FMA03/cube-ultra）
+ *   のモデルを @huggingface/transformers（WebGPU）で動かす。ライブラリと
+ *   モデルは、Ultra を初めて選んだときだけ遅延読み込みする
  * - 回答の照合は、ブラウザから日本語Wikipedia APIを直接呼んで行う
  * - 知識メモ帳は、この端末のブラウザ内（localStorage）に保存する
  * 外部AIのAPIは使っていない。
@@ -379,7 +382,7 @@ function buildEngine(manifest, bpeJson, fileBuffers) {
   const tensors = {};
   const isInt4 = manifest.format === "jisaku-llm-int4";
   if (!isInt4) {
-    // int8形式（Cube v1 / v2）：従来通りの読み込み。
+    // int8形式（Cube Nano / Flash）：従来通りの読み込み。
     for (const t of manifest.tensors) {
       const buf = bufferForFile(fileBuffers, manifest, t.file);
       if (!buf) throw new Error(`テンソル ${t.name} のファイルがありません`);
@@ -566,15 +569,21 @@ function pruneModelCache(db, basePrefix, keepPrefix) {
 }
 
 /* ================================================================== */
-/* モデル定義（Cube v1 / v2 / Twin 切り替え）                          */
+/* モデル定義（Cube Nano / Flash / Twin / Ultra 切り替え）             */
 /*                                                                    */
-/* v1 と v2 と Twin は語彙数こそ同じ 6000 だが BPE ファイルが別物で   */
-/* トークンIDに互換性がない。そのため BPE は必ず選択中モデルのベース  */
-/* パスから読み込む（LocalModel.load はモデルのベースURL配下からしか  */
-/* 取らない）。manifest の期待値はファイル取り違え防止の照合用で、    */
-/* エンジンを構築する前に total_params・層数・幅が一致しなければ      */
-/* 読み込みエラーにする。重みの端末キャッシュ（IndexedDB）のキーは    */
-/* ベースURLを含むので、各モデルの重みが混ざることはない。            */
+/* Nano と Flash と Twin は語彙数こそ同じ 6000 だが BPE ファイルが    */
+/* 別物でトークンIDに互換性がない。そのため BPE は必ず選択中モデル   */
+/* のベースパスから読み込む（LocalModel.load はモデルのベースURL配下  */
+/* からしか取らない）。manifest の期待値はファイル取り違え防止の照合  */
+/* 用で、エンジンを構築する前に total_params・層数・幅が一致しなけ   */
+/* れば読み込みエラーにする。重みの端末キャッシュ（IndexedDB）の     */
+/* キーはベースURLを含むので、各モデルの重みが混ざることはない。      */
+/*                                                                    */
+/* Cube Ultra は例外：自作エンジンではなく、Hugging Face              */
+/* （FMA03/cube-ultra）のモデルを @huggingface/transformers           */
+/* （WebGPU）で動かす。ベースURL・manifest 照合・ベースURL上書きは    */
+/* 自作モデル専用の仕組みなので Ultra には適用しない（engine が       */
+/* "ultra" のモデルは LocalModel を一切通らない）。                   */
 /* ================================================================== */
 
 const MODEL_ID_KEY = "jisaku-ai-model-id";
@@ -582,7 +591,8 @@ const MODEL_ID_KEY = "jisaku-ai-model-id";
 const MODELS = {
   v1: {
     id: "v1",
-    label: "Cube v1",
+    label: "Cube Nano",
+    engine: "local",
     defaultBaseUrl: "https://ydf65ypmtj-boop.github.io/llm-chat/",
     urlKey: "jisaku-ai-model-base-url",
     maxNew: 48,
@@ -590,23 +600,39 @@ const MODELS = {
   },
   v2: {
     id: "v2",
-    label: "Cube v2",
+    label: "Cube Flash",
+    engine: "local",
     defaultBaseUrl: "https://ydf65ypmtj-boop.github.io/llm-chat/v2/",
     urlKey: "jisaku-ai-model-base-url-v2",
     maxNew: 96,
     expect: { totalParams: 59947008, nLayer: 18, nEmbd: 512 },
   },
-  // Cube Twin：v2の蒸留モデル（r6）と v2の読解モデル（r9read2）を
+  // Cube Twin：Flashの蒸留モデル（r6）と Flashの読解モデル（r9read2）を
   // 横並びに結合した1つのモデル（約2億3,314万パラメータ）を、
   // グループ単位 int4（グループ128）で書き出したもの。ホスト上の
-  // 大きさは約121MB。生成設定は v2 と同じ（最大96トークン）。
+  // 大きさは約121MB。生成設定は Flash と同じ（最大96トークン）。
   twin: {
     id: "twin",
     label: "Cube Twin",
+    engine: "local",
     defaultBaseUrl: "https://ydf65ypmtj-boop.github.io/llm-chat/twin/",
     urlKey: "jisaku-ai-model-base-url-twin",
     maxNew: 96,
     expect: { totalParams: 233140224, nLayer: 18, nEmbd: 1024 },
+  },
+  // Cube Ultra：Qwen2.5-1.5B に LoRA を統合したモデルを Hugging Face
+  // （FMA03/cube-ultra）で公開したもの。自作エンジンではなく
+  // @huggingface/transformers（WebGPU）で動かすため、ベースURL・
+  // manifest 照合・ベースURL上書きは持たない（自作モデル専用の仕組み）。
+  // 生成上限は Ultra 固定の 128 トークン（UltraModel 側で固定）。
+  ultra: {
+    id: "ultra",
+    label: "Cube Ultra",
+    engine: "ultra",
+    defaultBaseUrl: "",
+    urlKey: "",
+    maxNew: 128,
+    expect: null,
   },
 };
 
@@ -782,6 +808,142 @@ const LocalModel = {
     return text.trim();
   },
 };
+
+/* ================================================================== */
+/* Cube Ultra エンジン（@huggingface/transformers / WebGPU）           */
+/*                                                                    */
+/* Qwen2.5-1.5B に LoRA を統合したモデルを Hugging Face で公開した    */
+/* FMA03/cube-ultra を、ブラウザの中で @huggingface/transformers v3   */
+/* （3.8.1 に固定）＋ WebGPU で動かす。Ultra は自作エンジン           */
+/* （LocalModel）を使わない：重みベースURL・manifest 照合・IndexedDB   */
+/* 重みキャッシュはすべて transformers.js の pipeline 側が持つ。      */
+/* ライブラリは ES モジュールとして、Ultra を初めて選んだときにだけ  */
+/* 遅延読み込みする（他のモデルの読み込みでは読み込まない）。         */
+/* 生成条件は検証済みのものと同一：固定の日本語システムプロンプト、   */
+/* greedy（do_sample: false）、max_new_tokens 128。答えは             */
+/* generated_text（メッセージ配列）の最後の assistant メッセージ。    */
+/* pipeline は Ultra が選択中の間だけ保持し、他のモデルへ切り替えた   */
+/* ら破棄する（アクティブなエンジンは常に1つだけ）。                  */
+/* ================================================================== */
+
+const TRANSFORMERS_ESM_URL =
+  "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm";
+
+const ULTRA_REPO = "FMA03/cube-ultra";
+const ULTRA_MAX_NEW_TOKENS = 128;
+/* リポジトリの config.json 上の総パラメータ数（Qwen2：28層・幅1536・
+   語彙151936・埋め込み共有）。表示専用で、manifest のような照合は
+   Ultra には行わない。 */
+const ULTRA_PARAM_COUNT = 1543714304;
+
+const ULTRA_SYSTEM_PROMPT =
+  "あなたは親切なAIアシスタントです。質問には日本語で分かりやすく答えてください。";
+
+const UltraModel = {
+  generator: null,
+  generatorPromise: null,
+  get ready() { return this.generator !== null; },
+  readyFor(id) { return id === "ultra" && this.generator !== null; },
+  /**
+   * FMA03/cube-ultra から pipeline を読み込む（dtype q4f16・device
+   * webgpu）。progress_callback の進捗（ファイル名と、そのファイルの
+   * ダウンロード済み／全体バイト数）を呼び出し側の読み込み表示へ流す。
+   * 初回は onnx/model_q4f16.onnx（約1.23GB）を含む約1.2GBの
+   * ダウンロードがある。失敗（WebGPU非対応・通信エラー等）は例外に
+   * して、呼び出し側の読み込みエラー表示に渡す。
+   */
+  async load(onProgress) {
+    if (this.generator) return;
+    if (!this.generatorPromise) {
+      const self = this;
+      this.generatorPromise = (async () => {
+        const mod = await import(TRANSFORMERS_ESM_URL);
+        const gen = await mod.pipeline("text-generation", ULTRA_REPO, {
+          dtype: "q4f16",
+          device: "webgpu",
+          progress_callback: (data) => {
+            onProgress(
+              data.loaded ?? 0,
+              data.total ?? 0,
+              data.file ?? data.name ?? ULTRA_REPO,
+            );
+          },
+        });
+        self.generator = gen;
+        return gen;
+      })();
+      // 失敗した読み込みで次回の再試行まで塞がない。
+      this.generatorPromise.catch(() => {
+        this.generatorPromise = null;
+      });
+    }
+    await this.generatorPromise;
+  },
+  /* アプリがモデルへ渡すプロンプト文字列から、Ultra の答えを生成する */
+  async generate(prompt) {
+    if (!this.generator) throw new Error("Cube Ultra が読み込まれていません");
+    const messages = [
+      { role: "system", content: ULTRA_SYSTEM_PROMPT },
+      { role: "user", content: prompt },
+    ];
+    const output = await this.generator(messages, {
+      do_sample: false,
+      max_new_tokens: ULTRA_MAX_NEW_TOKENS,
+    });
+    const generated = output?.[0]?.generated_text;
+    if (Array.isArray(generated)) {
+      const last = generated[generated.length - 1];
+      if (
+        last !== null &&
+        typeof last === "object" &&
+        "content" in last &&
+        typeof last.content === "string"
+      ) {
+        return last.content.trim();
+      }
+      return "";
+    }
+    if (typeof generated === "string") return generated.trim();
+    return "";
+  },
+  /* pipeline を破棄する（他のモデルが選択されたときに呼ぶ）。 */
+  dispose() {
+    const pending = this.generatorPromise;
+    this.generator = null;
+    this.generatorPromise = null;
+    if (pending) {
+      void pending
+        .then((gen) => gen.dispose?.())
+        .catch(() => {
+          /* 破棄はベストエフォート */
+        });
+    }
+  },
+};
+
+async function loadUltra(onProgress) {
+  return UltraModel.load(onProgress);
+}
+
+async function generateUltra(prompt) {
+  return UltraModel.generate(prompt);
+}
+
+function disposeUltra() {
+  UltraModel.dispose();
+}
+
+/**
+ * 「回答可能」の判定：読み込み完了したエンジンが選択中モデルと一致
+ * するときだけ真。自作モデルは LocalModel、Ultra は UltraModel が
+ * それぞれ判定し、切り替え先の読み込みに失敗した状態で前のモデルが
+ * 新しいモデルの名前で回答することは絶対にない。
+ */
+function modelReadyFor(id) {
+  return id === "ultra"
+    ? UltraModel.readyFor(id)
+    : LocalModel.readyFor(id);
+}
 
 /* ================================================================== */
 /* 回答コア：正規化・検算・照合・種類つき事実抽出                        */
@@ -4553,6 +4715,7 @@ function formatBytes(n) {
 }
 
 function formatParams(n) {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}B`;
   return `${(n / 1_000_000).toFixed(2)}M`;
 }
 
@@ -4574,7 +4737,10 @@ const App = {
     const savedId = store.get(MODEL_ID_KEY);
     this.modelId = MODELS[savedId] ? savedId : "v1";
     const def = modelDef(this.modelId);
-    this.baseUrl = store.get(def.urlKey) || def.defaultBaseUrl;
+    // Ultra にはベースURLが無い（Hugging Face から読み込む）。
+    this.baseUrl = def.engine === "ultra"
+      ? ""
+      : store.get(def.urlKey) || def.defaultBaseUrl;
     el("base-url").value = this.baseUrl;
     el("current-url").textContent = this.baseUrl;
     for (const btn of document.querySelectorAll(".model-switch-btn")) {
@@ -4675,7 +4841,9 @@ const App = {
     this.modelId = id;
     store.set(MODEL_ID_KEY, id);
     const def = modelDef(id);
-    this.baseUrl = store.get(def.urlKey) || def.defaultBaseUrl;
+    this.baseUrl = def.engine === "ultra"
+      ? ""
+      : store.get(def.urlKey) || def.defaultBaseUrl;
     el("base-url").value = this.baseUrl;
     el("current-url").textContent = this.baseUrl;
     this.renderModelSwitch();
@@ -4693,7 +4861,7 @@ const App = {
     dot.className = "dot";
     if (st.kind === "not_loaded") text.textContent = "モデル未配置";
     if (st.kind === "loading") {
-      text.textContent = `${label} 読み込み中… ${formatBytes(st.loadedBytes)}${st.totalBytes > 0 ? ` / ${formatBytes(st.totalBytes)}` : ""}（${st.label}）`;
+      text.textContent = `${label} 読み込み中… ${formatBytes(st.loadedBytes)}${st.totalBytes > 0 ? ` / ${formatBytes(st.totalBytes)}` : ""}（${st.label}）${this.modelId === "ultra" ? " ※Cube Ultraの初回読み込みは約1.2GBのダウンロードがあります" : ""}`;
     }
     if (st.kind === "ready") {
       text.textContent = `${label} 読み込み完了（パラメータ数 ${formatParams(st.paramCount)}）`;
@@ -4713,12 +4881,56 @@ const App = {
               : "モデル未配置"
       );
     }
+    // Ultra 選択中は、ベースURLの上書き欄（自作モデル専用）を無効化し、
+    // 現在のベースURL欄には Ultra には無い旨を表示する。
+    const isUltra = this.modelId === "ultra";
+    const baseInput = el("base-url");
+    if (baseInput) baseInput.disabled = isUltra;
+    const loadBtn = el("load-model-btn");
+    if (loadBtn) loadBtn.disabled = isUltra;
+    if (isUltra) {
+      const cur = el("current-url");
+      if (cur) {
+        cur.textContent =
+          "（Cube Ultraにはありません。Hugging Face の FMA03/cube-ultra から読み込みます）";
+      }
+    }
   },
 
   async loadModel(url) {
     const def = modelDef(this.modelId);
+    if (def.engine === "ultra") {
+      // Cube Ultra：エンジンは transformers.js の pipeline。ベースURL・
+      // manifest 照合・IndexedDB キャッシュは使わない。読み込み完了の
+      // 記録は UltraModel 側にあり、失敗時は ready にならないので、
+      // 他のモデルが Ultra の名前で回答することは絶対にない。
+      this.modelBusy = true;
+      this.renderModelSwitch();
+      this.setModelStatus({
+        kind: "loading",
+        loadedBytes: 0,
+        totalBytes: 0,
+        label: "Cube Ultra（初回は約1.2GBのダウンロードがあります）",
+      });
+      try {
+        await loadUltra((loaded, total, label) => {
+          this.setModelStatus({ kind: "loading", loadedBytes: loaded, totalBytes: total, label });
+        });
+        this.setModelStatus({ kind: "ready", paramCount: ULTRA_PARAM_COUNT });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        this.setModelStatus({ kind: "error", message });
+      } finally {
+        this.modelBusy = false;
+        this.renderModelSwitch();
+      }
+      return;
+    }
+    // 自作モデルが選択された：Ultra の pipeline があれば破棄する
+    // （アクティブなエンジンは常に1つだけ）。
+    disposeUltra();
     // ベースURLの上書きは選択中モデルごとのキーに保存する
-    // （v1 は従来の jisaku-ai-model-base-url、v2 は専用キー）。
+    // （Nano は従来の jisaku-ai-model-base-url、Flash / Twin は専用キー）。
     store.set(def.urlKey, url);
     this.modelBusy = true;
     this.renderModelSwitch();
@@ -4730,10 +4942,10 @@ const App = {
       this.setModelStatus({ kind: "ready", paramCount: LocalModel.paramCount });
     } catch (e) {
       let message = e instanceof Error ? e.message : String(e);
-      // v2 / Twin の重みがまだアップロードされていない場合の案内を
-      // 添える（黙って v1 で回答することは絶対にしない）。
+      // Flash / Twin の重みがまだアップロードされていない場合の案内を
+      // 添える（黙って Nano で回答することは絶対にしない）。
       if ((def.id === "v2" || def.id === "twin") && message.includes("manifest.json")) {
-        message += `。${def.label} の重みはまだ GitHub にアップロードされていない可能性があります。Cube v1 に戻すと今まで通り使えます`;
+        message += `。${def.label} の重みはまだ GitHub にアップロードされていない可能性があります。Cube Nano に戻すと今まで通り使えます`;
       }
       this.setModelStatus({ kind: "error", message });
     } finally {
@@ -4848,7 +5060,7 @@ const App = {
     // 「回答可能」は、読み込み済みのモデルIDと選択中のIDが一致する
     // ときだけ真。切り替え先の読み込みに失敗した状態では、前のモデル
     // のエンジンで（新しいモデルの名前で）回答することはない。
-    const modelReady = LocalModel.readyFor(this.modelId);
+    const modelReady = modelReadyFor(this.modelId);
     const normalized = normalizeQuestion(question);
     // 今回の検索の失敗理由はここから集める（前の質問の理由を持ち越さない）。
     WikiNet.lastError = "";
@@ -4997,8 +5209,11 @@ const App = {
         this.setPhase("thinking");
         await new Promise((r) => setTimeout(r, 30)); // 「考え中…」を先に描く
         try {
-          // 検算経路のモデル生成にも、選択中モデルの生成上限を渡す。
-          const modelAns = LocalModel.generate(question, modelDef(this.modelId).maxNew);
+          // 検算経路のモデル生成にも、選択中モデルを使う。Ultra の
+          // 生成は非同期（transformers.js）で、上限は Ultra 固定の128。
+          const modelAns = this.modelId === "ultra"
+            ? await generateUltra(question)
+            : LocalModel.generate(question, modelDef(this.modelId).maxNew);
           const modelNums = numbersIn(modelAns);
           if (
             modelAns &&
@@ -5056,8 +5271,11 @@ const App = {
       await new Promise((r) => setTimeout(r, 30));
       try {
         // 通常の質問応答の生成にも、選択中モデルの生成上限
-        // （v1: 48 / v2: 96）を明示的に渡す。
-        modelAnswer = LocalModel.generate(question, modelDef(this.modelId).maxNew);
+        // （Nano: 48 / Flash・Twin: 96）を明示的に渡す。Ultra の生成は
+        // 非同期（transformers.js）で、上限は Ultra 固定の128。
+        modelAnswer = this.modelId === "ultra"
+          ? await generateUltra(question)
+          : LocalModel.generate(question, modelDef(this.modelId).maxNew);
         if (!modelAnswer) modelIssue = "empty";
       } catch (e) {
         modelAnswer = "";
@@ -5436,6 +5654,8 @@ if (typeof module !== "undefined" && module.exports) {
     BPE, GPT, QTensor, Int4Tensor, fp16ToFloat32, tensorElementCount,
     buildEngine, LocalModel,
     MODELS, modelDef, validateManifest,
+    UltraModel, loadUltra, generateUltra, disposeUltra, modelReadyFor,
+    ULTRA_REPO, ULTRA_PARAM_COUNT, ULTRA_MAX_NEW_TOKENS,
     evalArithmetic, extractFact, classifyQuestion,
     resolveArticleSource, searchWikipedia, topicFromQuestion, kindSearchPhrase,
     canonicalTensorName, expectedTensors, modelAgreesWithFact,
