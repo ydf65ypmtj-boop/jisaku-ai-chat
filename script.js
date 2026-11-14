@@ -2608,7 +2608,8 @@ function parseWeatherQuery(q) {
     .replace(/(の|は|って|を)+$/, "")
     .trim();
   if (/^(今|現在|そこ|ここ|あそこ)$/.test(place)) place = "";
-  return { place: place.length >= 2 ? place : null, day };
+  // 1文字の地名（津など）も、場所として指定されたなら使う。
+  return { place: place.length >= 1 ? place : null, day };
 }
 
 /* ================================================================== */
@@ -3685,39 +3686,70 @@ async function resolveArticleSource(q) {
  * 都道府県と市区町村がくっついている（「福島県郡山市」）ことが多く、
  * そのままでは一致しないため、少しずつ短くした形も試す
  * （そのまま／都道府県なし／市区町村の接尾なし／両方なし）。
- * 日本の結果があれば優先する。失敗時は null。
+ * 逆に「東京」「横浜」「津」のような短い形は、データ側の正式名
+ * （「東京都」「横浜市」「津市」）でないと一致しないことがあるため、
+ * 接尾を足した形も試す。同名の小さい地名（青森県の横浜町など）が
+ * 本命の都市より先に返ることがあるため、候補の中では人口の多い
+ * ＝代表的な場所を優先する（人口10万人以上の都市が見つかれば即決）。
+ * 日本の結果だけを使う。失敗時は null。
  */
 async function geocodePlace(place) {
   const noPref = place.replace(/^.+?(?:都|道|府|県)/, "");
   const noCity = place.replace(/(?:市|区|町|村)$/, "");
   const bare = noPref.replace(/(?:市|区|町|村)$/, "");
-  const variants = [...new Set([place, noPref, noCity, bare])].filter(
-    (v) => v.length >= 2,
-  );
+  const withCity = (s) =>
+    !s || /(?:市|区|町|村|都|道|府|県)$/.test(s) ? null : `${s}市`;
+  const prefDone = /(?:都|府|県)$/.test(place);
+  const variants = [
+    ...new Set(
+      [
+        place,
+        withCity(place),
+        noPref,
+        withCity(noPref),
+        noCity,
+        bare,
+        withCity(bare),
+        prefDone ? null : `${place}都`,
+        prefDone ? null : `${place}府`,
+        prefDone ? null : `${place}県`,
+      ].filter((v) => v && v.length >= 1),
+    ),
+  ];
+  const popOf = (r) => (typeof r.population === "number" ? r.population : 0);
+  const toGeo = (r, v) => ({
+    name: r.name ?? v,
+    admin1: r.admin1 ?? "",
+    latitude: r.latitude,
+    longitude: r.longitude,
+    population: popOf(r),
+  });
+  let fallback = null;
   for (const v of variants) {
     try {
       const res = await fetch(
-        `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(v)}&count=5&language=ja&format=json`,
+        `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(v)}&count=10&language=ja&format=json`,
       );
       if (!res.ok) continue;
       const data = await res.json();
       const list = (data.results ?? []).filter(
-        (r) => typeof r.latitude === "number" && typeof r.longitude === "number",
+        (r) =>
+          typeof r.latitude === "number" &&
+          typeof r.longitude === "number" &&
+          r.country_code === "JP",
       );
       if (list.length === 0) continue;
-      const pick = list.find((r) => r.country_code === "JP") ?? list[0];
-      if (!pick) continue;
-      return {
-        name: pick.name ?? v,
-        admin1: pick.admin1 ?? "",
-        latitude: pick.latitude,
-        longitude: pick.longitude,
-      };
+      const best = list.reduce(
+        (a, b) => (popOf(b) > popOf(a) ? b : a),
+        list[0],
+      );
+      if (!fallback || popOf(best) > popOf(fallback)) fallback = best;
+      if (popOf(best) >= 100000) return toGeo(best, v);
     } catch {
       /* 次の形を試す */
     }
   }
-  return null;
+  return fallback ? toGeo(fallback, place) : null;
 }
 
 /** WMO天気コード（Open-Meteo）→ 平易な日本語。 */
@@ -3876,6 +3908,15 @@ async function resolveJmaArea(place, geo) {
   push(geo?.name);
   push(place);
   for (const s of [...names]) push(s.replace(/^.+?(?:都|道|府|県)/, ""));
+  // 「東京」「津」のような短い形は、正式名（「東京都」「津市」）に
+  // 接尾を足した形でも探す（area.json の名前は正式名で載っている）。
+  for (const s of [...names]) {
+    if (/(?:市|区|町|村|都|道|府|県)$/.test(s)) continue;
+    push(`${s}市`);
+    push(`${s}都`);
+    push(`${s}府`);
+    push(`${s}県`);
+  }
   const fromClass20 = (entry) => {
     const c15 = class15s[entry.parent];
     const c10 = c15 ? class10s[c15.parent] : null;
@@ -3900,17 +3941,23 @@ async function resolveJmaArea(place, geo) {
     if (hit) break;
   }
   // 前方一致（「札幌市」→「札幌市中央区」など、区に分かれる政令市）。
+  // 名前の優先順（ジオコーディング名→入力の順）に探し、最初に当たった
+  // 名前の中で一番短いものを採る。全名前を通して一番短いものを採ると、
+  // 「横浜」で青森県の横浜町のような同名の小さい地名を拾ってしまう。
   if (!hit) {
-    let best = null;
     for (const n of names) {
       if (n.length < 2) continue;
+      let best = null;
       for (const [code, v] of Object.entries(class20s)) {
         if (v.name.startsWith(n) && (!best || v.name.length < best.name.length)) {
           best = { code, ...v };
         }
       }
+      if (best) {
+        hit = best;
+        break;
+      }
     }
-    hit = best;
   }
   if (hit) {
     const resolved = fromClass20(hit);
@@ -3922,13 +3969,13 @@ async function resolveJmaArea(place, geo) {
     (geo?.admin1 ?? "").trim() ||
     (place.match(/^.+?(?:都|道|府|県)/)?.[0] ?? "");
   for (const [code, off] of Object.entries(offices)) {
-    if (off.name !== prefName && off.name !== place) continue;
+    if (off.name !== prefName && !names.includes(off.name)) continue;
     const children = off.children ?? [];
     if (children.length === 0) return null;
     let c10code = children[0];
     for (const ch of children) {
       const nm = class10s[ch]?.name ?? "";
-      if (nm && place.includes(nm)) {
+      if (nm && (place.includes(nm) || names.some((n) => n.includes(nm)))) {
         c10code = ch;
         break;
       }
@@ -4177,9 +4224,16 @@ function selectJmaDays(jma, day) {
     precip_prob: d.precip_prob,
   });
   if (day === "week") {
-    return jma.weekly.length > 0
-      ? jma.weekly.map(toLabeled)
-      : [...jma.detailed.values()].map(toLabeled);
+    // 週間予報は明日から始まることが多く、そのままだと今日が抜ける。
+    // 詳細予報（今日〜明後日）と重ねて、日付順に最大7日分を返す
+    // （同じ日は詳細予報の文を優先する）。
+    const byDate = new Map();
+    for (const d of jma.weekly) byDate.set(d.date, d);
+    for (const d of jma.detailed.values()) byDate.set(d.date, d);
+    return [...byDate.values()]
+      .sort((a, b) => (a.date < b.date ? -1 : 1))
+      .slice(0, 7)
+      .map(toLabeled);
   }
   const offset = day === "today" ? 0 : day === "tomorrow" ? 1 : 2;
   const target = new Date();
@@ -4243,13 +4297,45 @@ async function fetchWeather(place, defaultPlace, day) {
     }
     return { ...empty, error: "place_not_found" };
   }
-  const placeLabel = geo.admin1 ? `${geo.admin1} ${geo.name}` : geo.name;
+  const placeLabel =
+    geo.admin1 && geo.admin1 !== geo.name
+      ? `${geo.admin1} ${geo.name}`
+      : geo.name;
   const om = await fetchOpenMeteoWeather(geo, day);
   let jma = null;
   try {
     jma = await fetchJmaForecast(wanted, geo);
   } catch {
     jma = null;
+  }
+  if (jma) {
+    // 人口情報のない弱いジオコーディング（同名の小さい地名など）と
+    // 気象庁の解決した都道府県が食い違うときは、混ぜて答えず
+    // 気象庁の場所で統一する（例：「富山」で千葉県の富山地区の
+    // 現在気温と富山県の予報が混ざる事故の防止）。
+    const prefForm = (s) => /(?:都|府|県)$/.test(s) || s === "北海道";
+    if (
+      geo.admin1 &&
+      prefForm(geo.admin1) &&
+      prefForm(jma.officeName) &&
+      geo.admin1 !== jma.officeName &&
+      !(geo.population > 0)
+    ) {
+      const days = selectJmaDays(jma, day);
+      if (days.length > 0) {
+        return {
+          ok: true,
+          error: "",
+          place_label: `${jma.officeName} ${wanted}`,
+          current_temp: null,
+          current_text: "",
+          days,
+          forecast_source: "jma",
+          jma_area_label: `${jma.officeName}・${jma.areaName}`,
+          source_url: JMA_FORECAST_PAGE,
+        };
+      }
+    }
   }
   if (jma) {
     const days = selectJmaDays(jma, day);
