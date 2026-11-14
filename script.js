@@ -3,8 +3,9 @@
  * Cube（GitHub Pages版） script.js
  *
  * 全部ブラウザの中で動く版：
- * - 自作LLM（約3,177万パラメータ）の推論エンジン（int8量子化・KVキャッシュ付き。
- *   Python版とNodeで10問全一致を検証済みのエンジンと同一計算）
+ * - 自作LLMの推論エンジン（Cube v1 / v2 は int8量子化、Cube Twin は
+ *   グループ単位 int4量子化。KVキャッシュ付き。Python版とNodeで
+ *   10問全一致を検証済みのエンジンと同一計算）
  * - 回答の照合は、ブラウザから日本語Wikipedia APIを直接呼んで行う
  * - 知識メモ帳は、この端末のブラウザ内（localStorage）に保存する
  * 外部AIのAPIは使っていない。
@@ -91,9 +92,94 @@ class QTensor {
 }
 
 function dequantSmall(t) { // LayerNorm等の小さなテンソルは float 化しておく
+  // int4形式では1次元テンソルは fp32 のまま渡ってくる（raw.bin）。
+  if (t instanceof Float32Array) return t;
   const out = new Float32Array(t.q.length);
   for (let i = 0; i < t.q.length; i++) out[i] = t.q[i] * t.scale;
   return out;
+}
+
+// ---------- fp16 デコード（int4形式のグループスケール用） ----------
+/** IEEE 754 半精度1値を float に戻す。スケールは fp16 で保存されている。 */
+function fp16ToFloat32(h) {
+  const sign = h & 0x8000 ? -1 : 1;
+  const exp = (h >> 10) & 0x1f;
+  const frac = h & 0x3ff;
+  if (exp === 0) return sign * (frac / 1024) * 2 ** -14;
+  if (exp === 31) return frac === 0 ? sign * Infinity : NaN;
+  return sign * 2 ** (exp - 15) * (1 + frac / 1024);
+}
+
+// ---------- int4 量子化テンソル（Cube Twin） ----------
+/**
+ * グループ単位 int4 の2次元重み。packed はダウンロードしたシャードへの
+ * ビューのまま保持し、fp32 へは絶対に展開しない（233Mパラメータを
+ * 展開すると約932MBになり破綻する）。要素 (row, col) は全体 index
+ * row*cols+col にあり、バイト (index>>1) の、偶数 index では下位
+ * ニブル・奇数 index では上位ニブル（low-first）。実値は
+ * (code - 8) * scales[row * groupsPerRow + col / groupSize]。
+ * matvec はグループごとに内積へスケールを掛ける。
+ */
+class Int4Tensor {
+  constructor(packed, scales, shape, groupSize) {
+    this.packed = packed; // Uint8Array（ニブル詰め）
+    this.scales = scales; // Float32Array（行×グループ数、fp16から復号済み）
+    this.shape = shape;
+    this.groupSize = groupSize;
+    this.rows = shape[0];
+    this.cols = shape[1];
+    this.groupsPerRow = this.cols / groupSize;
+    this.count = this.rows * this.cols;
+  }
+  // y[o] = bias[o] + sum_g scale[o,g] * sum_j (code-8) * x[g*group+j]
+  matvec(x, bias, out) {
+    const packed = this.packed, scales = this.scales;
+    const nIn = this.cols, nOut = this.rows;
+    const groupSize = this.groupSize, groupsPerRow = this.groupsPerRow;
+    for (let o = 0; o < nOut; o++) {
+      let sum = bias ? bias[o] : 0;
+      const rowBase = o * nIn, scaleBase = o * groupsPerRow;
+      for (let g = 0; g < groupsPerRow; g++) {
+        const s = scales[scaleBase + g];
+        if (s === 0) continue;
+        const base = g * groupSize;
+        let acc = 0;
+        for (let j = 0; j < groupSize; j += 2) {
+          const idx = rowBase + base + j;
+          const byte = packed[idx >> 1];
+          acc += x[base + j] * ((byte & 0xf) - 8) +
+            x[base + j + 1] * (((byte >> 4) & 0xf) - 8);
+        }
+        sum += acc * s;
+      }
+      out[o] = sum;
+    }
+    return out;
+  }
+  rowFloat(rowIdx, out) { // 埋め込み行を float で取り出す（1行だけ展開する）
+    const packed = this.packed, scales = this.scales;
+    const cols = this.cols, groupSize = this.groupSize, groupsPerRow = this.groupsPerRow;
+    const rowBase = rowIdx * cols;
+    for (let g = 0; g < groupsPerRow; g++) {
+      const s = scales[rowIdx * groupsPerRow + g];
+      const base = g * groupSize;
+      for (let j = 0; j < groupSize; j++) {
+        const idx = rowBase + base + j;
+        const byte = packed[idx >> 1];
+        const code = idx % 2 === 0 ? byte & 0xf : (byte >> 4) & 0xf;
+        out[base + j] = (code - 8) * s;
+      }
+    }
+    return out;
+  }
+}
+
+/** テンソルの要素数（形式によらず検証・集計に使う）。 */
+function tensorElementCount(t) {
+  if (t instanceof Float32Array) return t.length;
+  if (t instanceof Int4Tensor) return t.count;
+  if (t && t.q) return t.q.length;
+  return 0;
 }
 
 function layernorm(x, w, b, out) {
@@ -179,12 +265,10 @@ class GPT {
     layernorm(x, this.lnfw, this.lnfb, h);
     const V = this.cfg.vocab_size;
     const logits = new Float32Array(V);
-    const q = this.emb.q, s = this.emb.scale;
-    for (let v = 0; v < V; v++) {
-      const base = v * C; let acc = 0;
-      for (let j = 0; j < C; j++) acc += q[base + j] * h[j];
-      logits[v] = s * acc;
-    }
+    // lm_head は tok_emb と tied。matvec 経由にすることで、int8
+    // （QTensor）でも int4（Int4Tensor）でも同じ経路で計算できる。
+    // int8 の計算結果は従来の直接ループと同一になる。
+    this.emb.matvec(h, null, logits);
     return logits;
   }
   // promptIds を処理し、続きを生成して生成分の id 配列を返す
@@ -273,23 +357,93 @@ function expectedTensors(cfg) {
   return expected;
 }
 
+/**
+ * fileBuffers から、テンソルが属するファイルのバイト列を引く。
+ * fileBuffers は次のどれでもよい：ファイル名→Uint8Array の Map、
+ * ファイル名キーのプレーンオブジェクト、manifest.files 順の配列。
+ * int4形式では scales.bin / raw.bin もファイル名で引ける必要がある。
+ */
+function bufferForFile(fileBuffers, manifest, fileRef) {
+  const name = typeof fileRef === "number" ? manifest.files[fileRef] : fileRef;
+  if (!fileBuffers) return undefined;
+  if (Array.isArray(fileBuffers)) {
+    return typeof fileRef === "number"
+      ? fileBuffers[fileRef]
+      : fileBuffers[manifest.files.indexOf(fileRef)];
+  }
+  if (fileBuffers instanceof Map) return fileBuffers.get(name);
+  return fileBuffers[name];
+}
+
 function buildEngine(manifest, bpeJson, fileBuffers) {
   const tensors = {};
-  for (const t of manifest.tensors) {
-    const buf =
-      fileBuffers[t.file] ??
-      fileBuffers[manifest.files.indexOf(t.file)];
-    if (!buf) throw new Error(`テンソル ${t.name} のファイルがありません`);
-    const bytes = new Int8Array(buf.buffer, buf.byteOffset + t.offset, t.length);
-    tensors[canonicalTensorName(t.name)] = new QTensor(bytes, t.scale, t.shape);
+  const isInt4 = manifest.format === "jisaku-llm-int4";
+  if (!isInt4) {
+    // int8形式（Cube v1 / v2）：従来通りの読み込み。
+    for (const t of manifest.tensors) {
+      const buf = bufferForFile(fileBuffers, manifest, t.file);
+      if (!buf) throw new Error(`テンソル ${t.name} のファイルがありません`);
+      const bytes = new Int8Array(buf.buffer, buf.byteOffset + t.offset, t.length);
+      tensors[canonicalTensorName(t.name)] = new QTensor(bytes, t.scale, t.shape);
+    }
+  } else {
+    // int4形式（Cube Twin）：2次元重みはニブル詰めのまま保持し、
+    // 1次元テンソルは raw.bin の fp32 をそのまま使う。
+    if (!manifest.scales_file || !manifest.raw_file) {
+      throw new Error("int4形式の manifest に scales_file / raw_file がありません");
+    }
+    const scalesBuf = bufferForFile(fileBuffers, manifest, manifest.scales_file);
+    const rawBuf = bufferForFile(fileBuffers, manifest, manifest.raw_file);
+    if (!scalesBuf || !rawBuf) {
+      throw new Error("int4形式の scales / raw ファイルがありません");
+    }
+    const scalesView = new DataView(
+      scalesBuf.buffer, scalesBuf.byteOffset, scalesBuf.byteLength,
+    );
+    for (const t of manifest.tensors) {
+      const canon = canonicalTensorName(t.name);
+      if (t.kind === "fp32") {
+        const rawOff = t.raw_off ?? 0;
+        const rawLen = t.raw_len ?? 0;
+        let floats;
+        if ((rawBuf.byteOffset + rawOff) % 4 === 0) {
+          floats = new Float32Array(rawBuf.buffer, rawBuf.byteOffset + rawOff, rawLen / 4);
+        } else {
+          floats = new Float32Array(rawLen / 4);
+          const view = new DataView(rawBuf.buffer, rawBuf.byteOffset, rawBuf.byteLength);
+          for (let i = 0; i < floats.length; i++) {
+            floats[i] = view.getFloat32(rawOff + i * 4, true);
+          }
+        }
+        tensors[canon] = floats;
+      } else if (t.kind === "int4") {
+        const buf = bufferForFile(fileBuffers, manifest, t.file);
+        if (!buf) throw new Error(`テンソル ${t.name} のファイルがありません`);
+        const groupSize = t.group ?? 128;
+        const scaleCount = (t.scale_shape ?? []).reduce((a, b) => a * b, 1);
+        const scales = new Float32Array(scaleCount);
+        const scaleOff = t.scale_off ?? 0;
+        for (let i = 0; i < scaleCount; i++) {
+          scales[i] = fp16ToFloat32(scalesView.getUint16(scaleOff + i * 2, true));
+        }
+        const packed = new Uint8Array(
+          buf.buffer, buf.byteOffset + (t.offset ?? 0), t.packed_len ?? 0,
+        );
+        tensors[canon] = new Int4Tensor(packed, scales, t.shape, groupSize);
+      } else {
+        throw new Error(`テンソル ${t.name} の kind が不明です（${t.kind ?? "なし"}）`);
+      }
+    }
   }
   // 全テンソル検証：生成に必要な重みが全部そろい、大きさも合う時だけ通す。
   const problems = [];
   for (const [name, len] of expectedTensors(manifest.config)) {
     const t = tensors[name];
     if (!t) problems.push(`${name} がありません`);
-    else if (t.q.length !== len) {
-      problems.push(`${name} の大きさが合いません（${t.q.length} ≠ ${len}）`);
+    else if (tensorElementCount(t) !== len) {
+      problems.push(`${name} の大きさが合いません（${tensorElementCount(t)} ≠ ${len}）`);
+    } else if (t instanceof Int4Tensor && t.packed.length * 2 !== t.count) {
+      problems.push(`${name} のパック済みデータ長が合いません（${t.packed.length * 2} ≠ ${t.count}）`);
     }
   }
   if (problems.length > 0) {
@@ -412,15 +566,15 @@ function pruneModelCache(db, basePrefix, keepPrefix) {
 }
 
 /* ================================================================== */
-/* モデル定義（Cube v1 / v2 切り替え）                                 */
+/* モデル定義（Cube v1 / v2 / Twin 切り替え）                          */
 /*                                                                    */
-/* v1 と v2 は語彙数こそ同じ 6000 だが BPE ファイルが別物でトークン   */
-/* IDに互換性がない。そのため BPE は必ず選択中モデルのベースパスから  */
-/* 読み込む（LocalModel.load はモデルのベースURL配下からしか取らない）。*/
-/* manifest の期待値はファイル取り違え防止の照合用で、エンジンを構築  */
-/* する前に total_params・層数・幅が一致しなければ読み込みエラーに    */
-/* する。重みの端末キャッシュ（IndexedDB）のキーはベースURLを含む    */
-/* ので、v1 と v2 の重みが混ざることはない。                          */
+/* v1 と v2 と Twin は語彙数こそ同じ 6000 だが BPE ファイルが別物で   */
+/* トークンIDに互換性がない。そのため BPE は必ず選択中モデルのベース  */
+/* パスから読み込む（LocalModel.load はモデルのベースURL配下からしか  */
+/* 取らない）。manifest の期待値はファイル取り違え防止の照合用で、    */
+/* エンジンを構築する前に total_params・層数・幅が一致しなければ      */
+/* 読み込みエラーにする。重みの端末キャッシュ（IndexedDB）のキーは    */
+/* ベースURLを含むので、各モデルの重みが混ざることはない。            */
 /* ================================================================== */
 
 const MODEL_ID_KEY = "jisaku-ai-model-id";
@@ -441,6 +595,18 @@ const MODELS = {
     urlKey: "jisaku-ai-model-base-url-v2",
     maxNew: 96,
     expect: { totalParams: 59947008, nLayer: 18, nEmbd: 512 },
+  },
+  // Cube Twin：v2の蒸留モデル（r6）と v2の読解モデル（r9read2）を
+  // 横並びに結合した1つのモデル（約2億3,314万パラメータ）を、
+  // グループ単位 int4（グループ128）で書き出したもの。ホスト上の
+  // 大きさは約121MB。生成設定は v2 と同じ（最大96トークン）。
+  twin: {
+    id: "twin",
+    label: "Cube Twin",
+    defaultBaseUrl: "https://ydf65ypmtj-boop.github.io/llm-chat/twin/",
+    urlKey: "jisaku-ai-model-base-url-twin",
+    maxNew: 96,
+    expect: { totalParams: 233140224, nLayer: 18, nEmbd: 1024 },
   },
 };
 
@@ -520,18 +686,27 @@ const LocalModel = {
     }
     const bpeJson = JSON.parse(bpeText);
 
+    // 取得するファイル：重みシャード一式に、int4形式ではグループ
+    // スケールのファイルと fp32 の生ファイルも加える。
+    const isInt4 = manifest.format === "jisaku-llm-int4";
+    if (isInt4 && (!manifest.scales_file || !manifest.raw_file)) {
+      throw new Error("int4形式の manifest に scales_file / raw_file がありません");
+    }
+    const fileNames = [...manifest.files];
+    if (isInt4) fileNames.push(manifest.scales_file, manifest.raw_file);
+
     // シャード：キャッシュにあるものはそのまま使い、無いものだけ
     // バイト単位で進捗を数えながら読み、次回のために保存する。
-    const totals = manifest.files.map(() => 0);
+    const totals = fileNames.map(() => 0);
     let loadedTotal = 0;
-    const buffers = [];
-    for (let i = 0; i < manifest.files.length; i++) {
-      const name = manifest.files[i];
+    const buffers = new Map();
+    for (let i = 0; i < fileNames.length; i++) {
+      const name = fileNames[i];
       if (cache) {
         const hit = await modelCacheGet(cache, cacheKey(name));
         if (hit instanceof ArrayBuffer) {
           const buf = new Uint8Array(hit);
-          buffers.push(buf);
+          buffers.set(name, buf);
           totals[i] = buf.byteLength;
           loadedTotal += buf.byteLength;
           onProgress(loadedTotal, totals.reduce((a, b) => a + b, 0), `${name}（キャッシュから）`);
@@ -544,7 +719,7 @@ const LocalModel = {
       if (len > 0) totals[i] = len;
       if (!r.body || !r.body.getReader) {
         const buf = new Uint8Array(await r.arrayBuffer());
-        buffers.push(buf);
+        buffers.set(name, buf);
         loadedTotal += totals[i] || buf.byteLength;
         onProgress(loadedTotal, totals.reduce((a, b) => a + b, 0), name);
         if (cache) {
@@ -565,7 +740,7 @@ const LocalModel = {
       const buf = new Uint8Array(got);
       let off = 0;
       for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
-      buffers.push(buf);
+      buffers.set(name, buf);
       loadedTotal += got;
       if (cache) {
         void modelCachePut(cache, cacheKey(name), buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
@@ -573,7 +748,10 @@ const LocalModel = {
     }
     this.engine = buildEngine(manifest, bpeJson, buffers);
     this.paramCount = manifest.total_params ||
-      manifest.tensors.reduce((a, t) => a + t.length, 0);
+      manifest.tensors.reduce(
+        (a, t) => a + (t.length ?? (t.shape ?? []).reduce((x, y) => x * y, 1)),
+        0,
+      );
     // 試し生成：「読み込み完了」はファイルが届いたことではなく、
     // 実際に生成できること。ここで落ちる失敗は読み込みエラーとして出す。
     try {
@@ -4263,8 +4441,9 @@ const App = {
   init() {
     Notebook.load();
     // 選択中のモデルを復元する（初期値は v1）。ベースURLはモデルごとの
-    // 上書きとして読み込む（v1 は従来キー、v2 は専用キー）。
-    this.modelId = store.get(MODEL_ID_KEY) === "v2" ? "v2" : "v1";
+    // 上書きとして読み込む（v1 は従来キー、v2 / Twin は専用キー）。
+    const savedId = store.get(MODEL_ID_KEY);
+    this.modelId = MODELS[savedId] ? savedId : "v1";
     const def = modelDef(this.modelId);
     this.baseUrl = store.get(def.urlKey) || def.defaultBaseUrl;
     el("base-url").value = this.baseUrl;
@@ -4351,7 +4530,7 @@ const App = {
   },
 
   /* 切り替えボタンの見た目：選択中のモデルを押し込み表示にし、
-     読み込み中は両方とも無効化する。 */
+     読み込み中はすべて無効化する。 */
   renderModelSwitch() {
     for (const btn of document.querySelectorAll(".model-switch-btn")) {
       btn.setAttribute("aria-pressed", String(btn.dataset.model === this.modelId));
@@ -4422,10 +4601,10 @@ const App = {
       this.setModelStatus({ kind: "ready", paramCount: LocalModel.paramCount });
     } catch (e) {
       let message = e instanceof Error ? e.message : String(e);
-      // v2 の重みがまだアップロードされていない場合の案内を添える
-      // （黙って v1 で回答することは絶対にしない）。
-      if (def.id === "v2" && message.includes("manifest.json")) {
-        message += "。Cube v2 の重みはまだ GitHub にアップロードされていない可能性があります。Cube v1 に戻すと今まで通り使えます";
+      // v2 / Twin の重みがまだアップロードされていない場合の案内を
+      // 添える（黙って v1 で回答することは絶対にしない）。
+      if ((def.id === "v2" || def.id === "twin") && message.includes("manifest.json")) {
+        message += `。${def.label} の重みはまだ GitHub にアップロードされていない可能性があります。Cube v1 に戻すと今まで通り使えます`;
       }
       this.setModelStatus({ kind: "error", message });
     } finally {
@@ -5125,7 +5304,8 @@ if (typeof document !== "undefined") {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    BPE, GPT, QTensor, buildEngine, LocalModel,
+    BPE, GPT, QTensor, Int4Tensor, fp16ToFloat32, tensorElementCount,
+    buildEngine, LocalModel,
     MODELS, modelDef, validateManifest,
     evalArithmetic, extractFact, classifyQuestion,
     resolveArticleSource, searchWikipedia, topicFromQuestion, kindSearchPhrase,

@@ -20,6 +20,7 @@
           <div class="model-switch" role="group" aria-label="モデルの切り替え">
             <button type="button" class="model-switch-btn" data-model="v1" aria-pressed="true">Cube v1</button>
             <button type="button" class="model-switch-btn" data-model="v2" aria-pressed="false">Cube v2</button>
+            <button type="button" class="model-switch-btn" data-model="twin" aria-pressed="false">Cube Twin</button>
           </div>
           <nav class="tabs" aria-label="画面切り替え">
             <button type="button" class="tab-btn" data-tab="chat" aria-pressed="true">チャット</button>
@@ -37,7 +38,8 @@
               <p class="big">Cubeに質問してみよう</p>
               <p class="desc">
                 Cubeは自作LLMです（Cube v1：約3,177万パラメータ／
-                Cube v2：約5,995万パラメータ。ヘッダーで切り替えられます）。
+                Cube v2：約5,995万パラメータ／Cube Twin：約2億3,314万
+                パラメータ。ヘッダーで切り替えられます）。
                 答えには必ず「出どころ」のラベルがつきます。基本はCubeの
                 答えを主表示し、ネット検索は裏づけとして添えます。Cubeと
                 ネットで食い違ったら、ネットの事実を正として表示し、
@@ -110,7 +112,7 @@
               <h3><label for="base-url">モデルの重みベースURL</label></h3>
               <p class="desc">
                 manifest.json / bpe.json / weights-*.bin が置いてある場所を指定します。
-                このURLは選択中のモデル（Cube v1 / Cube v2）ごとの上書きとして
+                このURLは選択中のモデル（Cube v1 / Cube v2 / Cube Twin）ごとの上書きとして
                 この端末に保存され、次回から自動で読み込みます。ヘッダーでモデルを
                 切り替えると、そのモデルのURLに切り替わります。
               </p>
@@ -186,11 +188,15 @@
               <p class="desc">
                 このAIの名前はCubeです。
                 GPT方式Transformerの自作LLMをブラウザの中で直接動かしています。
-                モデルは2つあり、ヘッダーで切り替えられます。Cube v1は
+                モデルは3つあり、ヘッダーで切り替えられます。Cube v1は
                 12層・幅448・語彙6,000の自作BPEで約3,177万パラメータ、
                 Cube v2は18層・幅512・語彙6,000の自作BPEで約5,995万
-                パラメータです（BPEはモデルごとに別物なので、必ず選択中の
-                モデルの場所から読み込みます）。外部AIのAPIは使っていません。
+                パラメータ、Cube Twinは18層・幅1024・語彙6,000の自作BPEで
+                約2億3,314万パラメータです（Twinは、v2の蒸留モデルと読解
+                モデルを横並びに結合した1つのモデルを、グループ単位の
+                int4量子化で書き出したものです。BPEはモデルごとに別物
+                なので、必ず選択中のモデルの場所から読み込みます）。
+                外部AIのAPIは使っていません。
                 回答は表示前にウェブ検索と照合し、計算は検算します。
                 照合で「確認済み」になるのは、その質問の対象についての
                 日本語Wikipediaの1記事だけが裏づけたときだけです
