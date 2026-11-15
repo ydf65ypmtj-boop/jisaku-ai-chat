@@ -4,8 +4,8 @@
  *
  * 全部ブラウザの中で動く版：
  * - 自作LLMの推論エンジン（Cube Nano / Flash は int8量子化、Cube Twin /
- *   Cube Pro はグループ単位 int4量子化。KVキャッシュ付き。Python版とNodeで
- *   10問全一致を検証済みのエンジンと同一計算）
+ *   Cube Pro / Cube Max はグループ単位 int4量子化。KVキャッシュ付き。
+ *   Python版とNodeで10問全一致を検証済みのエンジンと同一計算）
  * - Cube Ultra は自作エンジンではなく、Hugging Face（FMA03/cube-ultra）
  *   のモデルを @huggingface/transformers（WebGPU）で動かす。ライブラリと
  *   モデルは、Ultra を初めて選んだときだけ遅延読み込みする
@@ -113,7 +113,7 @@ function fp16ToFloat32(h) {
   return sign * 2 ** (exp - 15) * (1 + frac / 1024);
 }
 
-// ---------- int4 量子化テンソル（Cube Twin / Pro） ----------
+// ---------- int4 量子化テンソル（Cube Twin / Pro / Max） ----------
 /**
  * グループ単位 int4 の2次元重み。packed はダウンロードしたシャードへの
  * ビューのまま保持し、fp32 へは絶対に展開しない（233Mパラメータを
@@ -390,7 +390,7 @@ function buildEngine(manifest, bpeJson, fileBuffers) {
       tensors[canonicalTensorName(t.name)] = new QTensor(bytes, t.scale, t.shape);
     }
   } else {
-    // int4形式（Cube Twin / Pro）：2次元重みはニブル詰めのまま保持し、
+    // int4形式（Cube Twin / Pro / Max）：2次元重みはニブル詰めのまま保持し、
     // 1次元テンソルは raw.bin の fp32 をそのまま使う。
     if (!manifest.scales_file || !manifest.raw_file) {
       throw new Error("int4形式の manifest に scales_file / raw_file がありません");
@@ -569,13 +569,14 @@ function pruneModelCache(db, basePrefix, keepPrefix) {
 }
 
 /* ================================================================== */
-/* モデル定義（Cube Nano / Flash / Twin / Pro / Ultra 切り替え）      */
+/* モデル定義（Cube Nano / Flash / Twin / Pro / Max / Ultra 切り替え）*/
 /*                                                                    */
 /* Nano と Flash と Twin は語彙数こそ同じ 6000 だが BPE ファイルが    */
-/* 別物でトークンIDに互換性がない。Pro の BPE は語彙32,000（bpe_v3）  */
-/* で、他の自作モデルとは互換性がない。そのため BPE は必ず選択中モデル   */
-/* のベースパスから読み込む（LocalModel.load はモデルのベースURL配下  */
-/* からしか取らない）。manifest の期待値はファイル取り違え防止の照合  */
+/* 別物でトークンIDに互換性がない。Pro と Max の BPE は語彙32,000      */
+/* （bpe_v3）で、他の自作モデルとは互換性がない。そのため BPE は      */
+/* 必ず選択中モデルのベースパスから読み込む（LocalModel.load は      */
+/* モデルのベースURL配下からしか取らない）。manifest の期待値は        */
+/* ファイル取り違え防止の照合  */
 /* 用で、エンジンを構築する前に total_params・層数・幅が一致しなけ   */
 /* れば読み込みエラーにする。重みの端末キャッシュ（IndexedDB）の     */
 /* キーはベースURLを含むので、各モデルの重みが混ざることはない。      */
@@ -636,6 +637,24 @@ const MODELS = {
     urlKey: "jisaku-ai-model-base-url-pro",
     maxNew: 48,
     expect: { totalParams: 297815040, nLayer: 21, nEmbd: 1024 },
+  },
+  // Cube Max：v3モデル（語彙32,000の自作BPE）の蒸留 r1 と r2 を
+  // 横並びに結合した1つのモデル（総パラメータ 1,189,648,384、
+  // 21層・幅2048・32ヘッド）。全ゲート合格（回帰5/5・初見31/40・
+  // 読解24/30・習得484/500）を受けて公開するもの。Pro・Twin と
+  // まったく同じグループ単位 int4 形式（グループ128、lm_head は
+  // tok_emb と tied）で書き出したものなので、読み込み経路は Pro と
+  // 同一で、違うのはベースURL・manifest の照合値だけ。生成設定は
+  // Pro と同じ（greedy、最大48トークン）。ホスト上の大きさは
+  // 合計 582,679,390 バイト（約583MB）。
+  max: {
+    id: "max",
+    label: "Cube Max",
+    engine: "local",
+    defaultBaseUrl: "https://ydf65ypmtj-boop.github.io/llm-chat/max/",
+    urlKey: "jisaku-ai-model-base-url-max",
+    maxNew: 48,
+    expect: { totalParams: 1189648384, nLayer: 21, nEmbd: 2048 },
   },
   // Cube Ultra：Qwen2.5-1.5B に LoRA を統合したモデルを Hugging Face
   // （FMA03/cube-ultra）で公開したもの。自作エンジンではなく
@@ -6649,7 +6668,7 @@ const App = {
   init() {
     Notebook.load();
     // 選択中のモデルを復元する（初期値は v1）。ベースURLはモデルごとの
-    // 上書きとして読み込む（v1 は従来キー、v2 / Twin / Pro は専用キー）。
+    // 上書きとして読み込む（v1 は従来キー、v2 / Twin / Pro / Max は専用キー）。
     const savedId = store.get(MODEL_ID_KEY);
     this.modelId = MODELS[savedId] ? savedId : "v1";
     const def = modelDef(this.modelId);
@@ -6853,7 +6872,7 @@ const App = {
     // （アクティブなエンジンは常に1つだけ）。
     disposeUltra();
     // ベースURLの上書きは選択中モデルごとのキーに保存する
-    // （Nano は従来の jisaku-ai-model-base-url、Flash / Twin / Pro は専用キー）。
+    // （Nano は従来の jisaku-ai-model-base-url、Flash / Twin / Pro / Max は専用キー）。
     store.set(def.urlKey, url);
     this.modelBusy = true;
     this.renderModelSwitch();
@@ -6865,9 +6884,9 @@ const App = {
       this.setModelStatus({ kind: "ready", paramCount: LocalModel.paramCount });
     } catch (e) {
       let message = e instanceof Error ? e.message : String(e);
-      // Flash / Twin / Pro の重みがまだアップロードされていない場合の
-      // 案内を添える（黙って Nano で回答することは絶対にしない）。
-      if ((def.id === "v2" || def.id === "twin" || def.id === "pro") && message.includes("manifest.json")) {
+      // Flash / Twin / Pro / Max の重みがまだアップロードされていない
+      // 場合の案内を添える（黙って Nano で回答することは絶対にしない）。
+      if ((def.id === "v2" || def.id === "twin" || def.id === "pro" || def.id === "max") && message.includes("manifest.json")) {
         message += `。${def.label} の重みはまだ GitHub にアップロードされていない可能性があります。Cube Nano に戻すと今まで通り使えます`;
       }
       this.setModelStatus({ kind: "error", message });
