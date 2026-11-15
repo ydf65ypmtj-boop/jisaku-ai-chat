@@ -1201,6 +1201,271 @@ function evalArithmetic(question) {
   }
 }
 
+"use strict";
+/* calc_lane.js — Faithful JavaScript port of ~/workspace/hybrid/calc_lane.py
+ * (hybrid system lane 3: pattern-based exact computation for Japanese
+ * arithmetic questions). Returns {answer, steps, kind[, expr|remainder]}
+ * or null when no pattern matches (the lane abstains).
+ *
+ * Port notes (behavior on the probe set is byte-identical to Python):
+ * - Python's eval() for the restricted expression grammar is replaced by
+ *   a two-pass evaluator (no eval): * and / bind tighter than + and -,
+ *   left-associative, exactly like Python. Division by zero -> null
+ *   (Python raises -> None). A numeric token with a leading zero such as
+ *   "007" -> null (Python eval raises SyntaxError on such literals).
+ * - Python's \d is Unicode-aware; JS \d is ASCII-only. All patterns run
+ *   on norm()ed text (full-width digits are translated to ASCII first),
+ *   except solve_sub's payment regex, which Python applies to the raw
+ *   text: it is applied to norm(text) here so full-width digits behave
+ *   the same. Keyword checks stay on the raw text, as in Python.
+ * - Number formatting: integral floats are converted to integers before
+ *   stringifying (same as Python's `val.is_integer()` -> int()).
+ *
+ * Exposes globalThis.CalcLane = { solve } (solveCalc). No module.exports
+ * side effects, so the file can be embedded verbatim into Cube's
+ * script.js and also loaded directly from Node for testing.
+ */
+const CalcLane = (() => {
+  const ZEN_MAP = {
+    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+    "＋": "+", "－": "-", "×": "×", "÷": "÷", "＊": "*", "／": "/", "＝": "=",
+  };
+
+  function norm(s) {
+    let out = "";
+    for (const ch of String(s)) out += ZEN_MAP[ch] ?? ch;
+    return out.replace(/ /g, "").replace(/　/g, "").replace(/,/g, "");
+  }
+
+  function nums(text) {
+    return (norm(text).match(/\d+/g) ?? []).map((x) => parseInt(x, 10));
+  }
+
+  const MINUS = "−"; // U+2212 (as in the Python f-strings)
+  const FEQ = "＝"; // U+FF1D full-width equals
+  const MUL = "×"; // U+00D7
+  const DIV = "÷"; // U+00F7
+
+  function subSteps(a, b) {
+    if (b === 0) return `${a}${MINUS}0${FEQ}${a}`;
+    const parts = [];
+    let rem = b;
+    for (const unit of [1000, 100, 10, 1]) {
+      const d = Math.floor(rem / unit) * unit;
+      if (d) parts.push(d);
+      rem -= d;
+    }
+    const steps = [`${a}${MINUS}${b}を計算する。`];
+    let cur = a;
+    for (const p of parts) {
+      steps.push(`${cur}${MINUS}${p}${FEQ}${cur - p}。`);
+      cur -= p;
+    }
+    return steps.join("");
+  }
+
+  function divAnswer(a, b) {
+    const q = Math.floor(a / b);
+    const r = a % b;
+    let steps = `${a}${DIV}${b}${FEQ}${q}`;
+    if (r) steps += ` あまり${r}`;
+    return [q, r, steps];
+  }
+
+  const COUNTERS = "個|枚|本|つ|冊|台|匹|人|円";
+
+  function mulResult(a, b, unit, label = "全部で") {
+    const ans = a * b;
+    let steps = `${a}${MUL}${b}${FEQ}${ans}。`;
+    if (label) steps += `${label}${ans}${unit}。`;
+    return { answer: ans, steps, kind: "mul" };
+  }
+
+  function solveMul(text) {
+    const t = norm(text);
+    // direct: "6かける7は？" ("6×7" is handled by solveExpression)
+    let m = new RegExp("(\\d+)かける(\\d+)").exec(t);
+    if (m) return mulResult(parseInt(m[1], 10), parseInt(m[2], 10), "", "");
+    // per-container: "1箱にボールが6個入っています。7箱では全部で何個？"
+    if (t.includes("全部で") || t.includes("何個") || t.includes("いくつ")) {
+      m = new RegExp(
+        "1(.{1,6}?)に[^0-9]*?(\\d+)\\s*(" + COUNTERS + ")[^0-9]*?(\\d+)\\1",
+      ).exec(t);
+      if (m) {
+        const per = parseInt(m[2], 10);
+        const unit = m[3];
+        const cnt = parseInt(m[4], 10);
+        return mulResult(per, cnt, unit);
+      }
+    }
+    // per-person handout: "1人に3個ずつ5人に配ると全部で何個？"
+    m = new RegExp("(\\d+)\\s*(" + COUNTERS + ")ずつ\\D{0,8}?(\\d+)人").exec(t);
+    if (m) return mulResult(parseInt(m[1], 10), parseInt(m[3], 10), m[2]);
+    // same handout, people first: "2人に4枚ずつ配ると全部で何枚？"
+    m = new RegExp("(\\d+)人に(\\d+)\\s*(" + COUNTERS + ")ずつ").exec(t);
+    if (m) return mulResult(parseInt(m[2], 10), parseInt(m[1], 10), m[3]);
+    return null;
+  }
+
+  // Two-pass evaluator for ^\d+(op\d+)+$ with Python eval semantics.
+  function evalExpr(expr) {
+    const tokens = expr.match(/\d+|[+\-×÷*/]/g);
+    if (!tokens) return null;
+    const values = [];
+    const ops = [];
+    for (let i = 0; i < tokens.length; i++) {
+      if (i % 2 === 0) {
+        if (/^0\d/.test(tokens[i])) return null; // Python: SyntaxError
+        values.push(parseInt(tokens[i], 10));
+      } else {
+        ops.push(tokens[i]);
+      }
+    }
+    // pass 1: × ÷ (and their ASCII forms * /)
+    const v2 = [values[0]];
+    const o2 = [];
+    for (let i = 0; i < ops.length; i++) {
+      const op = ops[i];
+      const rhs = values[i + 1];
+      if (op === "×" || op === "*") {
+        v2[v2.length - 1] = v2[v2.length - 1] * rhs;
+      } else if (op === "÷" || op === "/") {
+        if (rhs === 0) return null; // Python: ZeroDivisionError
+        v2[v2.length - 1] = v2[v2.length - 1] / rhs;
+      } else {
+        o2.push(op);
+        v2.push(rhs);
+      }
+    }
+    // pass 2: + -
+    let val = v2[0];
+    for (let i = 0; i < o2.length; i++) {
+      val = o2[i] === "+" ? val + v2[i + 1] : val - v2[i + 1];
+    }
+    return val;
+  }
+
+  function fmtVal(val) {
+    // Python: float with integral value -> int before str()
+    return Number.isInteger(val) ? String(Math.trunc(val)) : String(val);
+  }
+
+  function solveExpression(text) {
+    const t = norm(text);
+    const m = /(\d+(?:[+\-×÷*/]\d+)+)/.exec(t);
+    if (!m) return null;
+    const expr = m[1];
+    const val = evalExpr(expr);
+    if (val === null || !Number.isFinite(val)) return null;
+    const shown = expr.replace(/\*/g, "×").replace(/\//g, "÷");
+    const v = Number.isInteger(val) ? Math.trunc(val) : val;
+    return { answer: v, steps: `${shown}${FEQ}${fmtVal(val)}`, kind: "expr", expr: shown };
+  }
+
+  function solveSub(text) {
+    const t = text;
+    const ns = nums(t);
+    if (ns.length < 2) return null;
+    const kw = ["おつり", "残り", "差は", "差いくつ", "引く", "違い",
+      "よりいくつ大きい", "より大きい"].some((k) => t.includes(k));
+    if (!kw) return null;
+    let a = ns[0];
+    let b = ns[1];
+    if (t.includes("より")) {
+      a = Math.max(...ns);
+      b = Math.min(...ns);
+      const ans = a - b;
+      return { answer: ans, steps: subSteps(a, b) + `差は${ans}。`, kind: "sub" };
+    }
+    // price first, payment second: "670円のおもちゃを買って2000円を出した"
+    // (Python applies this regex to the raw text; JS \d is ASCII-only, so
+    // it runs on norm(text) — see the port notes at the top.)
+    if (/買って\d+円を出し|円札で|を出した/.test(norm(t))) {
+      const price = ns[0];
+      const pay = ns[ns.length - 1];
+      if (pay >= price) {
+        a = pay;
+        b = price;
+      }
+    } else if (t.includes("差")) {
+      a = Math.max(...ns);
+      b = Math.min(...ns);
+    }
+    const ans = a - b;
+    const unit = t.includes("円") ? "円" : t.includes("人") ? "人" : "";
+    const label = t.includes("おつり") ? "おつり" : t.includes("残り") ? "残り" : "差";
+    return {
+      answer: ans,
+      steps: subSteps(a, b) + `${label}は${ans}${unit}。`,
+      kind: "sub",
+    };
+  }
+
+  function solveDiv(text) {
+    const t = text;
+    const ns = nums(t);
+    if (ns.length < 2) return null;
+    let m = /(\d+)を(\d+)で割る/.exec(norm(t));
+    if (m) {
+      const a = parseInt(m[1], 10);
+      const b = parseInt(m[2], 10);
+      if (b) {
+        const [q, r, steps] = divAnswer(a, b);
+        return { answer: q, steps: steps + "。", kind: "div", remainder: r };
+      }
+    }
+    // grouping by count: "24個を6個ずつ分けると何人分？" -> total / group size
+    m = new RegExp(
+      "(\\d+)\\s*(" + COUNTERS + ")[^0-9を]{0,6}を(\\d+)\\s*(" + COUNTERS + ")ずつ",
+    ).exec(norm(t));
+    if (m) {
+      const a = parseInt(m[1], 10);
+      const b = parseInt(m[3], 10);
+      if (b) {
+        const [q, r, steps] = divAnswer(a, b);
+        let tail;
+        if (t.includes("組")) tail = `${q}組。`;
+        else if (t.includes("人分")) tail = `${q}人分。`;
+        else tail = `${q}${m[4]}分。`;
+        if (r) tail += `あまり${r}${m[2]}。`;
+        return { answer: q, steps: steps + "。" + tail, kind: "div", remainder: r };
+      }
+    }
+    const kw = ["分けると", "分けたら", "割り勘", "ずつ配", "ずつ分け",
+      "何組", "何人分", "1人", "一人"].some((k) => t.includes(k));
+    if (!kw) return null;
+    const a = ns[0];
+    const b = ns[1];
+    if (b === 0) return null;
+    const [q, r, steps] = divAnswer(a, b);
+    const unit = t.includes("円") ? "円"
+      : t.includes("個") ? "個"
+      : t.includes("本") ? "本"
+      : t.includes("枚") ? "枚" : "";
+    let tail = (t.includes("1人") || t.includes("一人") || t.includes("分けると"))
+      ? `1人${q}${unit}。`
+      : `${q}${unit}。`;
+    if (r) tail += `あまり${r}${unit}。`;
+    return { answer: q, steps: steps + "。" + tail, kind: "div", remainder: r };
+  }
+
+  function solveCalc(text) {
+    // multiplication must run before division: "1人に3個ずつ5人に配る"
+    // contains the division keyword "1人" but is a multiplication.
+    return (
+      solveExpression(text) ||
+      solveMul(text) ||
+      solveDiv(text) ||
+      solveSub(text)
+    );
+  }
+
+  return { solve: solveCalc, solveCalc };
+})();
+
+globalThis.CalcLane = CalcLane;
+
 /** 文中の数字（半角化してから拾う）。
  *  3桁区切りは先に外す：「3,776.12」は1つの数であり、「3」と「776.12」
  *  に割るとカンマ無しで書いたモデルの答えと照合できなくなる。 */
@@ -6991,6 +7256,7 @@ const App = {
   /* 質問への回答の流れ：
      0) 天気 → 気象庁の予報＋Open-Meteoの現在の状況（実データ）
      0.5) Cube自身の質問 → 固定情報
+     0.75) 計算レーン → 正確な計算結果（過程つき）
      1) 知識メモ帳 → 即答＋裏で再確認
      2) 計算 → 検算 3) モデル生成 → 対象記事の事実で照合 */
   async ask(rawQuestion) {
@@ -7089,6 +7355,26 @@ const App = {
         text: selfAnswer,
         badge: "self",
         note: "Cube自身についての質問には、モデルやネット検索ではなく、アプリに固定した正しい情報から答えています。この種別の答えは知識メモ帳に保存しません。",
+      });
+      return;
+    }
+
+    // 0.75) 計算レーン：文章題を含む計算のパターンに一致したら、
+    // モデル・メモ帳を素通りして、正確な計算結果（過程つき）を
+    // そのまま答える。結果は従来の計算経路と同じ形でメモ帳に残す。
+    const lane = CalcLane.solve(question);
+    if (lane) {
+      this.pushAssistant({
+        text: lane.steps,
+        badge: "calc",
+      });
+      this.saveNotebook({
+        question,
+        answer: lane.steps,
+        source_title: "",
+        source_url: "",
+        question_type: "calc",
+        fact: String(lane.answer),
       });
       return;
     }
@@ -7600,7 +7886,7 @@ if (typeof module !== "undefined" && module.exports) {
     MODELS, modelDef, validateManifest,
     UltraModel, loadUltra, generateUltra, disposeUltra, modelReadyFor,
     ULTRA_REPO, ULTRA_PARAM_COUNT, ULTRA_MAX_NEW_TOKENS,
-    evalArithmetic, extractFact, classifyQuestion,
+    evalArithmetic, CalcLane, extractFact, classifyQuestion,
     resolveArticleSource, searchWikipedia, topicFromQuestion, kindSearchPhrase,
     canonicalTensorName, expectedTensors, modelAgreesWithFact,
     isCorroborated, findCorroboratingResult,
