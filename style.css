@@ -236,6 +236,7 @@ a { color: var(--accent); }
 .badge-calc { background: #26706b; color: #ffffff; }
 .badge-self { background: #7a4a56; color: #ffffff; }
 .badge-weather { background: #1f6fb2; color: #ffffff; }
+.badge-briefing { background: #b25f16; color: #ffffff; }
 .badge-model { background: #a84e2f; color: #ffffff; }
 .badge-net { background: #3e6390; color: #ffffff; }
 .badge-unverified { background: #9a6206; color: #ffffff; }
@@ -244,6 +245,7 @@ a { color: var(--accent); }
   .badge-calc { background: #6fbfb8; color: #1d1a15; }
   .badge-self { background: #d59aa7; color: #1d1a15; }
   .badge-weather { background: #7db3dd; color: #1d1a15; }
+  .badge-briefing { background: #e0a35c; color: #1d1a15; }
   .badge-model { background: #e08a6d; color: #1d1a15; }
   .badge-net { background: #8fb0cc; color: #1d1a15; }
   .badge-unverified { background: #d9a84e; color: #1d1a15; }

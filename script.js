@@ -1706,6 +1706,132 @@ async function ultraWriteFactAnswer(question, article, fact) {
   }
 }
 
+/* ================================================================== */
+/* 朝のブリーフィング                                                  */
+/*                                                                    */
+/* 朝（05:00–11:00）にその日初めて Cube を開いたとき、iMac サーバー   */
+/* の /briefing（天気・学校の行事・近くのイベントを集めた材料）を     */
+/* 取り、Ultra（iMac の llama-server）に読解形式で読ませて挨拶文を   */
+/* 書かせ、会話の先頭に出す。材料集めはサーバー側（briefing.js）が   */
+/* 担当し、ページ側は表示だけ。どの段階で失敗しても何も出さず、      */
+/* 通常の利用を妨げない（フェイルソフト）。Ultra が書けなければ      */
+/* 材料のデータだけの文面で出す。選択中のモデルが Ultra でなくても   */
+/* ブリーフィングは Ultra が担当する（バッジで明示する）。           */
+/* ================================================================== */
+
+const BRIEFING_FETCH_TIMEOUT_MS = 20000;
+const BRIEFING_START_HOUR = 5;
+const BRIEFING_END_HOUR = 11;
+
+/* ローカル日付を YYYY-MM-DD で返す（ブリーフィングの当日判定用）。 */
+function localDateKey(d) {
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+/* "2026-11-19" -> "11月19日"（材料の文章用）。 */
+function briefingDateLabel(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ""));
+  if (!m) return String(iso || "");
+  return `${Number(m[2])}月${Number(m[3])}日`;
+}
+
+/* /briefing の JSON から、Ultra に読ませる材料を組み立てる。
+   材料は天気・学校・イベントの節（セクション）単位に分ける：
+   Ultra は1つの材料につき1つの話題を書くのが得意で、全部を
+   1回で書かせると最初の話題だけで終わってしまうため、節ごとに
+   書かせて後でつなぐ。各節は {key, passage（読ませる文）,
+   prose（書けなかった節の代替文）}、全体の plain は全節が
+   書けなかったときのデータのみ表示文。伝えることが何も
+   無ければ null。 */
+function buildBriefingMaterial(data) {
+  if (!data || typeof data !== "object") return null;
+  const sections = [];
+  const plain = [];
+  const w = data.weather;
+  if (w && typeof w === "object") {
+    const parts = [];
+    if (w.text) parts.push(String(w.text));
+    const hasMax = w.temp_max !== null && w.temp_max !== undefined;
+    const hasMin = w.temp_min !== null && w.temp_min !== undefined;
+    if (hasMax && hasMin) parts.push(`最高気温${w.temp_max}°C・最低気温${w.temp_min}°C`);
+    else if (hasMax) parts.push(`最高気温${w.temp_max}°C`);
+    else if (hasMin) parts.push(`最低気温${w.temp_min}°C`);
+    if (w.precip_prob !== null && w.precip_prob !== undefined) {
+      parts.push(`降水確率${w.precip_prob}%`);
+    }
+    if (w.current_temp !== null && w.current_temp !== undefined) {
+      parts.push(`現在の気温${w.current_temp}°C`);
+    }
+    if (parts.length) {
+      const prose = `今日の郡山市の天気は、${parts.join("、")}です。`;
+      sections.push({ key: "weather", passage: prose, prose });
+      plain.push(`天気：${parts.join("、")}`);
+    }
+  }
+  const school = Array.isArray(data.school) ? data.school : [];
+  const schoolProse = [];
+  for (const s of school.slice(0, 5)) {
+    if (!s || !s.event) continue;
+    if (s.date === data.date) {
+      schoolProse.push(`今日の学校の行事は「${s.event}」です。`);
+      plain.push(`学校：今日は ${s.event}`);
+    } else {
+      schoolProse.push(`学校の次の行事は${briefingDateLabel(s.date)}の「${s.event}」です。`);
+      plain.push(`学校：${briefingDateLabel(s.date)} ${s.event}`);
+    }
+  }
+  if (schoolProse.length) {
+    sections.push({
+      key: "school",
+      passage: schoolProse.join("\n"),
+      prose: schoolProse.join(""),
+    });
+  }
+  const events = Array.isArray(data.events) ? data.events : [];
+  // イベントは3件まで：4件あると Ultra の生成上限（128トークン）に
+  // 当たって途中で切れ、節ごと材料文に落ちてしまうため。
+  const evs = events.filter((e) => e && e.title).slice(0, 3);
+  if (evs.length) {
+    const names = evs.map(
+      (e) => `「${e.title}」${e.venue ? `（会場：${e.venue}）` : ""}`,
+    );
+    const prose = `今日の近くのイベントには、${names.join("、")}があります。`;
+    sections.push({ key: "events", passage: prose, prose });
+    for (const e of evs) {
+      plain.push(`イベント：${e.title}${e.venue ? `（${e.venue}）` : ""}`);
+    }
+  }
+  if (!sections.length) return null;
+  return {
+    passage: sections.map((s) => s.passage).join("\n"),
+    sections,
+    plain: plain.join("\n"),
+  };
+}
+
+/* ブリーフィングの節ごとに Ultra へ渡す質問文。1節＝1話題に
+   絞る（全部まとめて書かせると最初の話題だけで終わるため）。 */
+const BRIEFING_SECTION_QUESTIONS = {
+  weather:
+    "この内容をもとに、今日の天気を簡潔に伝えてください。です・ます調で書いてください。",
+  school:
+    "この内容をもとに、学校の行事を簡潔に伝えてください。今日の行事と、次の行事の日付も入れてください。です・ます調で書いてください。",
+  events:
+    "この内容をもとに、今日の近くのイベントを簡潔に紹介してください。です・ます調で書いてください。",
+};
+
+/* Ultra の生成がトークン上限で途中に切れていたら、最後の文の
+   終わりまでで整える。文の終わりが1つも無ければ失敗扱い（空文字）。 */
+function trimBriefingTail(text) {
+  const s = String(text || "").trim();
+  if (!s) return "";
+  if (/[。！？」』]$/.test(s)) return s;
+  const idx = s.lastIndexOf("。");
+  return idx >= 20 ? s.slice(0, idx + 1) : "";
+}
+
 /**
  * 「回答可能」の判定：準備完了したエンジンが選択中モデルと一致する
  * ときだけ真。端末内モデル（Nano / Flash）は LocalModel、サーバー
@@ -7540,6 +7666,7 @@ async function fetchArticle(q) {
 /* ================================================================== */
 
 const NB_KEY = "jisaku-ai-codepen-notebook-v1";
+const BRIEFING_DATE_KEY = "cube-briefing-date";
 const URL_KEY = "jisaku-ai-model-base-url";
 const WEATHER_PLACE_KEY = "jisaku-ai-weather-place";
 const DEFAULT_WEATHER_PLACE = "福島県郡山市";
@@ -7636,6 +7763,7 @@ const BADGES = {
     className: "badge-weather",
   },
   "weather-om": { label: "天気情報（Open-Meteo）", className: "badge-weather" },
+  briefing: { label: "朝のブリーフィング（Cube Ultra）", className: "badge-briefing" },
   model: {
     label: "Cubeの答え（ネットで確認済み）",
     className: "badge-model",
@@ -7783,6 +7911,8 @@ const App = {
     this.renderSettings();
     this.setModelStatus({ kind: "not_loaded" });
     void this.loadModel(this.baseUrl);
+    // 朝のブリーフィング（条件に合うときだけ、裏で静かに試す）。
+    void this.maybeShowBriefing();
   },
 
   showTab(name) {
@@ -8346,6 +8476,101 @@ const App = {
     }
     el("msg-list").appendChild(li);
     this.scrollChat();
+  },
+
+  /* 朝のブリーフィングを会話の一番上に差す（pushAssistant と同じ
+     形だが、末尾ではなく先頭に入れる）。 */
+  pushBriefing(text) {
+    el("empty-state").hidden = true;
+    const li = document.createElement("li");
+    li.className = "msg-ai";
+    const b = document.createElement("span");
+    b.className = `badge mono ${BADGES.briefing.className}`;
+    b.textContent = BADGES.briefing.label;
+    li.appendChild(b);
+    const p = document.createElement("p");
+    p.className = "answer";
+    p.textContent = text;
+    li.appendChild(p);
+    const list = el("msg-list");
+    list.insertBefore(li, list.children[0] || null);
+  },
+
+  /* 朝のブリーフィング：05:00–11:00 の間に、その日初めて Cube を
+     開いたときだけ、iMac の /briefing から材料を取り、Ultra に
+     書かせて会話の先頭に出す。init から非同期に呼び、どの段階で
+     失敗しても何も出さない（通常の Cube の邪魔をしない）。
+     Ultra が書けなければ材料のデータだけの文面で出す。ユーザーが
+     既に質問していたら出さない（印も付けないので、次の機会に
+     改めて試す）。表示できたら当日の日付を記録し、同日は再表示
+     しない。 */
+  async maybeShowBriefing() {
+    try {
+      const now = new Date();
+      const hour = now.getHours();
+      if (hour < BRIEFING_START_HOUR || hour >= BRIEFING_END_HOUR) return;
+      const today = localDateKey(now);
+      if (store.get(BRIEFING_DATE_KEY) === today) return;
+      let data = null;
+      try {
+        const res = await fetchWithTimeout(
+          `${CUBE_SERVER_BASE_URL}/briefing`,
+          { method: "GET" },
+          BRIEFING_FETCH_TIMEOUT_MS,
+        );
+        if (res && res.ok) data = await res.json().catch(() => null);
+      } catch {
+        data = null;
+      }
+      // サーバー側の日付（JST）と端末の日付が違うデータは使わない。
+      if (!data || data.date !== today) return;
+      const material = buildBriefingMaterial(data);
+      if (!material) return;
+      let text = "";
+      try {
+        await UltraImacModel.load(() => {});
+        // 節ごとに書かせる（1回で全部書かせると最初の話題だけで
+        // 終わる）。書けた節は Ultra の文、書けなかった節は材料の
+        // 文でつなぎ、1節でも書けたらブリーフィングとして出す。
+        const parts = [];
+        let anyWritten = false;
+        for (const section of material.sections) {
+          let written = "";
+          try {
+            const out = await generateUltra(
+              `文：${section.passage}\n質問：${BRIEFING_SECTION_QUESTIONS[section.key] || "この内容を簡潔に伝えてください。です・ます調で書いてください。"}`,
+            );
+            const t = (out || "").trim();
+            if (t && !isUltraAbstention(t)) {
+              written = trimBriefingTail(normalizeUltraWrittenStyle(t));
+            }
+          } catch {
+            written = "";
+          }
+          if (written) anyWritten = true;
+          parts.push(written || section.prose);
+        }
+        if (anyWritten) {
+          text = `おはようございます。${parts.join("")}`.replace(
+            /^おはようございます。おはようございます。/,
+            "おはようございます。",
+          );
+        }
+      } catch {
+        text = "";
+      }
+      if (!text) text = material.plain;
+      if (!text) return;
+      // 既に会話が始まっていたら、邪魔をしない。
+      const chatted = [...el("msg-list").children].some(
+        (c) => c && c.className === "msg-user",
+      );
+      if (chatted) return;
+      this.pushBriefing(text);
+      store.set(BRIEFING_DATE_KEY, today);
+    } catch {
+      /* ブリーフィングの失敗は黙って流す */
+    }
   },
 
   saveNotebook(entry) {
@@ -9035,6 +9260,7 @@ if (typeof module !== "undefined" && module.exports) {
     normalizeUltraWrittenStyle,
     UltraGgufModel, loadUltraGguf,
     UltraImacModel, loadUltraImac, ULTRA_IMAC_BASE_URL, ULTRA_IMAC_UNREACHABLE,
+    buildBriefingMaterial, trimBriefingTail, localDateKey, BRIEFING_DATE_KEY,
     ServerModel, generateForModel, CUBE_SERVER_BASE_URL, CUBE_SERVER_UNREACHABLE,
     readUltraStage, writeUltraStage,
     ULTRA_REPO, ULTRA_PARAM_COUNT, ULTRA_MAX_NEW_TOKENS,
