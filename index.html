@@ -21,6 +21,14 @@
             <p id="ultra-gguf-notice-text" class="ultra-gguf-notice-text"></p>
             <button type="button" id="ultra-gguf-btn" class="primary-btn ultra-gguf-btn">軽量エンジンで試す（GGUF版）</button>
           </div>
+          <div id="ultra-engine-choice" class="ultra-engine-choice" hidden>
+            <p class="ultra-engine-choice-text">Cube Ultra のエンジンを選んでください。<span id="ultra-engine-saved-note"></span></p>
+            <div class="ultra-engine-choice-btns">
+              <button type="button" id="ultra-load-onnx-btn" class="primary-btn">通常エンジンで読み込む（ONNX）</button>
+              <button type="button" id="ultra-load-gguf-btn" class="primary-btn">軽量エンジンで読み込む（GGUF版）</button>
+            </div>
+            <p class="ultra-engine-choice-note">iPad では軽量エンジン（GGUF版）がおすすめです（約986MB）。通常エンジンは約1.2GBです。</p>
+          </div>
           <div class="model-switch" role="group" aria-label="モデルの切り替え">
             <button type="button" class="model-switch-btn" data-model="v1" aria-pressed="true">Cube Nano</button>
             <button type="button" class="model-switch-btn" data-model="v2" aria-pressed="false">Cube Flash</button>

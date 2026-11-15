@@ -8,10 +8,13 @@
  *   Python版とNodeで10問全一致を検証済みのエンジンと同一計算）
  * - Cube Ultra は自作エンジンではなく、Hugging Face（FMA03/cube-ultra）
  *   のモデルを @huggingface/transformers（WebGPU）で動かす。ライブラリと
- *   モデルは、Ultra を初めて選んだときだけ遅延読み込みする。通常版の
- *   読み込みがブラウザの再読み込みで中断されたときの予備経路として、
- *   同じモデルの GGUF 版を @wllama/wllama（llama.cpp の WASM 版）で
- *   動かす軽量エンジンも持つ（自動では始めず、ボタンを押したときだけ）
+ *   モデルは、Ultra を初めて選んだときだけ遅延読み込みする。Ultra では
+ *   エンジンを自動で開始せず、ステータスバーの選択ブロックから通常
+ *   エンジン（ONNX）と軽量エンジン（GGUF版）のどちらかをユーザーが
+ *   選んで読み込む。軽量エンジンは、同じモデルの GGUF 版を
+ *   @wllama/wllama（llama.cpp の WASM 版）で動かす。GGUF 版は読み込み・
+ *   生成の各フェーズを localStorage に記録し、タブが落ちた場合は次回に
+ *   「どこで落ちたか」を具体的に通知できるようにする
  * - 回答の照合は、ブラウザから日本語Wikipedia APIを直接呼んで行う
  * - 知識メモ帳は、この端末のブラウザ内（localStorage）に保存する
  * 外部AIのAPIは使っていない。
@@ -915,14 +918,16 @@ const LocalModel = {
 /* そろった直後は、ブラウザキャッシュへの保存コピーと WebGPU          */
 /* セッション構築が重なってメモリ使用量が跳ね上がり、メモリの少ない   */
 /* 端末（iPad 等）ではブラウザがタブごと再読み込みすることがある。     */
-/* このページ自体はリロードを一切呼ばないが、再読み込みされると        */
-/* App.init が保存済みの Ultra を自動で読み直すため、落ちる→再読み     */
-/* 込み→また落ちる、の繰り返しになってしまう。そこで読み込みの試行    */
-/* 回数を sessionStorage に印として残す（タブを閉じれば消える）。      */
-/* 1回落ちたら、次回はキャッシュ済みのファイルから再試行する          */
-/* （保存コピーの重なりが無く、ピークが低い）。2回続けて落ちたら       */
-/* 自動の再試行を止め、理由をエラー表示にする。ユーザーがモデルを      */
-/* 選び直したときだけ印を消し、最初から試せるようにする。             */
+/* このページ自体はリロードを一切呼ばない。Ultra はエンジンを自動で    */
+/* 開始しない（選択ブロックからユーザーが選ぶ）ので、落ちる→自動で    */
+/* 読み直す→また落ちる、という繰り返しにはならないが、どこで落ちた    */
+/* かを次回に伝えるため、読み込みの試行回数を sessionStorage に印と   */
+/* して残す（タブを閉じれば消える）。1回落ちたら印が残り、次回は      */
+/* 理由の表示と選択ブロックを出す。ユーザーが通常エンジンを選び直せ   */
+/* ば、キャッシュ済みのファイルから再試行になる（保存コピーの重なり   */
+/* が無く、ピークが低い）。2回続けて落ちたら（印が "build2"）自動の    */
+/* 再試行を止め、理由をエラー表示にする。ユーザーがモデルを選び直し   */
+/* たときだけ印を消し、最初から試せるようにする。                     */
 /* ================================================================== */
 
 const TRANSFORMERS_ESM_URL =
@@ -961,6 +966,42 @@ function writeUltraStage(value) {
     else sessionStorage.setItem(ULTRA_STAGE_KEY, value);
   } catch {
     /* 印が残せなくても読み込み自体は続ける */
+  }
+}
+
+/* 読み込みに成功した Ultra のエンジン（"onnx" / "gguf"）の保存キー。
+   次回エンジン選択ブロックを出すとき、「前回はどちらのエンジンで
+   読み込めたか」を案内するために使う（store ラッパ経由）。 */
+const ULTRA_ENGINE_KEY = "cube-ultra-engine";
+
+/* GGUF 版のフェーズ記録（localStorage）。読み込み・生成のどの段階で
+   タブが落ちたかを次回に具体的に伝えるためのもので、JSON
+   {phase, pct, answered, reported} を残す。phase は
+   "download"（ダウンロード中）→ "load"（ダウンロード完了・モデル
+   読み込み中）→ "ready"（読み込み完了・未回答）→ "generating"
+   （回答生成中）→ "answered"（1回以上回答できた）。pct はダウン
+   ロード進捗（%）、answered は回答できた回数、reported は落下通知を
+   既に出したかどうか。sessionStorage の試行の印と違い、タブを閉じ
+   ても残る（読み込み完了後に落ちるケースはタブを跨いで検知する
+   必要があるため）。記録に失敗しても読み込み自体は止めない。 */
+const ULTRA_GGUF_PHASE_KEY = "cube-ultra-gguf-phase";
+function readGgufPhase() {
+  try {
+    const raw = store.get(ULTRA_GGUF_PHASE_KEY);
+    if (!raw) return null;
+    const rec = JSON.parse(raw);
+    if (!rec || typeof rec !== "object" || typeof rec.phase !== "string") return null;
+    return rec;
+  } catch {
+    return null;
+  }
+}
+function writeGgufPhase(rec) {
+  try {
+    if (rec === null) window.localStorage.removeItem(ULTRA_GGUF_PHASE_KEY);
+    else store.set(ULTRA_GGUF_PHASE_KEY, JSON.stringify(rec));
+  } catch {
+    /* 記録できなくても読み込み自体は続ける */
   }
 }
 
@@ -1098,10 +1139,16 @@ const UltraModel = {
 /* ChatML 形式に組み立て（apply_chat_template 相当）、greedy          */
 /* （temperature 0・top_k 1・seed 42）、最大128トークン、停止文字列は  */
 /* <|im_end|> と <|endoftext|>。答えは choices[0].text を trim した    */
-/* もの。通常版の試行がタブ落下で中断されたときにだけ通知エリアへ     */
-/* ボタンを出し、自動では開始しない（App 側の制御）。試行の印は       */
-/* 通常版と共用の ULTRA_STAGE_KEY に "gguf" / "gguf2" として残し、    */
-/* GGUF 版の落下が合計2回に達したら自動の再試行を止める。             */
+/* もの。通常版と軽量エンジンのどちらも自動では開始せず、Ultra を   */
+/* 選んだ時点でステータスバーに出る選択ブロックからユーザーが選ぶ。 */
+/* 試行の印は通常版と共用の ULTRA_STAGE_KEY に "gguf" / "gguf2" と   */
+/* して残し、GGUF 版の落下が合計2回に達したら自動の再試行を止める。 */
+/* さらに、読み込み・生成のどのフェーズで落ちたかを localStorage の  */
+/* フェーズ記録（"cube-ultra-gguf-phase"）に残す：試行開始で         */
+/* "download"、ダウンロード完了で "load"、読み込み成功で "ready"、   */
+/* 生成開始で "generating"、生成成功で "answered"。読み込み完了後に  */
+/* 落ちるケース（最初の生成時・常駐時）は stage の印では分からない   */
+/* ため、この記録で次回に落下箇所を具体的に通知する。                 */
 /* ================================================================== */
 
 const WLLAMA_ESM_URL =
@@ -1152,6 +1199,9 @@ const UltraGgufModel = {
       const isRetry = prevStage === "gguf";
       this.recoveredFromCrash = isRetry;
       writeUltraStage(isRetry ? "gguf2" : "gguf");
+      // フェーズ記録：この試行はダウンロードから始まる。タブが落ちたら
+      // この記録が残り、次回に「どこで落ちたか」を通知できる。
+      writeGgufPhase({ phase: "download", pct: 0, answered: 0, reported: false });
       this.loadPromise = (async () => {
         const [mod, wasmMod] = await Promise.all([
           import(WLLAMA_ESM_URL),
@@ -1160,44 +1210,99 @@ const UltraGgufModel = {
         const wllama = new mod.Wllama(wasmMod.default, {
           parallelDownloads: 1,
         });
+        // 読み込みは loadModelFromUrl に任せる：wllama が OPFS
+        // キャッシュ経由でストリーミング読み込みするので、986MB を
+        // JS の ArrayBuffer / Blob に丸ごと保持しない最も軽い経路に
+        // なる。手動 fetch + loadModel([blob]) のような二重保持に
+        // なる方式には変えないこと。
         await wllama.loadModelFromUrl(ULTRA_GGUF_URL, {
           n_ctx: 2048,
           n_threads: 1,
           progressCallback: ({ loaded, total }) => {
+            // フェーズ記録を進捗に合わせて更新する。loaded が total に
+            // 達したらダウンロード完了＝モデルの読み込み中（"load"）。
+            // キャッシュ済みの場合も wllama は loaded = total で1回
+            // 呼ぶため、この判定でダウンロード完了を検知できる。
+            const pct = total > 0 ? Math.floor((loaded / total) * 100) : 0;
+            const done = total > 0 && loaded >= total;
+            const cur = readGgufPhase();
+            writeGgufPhase({
+              phase: done ? "load" : "download",
+              pct,
+              answered: cur && typeof cur.answered === "number" ? cur.answered : 0,
+              reported: cur ? !!cur.reported : false,
+            });
             onProgress(loaded ?? 0, total ?? 0, ULTRA_GGUF_FILE_LABEL);
           },
         });
         self.wllama = wllama;
-        // 起動できたので印を消す。
+        // 起動できたので印を消し、フェーズは「読み込み完了・未回答」
+        // に進める（この後にタブが落ちたら、生成前の落下と分かる）。
         writeUltraStage(null);
+        writeGgufPhase({ phase: "ready", pct: 100, answered: 0, reported: false });
         return wllama;
       })();
       // 失敗した読み込みで次回の再試行まで塞がない。通常の例外で
-      // 失敗したときも印を消す（印が残るのはタブが落ちたときだけ）。
+      // 失敗したときも印とフェーズ記録を消す（両方が残るのはタブが
+      // 落ちたときだけ）。
       this.loadPromise.catch(() => {
         this.loadPromise = null;
         writeUltraStage(null);
+        writeGgufPhase(null);
       });
     }
     await this.loadPromise;
+    // 成功が確定したら、読み込み約束への保持参照は手放す（モデル実体は
+    // this.wllama が保持する）。余分な参照を残さないための最小化。
+    this.loadPromise = null;
   },
   /* アプリがモデルへ渡すプロンプト文字列から、GGUF 版の答えを生成する。
      プロンプトの組み立てと生成条件は通常版と完全同一（上のセクション
      コメント参照）。 */
   async generate(prompt) {
     if (!this.wllama) throw new Error("Cube Ultra（軽量エンジン）が読み込まれていません");
+    // フェーズ記録：生成の開始を残す。生成の途中でタブが落ちたら、
+    // 次回に「回答生成の途中で落ちた」と通知できる（answered は維持）。
+    const before = readGgufPhase();
+    const answeredBefore = before && typeof before.answered === "number" ? before.answered : 0;
+    writeGgufPhase({
+      phase: "generating",
+      pct: 100,
+      answered: answeredBefore,
+      reported: before ? !!before.reported : false,
+    });
     const chatml =
       `<|im_start|>system\n${ULTRA_SYSTEM_PROMPT}<|im_end|>\n` +
       `<|im_start|>user\n${prompt}<|im_end|>\n` +
       `<|im_start|>assistant\n`;
-    const res = await this.wllama.createCompletion({
-      prompt: chatml,
-      max_tokens: ULTRA_MAX_NEW_TOKENS,
-      temperature: 0,
-      temp: 0,
-      top_k: 1,
-      seed: 42,
-      stop: ["<|im_end|>", "<|endoftext|>"],
+    let res;
+    try {
+      res = await this.wllama.createCompletion({
+        prompt: chatml,
+        max_tokens: ULTRA_MAX_NEW_TOKENS,
+        temperature: 0,
+        temp: 0,
+        top_k: 1,
+        seed: 42,
+        stop: ["<|im_end|>", "<|endoftext|>"],
+      });
+    } catch (e) {
+      // 通常の例外で失敗したときは、落下と誤認しないようフェーズを
+      // 生成前の状態へ戻してから投げ直す。
+      writeGgufPhase({
+        phase: answeredBefore > 0 ? "answered" : "ready",
+        pct: 100,
+        answered: answeredBefore,
+        reported: false,
+      });
+      throw e;
+    }
+    // 生成できた：フェーズを "answered" に進め、回答できた回数を増やす。
+    writeGgufPhase({
+      phase: "answered",
+      pct: 100,
+      answered: answeredBefore + 1,
+      reported: false,
     });
     const text = res?.choices?.[0]?.text;
     return typeof text === "string" ? text.trim() : "";
@@ -7156,6 +7261,16 @@ const App = {
     if (ggufBtn) {
       ggufBtn.addEventListener("click", () => void this.loadUltraGguf());
     }
+    // エンジン選択ブロックの2ボタン：Ultra を選んだら最初から出し、
+    // 押されたエンジンだけを開始する（どちらも自動では開始しない）。
+    const onnxChoiceBtn = el("ultra-load-onnx-btn");
+    if (onnxChoiceBtn) {
+      onnxChoiceBtn.addEventListener("click", () => void this.loadUltraOnnx());
+    }
+    const ggufChoiceBtn = el("ultra-load-gguf-btn");
+    if (ggufChoiceBtn) {
+      ggufChoiceBtn.addEventListener("click", () => void this.loadUltraGguf());
+    }
     this.renderModelSwitch();
     this.weatherPlace = store.get(WEATHER_PLACE_KEY) || DEFAULT_WEATHER_PLACE;
     const wpInput = el("weather-place");
@@ -7275,6 +7390,9 @@ const App = {
       (st.kind === "ready" ? "ready" : st.kind === "error" ? "error" : st.kind === "loading" ? "loading" : "");
     dot.className = "dot";
     if (st.kind === "not_loaded") text.textContent = "モデル未配置";
+    // standby：未読み込みだが、案内文（st.message）をそのまま出す。
+    // 見た目は not_loaded と同じ（ドット・色・メモ欄の扱いも同じ）。
+    if (st.kind === "standby") text.textContent = st.message;
     if (st.kind === "loading") {
       text.textContent = `${label} 読み込み中… ${formatBytes(st.loadedBytes)}${st.totalBytes > 0 ? ` / ${formatBytes(st.totalBytes)}` : ""}（${st.label}）${this.modelId === "ultra" ? " ※Cube Ultraの初回読み込みは約1.2GBのダウンロードがあります" : ""}`;
     }
@@ -7312,12 +7430,37 @@ const App = {
     }
   },
 
+  /* エンジン選択ブロックの表示／非表示。show のときは、前回読み込みに
+     成功したエンジンが保存されていれば、その案内を添える。Ultra の
+     エンジンはどちらも自動では開始せず、このブロックのボタンが
+     押されたときだけ開始する。 */
+  setUltraEngineChoice(show) {
+    const box = el("ultra-engine-choice");
+    if (!box) return;
+    if (show) {
+      const note = el("ultra-engine-saved-note");
+      if (note) {
+        const saved = store.get(ULTRA_ENGINE_KEY);
+        note.textContent =
+          saved === "onnx"
+            ? "前回は通常エンジンで読み込めました"
+            : saved === "gguf"
+              ? "前回は軽量エンジンで読み込めました"
+              : "";
+      }
+    }
+    box.hidden = !show;
+  },
+
   /* 軽量エンジン（GGUF版）への切り替え案内（通知エリア）の表示。
      mode が null なら隠す。通常版の試行がタブ落下で中断された状態
-     （"onnx-interrupted"：再試行中／"onnx-stopped"：2回落ちて停止）と、
-     GGUF 版の試行が中断・失敗した状態（"gguf-retry"／"gguf-failed"）
-     でだけ出す。自動でダウンロードは始めず、ボタンが押されたとき
-     だけ loadUltraGguf が走る。 */
+     （"onnx-interrupted"：再試行の案内／"onnx-stopped"：2回落ちて
+     停止）と、GGUF 版の試行が中断・失敗した状態（"gguf-retry"／
+     "gguf-failed"）、GGUF 版の読み込み完了後に落ちた状態
+     （"gguf-gen-crash"：生成中／"gguf-ready-crash"：回答前）で出す。
+     "gguf-retry" と落下通知の文言は、フェーズ記録を見て「どこで
+     落ちたか」を具体的に書く。自動でダウンロードは始めず、ボタンが
+     押されたときだけ loadUltraGguf が走る。 */
   setUltraGgufNotice(mode) {
     const box = el("ultra-gguf-notice");
     if (!box) return;
@@ -7327,14 +7470,31 @@ const App = {
     }
     const text = el("ultra-gguf-notice-text");
     if (text) {
-      text.textContent =
-        mode === "onnx-interrupted"
-          ? "前回は Cube Ultra の起動の途中でブラウザが再読み込みされました。通常版の再試行を続けていますが、読み込みの軽い軽量エンジン（GGUF版）に切り替えることもできます。"
-          : mode === "onnx-stopped"
-            ? "通常版の Cube Ultra は、この端末では起動できませんでした。読み込みの軽い軽量エンジン（GGUF版）なら開ける可能性があります。"
-            : mode === "gguf-retry"
-              ? "前回は軽量エンジン（GGUF版）の起動の途中でブラウザが再読み込みされました。ダウンロード済みのキャッシュから再試行できます。"
+      if (mode === "gguf-retry") {
+        // フェーズ記録から、前回 GGUF がどこで落ちたかを具体的に書く。
+        const rec = readGgufPhase();
+        text.textContent =
+          rec && (rec.phase === "load" || (typeof rec.pct === "number" && rec.pct >= 100))
+            ? "前回は軽量エンジン（GGUF版）のダウンロードは完了しましたが、モデルの読み込み中にブラウザが再読み込みされました。キャッシュから再試行できます。"
+            : `前回は軽量エンジン（GGUF版）のダウンロード中（約${rec && typeof rec.pct === "number" ? rec.pct : 0}%）にブラウザが再読み込みされました。再試行すると続きからダウンロードします。`;
+      } else if (mode === "gguf-gen-crash") {
+        const rec = readGgufPhase();
+        const answered = rec && typeof rec.answered === "number" ? rec.answered : 0;
+        text.textContent =
+          answered <= 0
+            ? "前回は軽量エンジン（GGUF版）の読み込みは完了しましたが、最初の回答生成の途中でブラウザが再読み込みされました。この端末のメモリ上限に達した可能性があります。"
+            : `前回は軽量エンジン（GGUF版）で回答を生成している途中でブラウザが再読み込みされました（その前に${answered}回は回答できていました）。この端末のメモリ上限に達した可能性があります。`;
+      } else if (mode === "gguf-ready-crash") {
+        text.textContent =
+          "前回は軽量エンジン（GGUF版）の読み込みは完了しましたが、回答する前にブラウザが再読み込みされました。この端末のメモリ上限に達した可能性があります。";
+      } else {
+        text.textContent =
+          mode === "onnx-interrupted"
+            ? "前回は Cube Ultra の起動の途中でブラウザが再読み込みされました。通常版の再試行を続けていますが、読み込みの軽い軽量エンジン（GGUF版）に切り替えることもできます。"
+            : mode === "onnx-stopped"
+              ? "通常版の Cube Ultra は、この端末では起動できませんでした。読み込みの軽い軽量エンジン（GGUF版）なら開ける可能性があります。"
               : "軽量エンジン（GGUF版）の読み込みに失敗しました。もう一度試せます。";
+      }
     }
     box.hidden = false;
   },
@@ -7342,76 +7502,97 @@ const App = {
   async loadModel(url) {
     const def = modelDef(this.modelId);
     if (def.engine === "ultra") {
-      // Cube Ultra：エンジンは transformers.js の pipeline。ベースURL・
-      // manifest 照合・IndexedDB キャッシュは使わない。読み込み完了の
-      // 記録は UltraModel 側にあり、失敗時は ready にならないので、
-      // 他のモデルが Ultra の名前で回答することは絶対にない。
-      const seq = ++this.ultraLoadSeq;
-      const stage = readUltraStage();
-      // 軽量エンジン（GGUF版）の試行が前回のタブ落下で中断されていた
-      // 場合は、通常版を自動では始め直さず、割り込みの通知と GGUF の
-      // 再試行ボタンを出す。GGUF の落下が合計2回に達していたら
-      // （印が "gguf2"）、理由を表示して止める（自動では繰り返さない。
-      // モデルを選び直すと印が消えて、また最初から試せる）。
-      if (stage === "gguf" || stage === "gguf2") {
-        if (stage === "gguf2") {
-          this.setUltraGgufNotice(null);
-          this.setModelStatus({
-            kind: "error",
-            message:
-              "Cube Ultra（軽量エンジン）の起動中にブラウザが繰り返し再読み込みされたため、自動の再試行を止めました。" +
-              "この端末ではメモリが足りず Ultra を起動できない可能性があります。" +
-              "他のタブやアプリを閉じるか、他のモデルをお使いください。" +
-              "他のモデルを選んでから Ultra を選び直すと、もう一度試せます",
-          });
-        } else {
-          this.setModelStatus({
-            kind: "error",
-            message: "Cube Ultra（軽量エンジン）の起動の途中でブラウザが再読み込みされました",
-          });
-          this.setUltraGgufNotice("gguf-retry");
-        }
-        return;
-      }
-      this.modelBusy = true;
-      this.renderModelSwitch();
-      const crashedBefore = UltraModel.previousAttemptCrashed();
-      this.setModelStatus({
-        kind: "loading",
-        loadedBytes: 0,
-        totalBytes: 0,
-        label: crashedBefore
-          ? "Cube Ultra（前回は起動の途中でブラウザが再読み込みされました。キャッシュから再試行しています）"
-          : "Cube Ultra（初回は約1.2GBのダウンロードがあります）",
-      });
-      // 前回の試行がタブ落下で中断されていたら、通知エリアに軽量
-      // エンジン（GGUF版）への切り替えボタンも出す。
-      this.setUltraGgufNotice(crashedBefore ? "onnx-interrupted" : null);
-      try {
-        await loadUltra((loaded, total, label) => {
-          if (seq !== this.ultraLoadSeq) return;
-          this.setModelStatus({ kind: "loading", loadedBytes: loaded, totalBytes: total, label });
-        });
-        // 読み込み中に軽量エンジンへ引き継がれていたら、状態表示は
-        // そちらに任せる（ここで ready に上書きしない）。
-        if (seq !== this.ultraLoadSeq) return;
+      // Cube Ultra：エンジンは transformers.js の pipeline（通常版）か
+      // wllama（軽量エンジン・GGUF版）。ベースURL・manifest 照合・
+      // IndexedDB キャッシュは使わない。ここは「待機ディスパッチャ」で、
+      // Ultra が選ばれてもどちらのエンジンも自動では開始しない。
+      // 前回の試行の痕跡（試行の印・GGUF フェーズ記録）から状態表示と
+      // 通知を出し、エンジン選択ブロックを表示して待つ。読み込み完了の
+      // 記録は各エンジン側にあり、失敗時は ready にならないので、他の
+      // モデルが Ultra の名前で回答することは絶対にない。
+      // (a) どちらかのエンジンが読み込み済みなら ready 表示にする。
+      if (UltraModel.ready || UltraGgufModel.ready) {
+        this.setUltraEngineChoice(false);
         this.setUltraGgufNotice(null);
         this.setModelStatus({ kind: "ready", paramCount: ULTRA_PARAM_COUNT });
-      } catch (e) {
-        if (seq !== this.ultraLoadSeq) return;
-        const message = e instanceof Error ? e.message : String(e);
-        this.setModelStatus({ kind: "error", message });
-        // 2回続けて落ちて自動の再試行が止まった状態（印が "build2"）でも、
-        // 軽量エンジンのボタンは出したままにする。再試行中の通常の
-        // 失敗でもボタンは残し、中断の無かった通常の失敗では隠す。
-        if (readUltraStage() === "build2") this.setUltraGgufNotice("onnx-stopped");
-        else if (!crashedBefore) this.setUltraGgufNotice(null);
-      } finally {
-        if (seq === this.ultraLoadSeq) {
-          this.modelBusy = false;
-          this.renderModelSwitch();
+        return;
+      }
+      const stage = readUltraStage();
+      // (b) GGUF の落下が合計2回に達していた：停止理由を表示し、
+      // 選択ブロックを出す（通常版は選べるようにする）。
+      if (stage === "gguf2") {
+        this.setUltraGgufNotice(null);
+        this.setModelStatus({
+          kind: "error",
+          message:
+            "Cube Ultra（軽量エンジン）の起動中にブラウザが繰り返し再読み込みされたため、自動の再試行を止めました。" +
+            "この端末ではメモリが足りず Ultra を起動できない可能性があります。" +
+            "他のタブやアプリを閉じるか、他のモデルをお使いください。" +
+            "他のモデルを選んでから Ultra を選び直すと、もう一度試せます",
+        });
+        this.setUltraEngineChoice(true);
+        return;
+      }
+      // (c) GGUF の試行が前回のタブ落下で中断されていた：割り込みの
+      // 通知（フェーズ記録つき）と選択ブロックを出す。
+      if (stage === "gguf") {
+        this.setModelStatus({
+          kind: "error",
+          message: "Cube Ultra（軽量エンジン）の起動の途中でブラウザが再読み込みされました",
+        });
+        this.setUltraGgufNotice("gguf-retry");
+        this.setUltraEngineChoice(true);
+        return;
+      }
+      // (d) 通常版の落下が合計2回に達していた：UltraModel.load が投げる
+      // のと同じ停止理由を表示し、選択ブロックを出す。
+      if (stage === "build2") {
+        this.setModelStatus({
+          kind: "error",
+          message:
+            "Cube Ultra の起動中にブラウザが繰り返し再読み込みされたため、自動の再試行を止めました。" +
+            "この端末ではメモリが足りず Ultra を起動できない可能性があります。" +
+            "他のタブやアプリを閉じるか、他のモデルをお使いください。" +
+            "他のモデルを選んでから Ultra を選び直すと、もう一度試せます",
+        });
+        this.setUltraGgufNotice("onnx-stopped");
+        this.setUltraEngineChoice(true);
+        return;
+      }
+      // (e) 通常版の試行が前回のタブ落下で中断されていた：通知と
+      // 選択ブロックを出す（自動では再試行しない）。
+      if (stage === "build") {
+        this.setModelStatus({
+          kind: "error",
+          message: "Cube Ultra の起動の途中でブラウザが再読み込みされました",
+        });
+        this.setUltraGgufNotice("onnx-interrupted");
+        this.setUltraEngineChoice(true);
+        return;
+      }
+      // (f) 試行の印が無い場合：GGUF フェーズ記録が「読み込み完了後に
+      // 落ちた」ことを示していたら、その落下通知を出して報告済みに
+      // する。"answered" の記録は静かに消す。"download" / "load" の
+      // 記録だけが残っている場合（タブを閉じた等）は通知を出さずに
+      // 記録を消す。
+      const phaseRec = readGgufPhase();
+      if (phaseRec) {
+        if (!phaseRec.reported && phaseRec.phase === "generating") {
+          this.setUltraGgufNotice("gguf-gen-crash");
+          writeGgufPhase({ ...phaseRec, reported: true });
+        } else if (!phaseRec.reported && phaseRec.phase === "ready") {
+          this.setUltraGgufNotice("gguf-ready-crash");
+          writeGgufPhase({ ...phaseRec, reported: true });
+        } else {
+          writeGgufPhase(null);
         }
       }
+      // (g) 待機表示にして、エンジン選択ブロックを出す。
+      this.setModelStatus({
+        kind: "standby",
+        message: "Cube Ultra は未読み込みです。エンジンを選んでください",
+      });
+      this.setUltraEngineChoice(true);
       return;
     }
     // 自作モデルが選択された：Ultra のエンジン（通常版・軽量エンジン
@@ -7419,6 +7600,7 @@ const App = {
     // 常に1つだけ）。進行中の Ultra 読み込みの後処理も無効化する。
     this.ultraLoadSeq++;
     this.setUltraGgufNotice(null);
+    this.setUltraEngineChoice(false);
     disposeUltra();
     // ベースURLの上書きは選択中モデルごとのキーに保存する
     // （Nano は従来の jisaku-ai-model-base-url、Flash / Twin / Pro / Max は専用キー）。
@@ -7445,8 +7627,60 @@ const App = {
     }
   },
 
-  /* 軽量エンジン（GGUF版）の読み込み：通知エリアのボタンが押された
-     ときだけ始める。開始時に通常版（ONNX）のモデルは読み込まない
+  /* 通常エンジン（ONNX版）の読み込み：エンジン選択ブロックのボタンが
+     押されたときだけ始める。試行の印・世代番号・通知の出し分けは、
+     以前 loadModel の Ultra 分岐で自動開始していた試行本体そのまま。
+     成功したら、読み込めたエンジンを保存し（次回の選択ブロックの
+     案内用）、GGUF のフェーズ記録は消す（古い生成落下の誤通知防止）。 */
+  async loadUltraOnnx() {
+    if (this.modelId !== "ultra" || UltraModel.ready) return;
+    this.setUltraEngineChoice(false);
+    const seq = ++this.ultraLoadSeq;
+    this.modelBusy = true;
+    this.renderModelSwitch();
+    const crashedBefore = UltraModel.previousAttemptCrashed();
+    this.setModelStatus({
+      kind: "loading",
+      loadedBytes: 0,
+      totalBytes: 0,
+      label: crashedBefore
+        ? "Cube Ultra（前回は起動の途中でブラウザが再読み込みされました。キャッシュから再試行しています）"
+        : "Cube Ultra（初回は約1.2GBのダウンロードがあります）",
+    });
+    // 前回の試行がタブ落下で中断されていたら、通知エリアに軽量
+    // エンジン（GGUF版）への切り替えボタンも出す。
+    this.setUltraGgufNotice(crashedBefore ? "onnx-interrupted" : null);
+    try {
+      await loadUltra((loaded, total, label) => {
+        if (seq !== this.ultraLoadSeq) return;
+        this.setModelStatus({ kind: "loading", loadedBytes: loaded, totalBytes: total, label });
+      });
+      // 読み込み中に軽量エンジンへ引き継がれていたら、状態表示は
+      // そちらに任せる（ここで ready に上書きしない）。
+      if (seq !== this.ultraLoadSeq) return;
+      this.setUltraGgufNotice(null);
+      store.set(ULTRA_ENGINE_KEY, "onnx");
+      writeGgufPhase(null);
+      this.setModelStatus({ kind: "ready", paramCount: ULTRA_PARAM_COUNT });
+    } catch (e) {
+      if (seq !== this.ultraLoadSeq) return;
+      const message = e instanceof Error ? e.message : String(e);
+      this.setModelStatus({ kind: "error", message });
+      // 2回続けて落ちて自動の再試行が止まった状態（印が "build2"）でも、
+      // 軽量エンジンのボタンは出したままにする。再試行中の通常の
+      // 失敗でもボタンは残し、中断の無かった通常の失敗では隠す。
+      if (readUltraStage() === "build2") this.setUltraGgufNotice("onnx-stopped");
+      else if (!crashedBefore) this.setUltraGgufNotice(null);
+    } finally {
+      if (seq === this.ultraLoadSeq) {
+        this.modelBusy = false;
+        this.renderModelSwitch();
+      }
+    }
+  },
+
+  /* 軽量エンジン（GGUF版）の読み込み：通知エリアのボタンか、エンジン
+     選択ブロックのボタンが押されたときだけ始める。開始時に通常版（ONNX）のモデルは読み込まない
      （読み込み中だった通常版は破棄し、その後処理は世代番号で無効化
      する）。進捗表示は通常版のローダーと同じ形（読み込み済み／全体
      バイト数とファイル名）。読み込みが成功したら、そのセッション中は
@@ -7455,6 +7689,7 @@ const App = {
     if (this.modelId !== "ultra" || UltraGgufModel.ready) return;
     const seq = ++this.ultraLoadSeq;
     UltraModel.dispose();
+    this.setUltraEngineChoice(false);
     this.modelBusy = true;
     this.renderModelSwitch();
     this.setUltraGgufNotice(null);
@@ -7473,6 +7708,8 @@ const App = {
         this.setModelStatus({ kind: "loading", loadedBytes: loaded, totalBytes: total, label });
       });
       if (seq !== this.ultraLoadSeq) return;
+      // 読み込めたエンジンを保存する（次回の選択ブロックの案内用）。
+      store.set(ULTRA_ENGINE_KEY, "gguf");
       this.setModelStatus({ kind: "ready", paramCount: ULTRA_PARAM_COUNT });
     } catch (e) {
       if (seq !== this.ultraLoadSeq) return;

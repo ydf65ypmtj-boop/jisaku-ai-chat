@@ -110,6 +110,19 @@ body {
 .ultra-gguf-notice-text { font-size: 13px; margin: 0; flex: 1; min-width: 200px; }
 .ultra-gguf-btn { flex: none; }
 
+/* Ultra のエンジン選択：Ultra を選んだら最初から出す。どちらの
+   エンジンも自動では開始せず、ここで選ばれたものだけを開始する */
+.ultra-engine-choice {
+  flex-basis: 100%;
+  border: 1px solid var(--warn);
+  background: var(--surface-alt);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+.ultra-engine-choice-text { font-size: 13px; margin: 0; }
+.ultra-engine-choice-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.ultra-engine-choice-note { font-size: 12px; color: var(--dim); margin: 8px 0 0; }
+
 /* モデル切り替え（セグメント型：選択中が押し込み表示になる） */
 .model-switch {
   display: inline-flex;
