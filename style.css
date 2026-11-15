@@ -94,6 +94,22 @@ body {
 }
 .model-note { font-size: 12px; color: var(--dim); }
 
+/* Ultra の軽量エンジン（GGUF版）への切り替え案内：通常版の読み込みが
+   ブラウザの再読み込みで中断されたときにだけ、通知エリアとして出す */
+.ultra-gguf-notice {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  border: 1px solid var(--warn);
+  background: var(--surface-alt);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+.ultra-gguf-notice-text { font-size: 13px; margin: 0; flex: 1; min-width: 200px; }
+.ultra-gguf-btn { flex: none; }
+
 /* モデル切り替え（セグメント型：選択中が押し込み表示になる） */
 .model-switch {
   display: inline-flex;
