@@ -1322,6 +1322,104 @@ const UltraGgufModel = {
   },
 };
 
+/* ================================================================== */
+/* Cube Ultra iMacサーバーエンジン                                      */
+/*                                                                    */
+/* 自宅の iMac（tailnet 内）で動く llama-server（GGUF Q4_K_M・同じ     */
+/* モデル）を、Tailscale Serve の HTTPS 経由で呼ぶ第3のエンジン。      */
+/* 端末側にモデルを読み込まないので、メモリの少ない端末でも Ultra を   */
+/* 使える。生成条件は他のエンジンと同一（同じシステムプロンプト、       */
+/* temperature 0・top_k 1・seed 42、最大128トークン）。公開範囲は      */
+/* tailnet 内のみ（Tailscale Serve。Funnel の全体公開ではない）ため、  */
+/* このエンジンが使えるのはユーザーの端末からだけ。iMac が起動して    */
+/* いない・スリープしている等で届かない場合は、例外にして素直な文面で  */
+/* 知らせ、エンジン選択に戻れるようにする。                           */
+/* ================================================================== */
+
+const ULTRA_IMAC_BASE_URL = "https://imac.tail9ed76a.ts.net";
+const ULTRA_IMAC_CONNECT_TIMEOUT_MS = 30000;
+const ULTRA_IMAC_GENERATE_TIMEOUT_MS = 120000;
+const ULTRA_IMAC_UNREACHABLE =
+  "iMacに届きませんでした。iMacが起動しているか確認してください";
+
+/* fetch にタイムアウトを付ける（AbortController）。時間切れ・到達不能は
+   呼び出し側でまとめて「iMacに届かない」として扱う。 */
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const UltraImacModel = {
+  connected: false,
+  get ready() { return this.connected; },
+  readyFor(id) { return id === "ultra" && this.connected; },
+  /* 「読み込み」は iMac への到達確認だけ（端末へのダウンロードは無い）。
+     llama-server の /health が 200 を返したら接続済みにする。 */
+  async load(onProgress) {
+    if (this.connected) return;
+    onProgress(0, 0, "iMacサーバー（接続を確認しています）");
+    let res;
+    try {
+      res = await fetchWithTimeout(
+        `${ULTRA_IMAC_BASE_URL}/health`,
+        { method: "GET" },
+        ULTRA_IMAC_CONNECT_TIMEOUT_MS,
+      );
+    } catch {
+      throw new Error(ULTRA_IMAC_UNREACHABLE);
+    }
+    if (!res || !res.ok) throw new Error(ULTRA_IMAC_UNREACHABLE);
+    this.connected = true;
+  },
+  /* アプリがモデルへ渡すプロンプト文字列から、iMac 上の llama-server
+     （OpenAI 互換 /v1/chat/completions）で答えを生成する。メッセージと
+     生成条件は他のエンジンと同一。失敗したら接続を切り、素直な文面の
+     例外にする（回答フロー側が注記として表示する）。 */
+  async generate(prompt) {
+    if (!this.connected) throw new Error("Cube Ultra（iMacサーバー）が接続されていません");
+    let res;
+    try {
+      res = await fetchWithTimeout(
+        `${ULTRA_IMAC_BASE_URL}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: [
+              { role: "system", content: ULTRA_SYSTEM_PROMPT },
+              { role: "user", content: prompt },
+            ],
+            temperature: 0,
+            top_k: 1,
+            seed: 42,
+            max_tokens: ULTRA_MAX_NEW_TOKENS,
+          }),
+        },
+        ULTRA_IMAC_GENERATE_TIMEOUT_MS,
+      );
+    } catch {
+      this.connected = false;
+      throw new Error(ULTRA_IMAC_UNREACHABLE);
+    }
+    if (!res || !res.ok) {
+      this.connected = false;
+      throw new Error(ULTRA_IMAC_UNREACHABLE);
+    }
+    const data = await res.json().catch(() => null);
+    const text = data?.choices?.[0]?.message?.content;
+    return typeof text === "string" ? text.trim() : "";
+  },
+  /* 接続を切る（他のモデルや他のエンジンが選択されたときに呼ぶ）。 */
+  dispose() {
+    this.connected = false;
+  },
+};
+
 async function loadUltra(onProgress) {
   return UltraModel.load(onProgress);
 }
@@ -1330,19 +1428,25 @@ async function loadUltraGguf(onProgress) {
   return UltraGgufModel.load(onProgress);
 }
 
+async function loadUltraImac(onProgress) {
+  return UltraImacModel.load(onProgress);
+}
+
 /* Ultra の生成：このセッションで軽量エンジン（GGUF版）が読み込み
    済みならそちらを使い続け、それ以外は通常版（ONNX）を使う。回答
    フロー・バッジ・出典表示はどちらでも同一に扱う。 */
 async function generateUltra(prompt) {
+  if (UltraImacModel.ready) return UltraImacModel.generate(prompt);
   return UltraGgufModel.ready
     ? UltraGgufModel.generate(prompt)
     : UltraModel.generate(prompt);
 }
 
-/* Ultra のエンジンを両方とも破棄する（他のモデルが選択されたとき）。 */
+/* Ultra のエンジンをすべて破棄する（他のモデルが選択されたとき）。 */
 function disposeUltra() {
   UltraModel.dispose();
   UltraGgufModel.dispose();
+  UltraImacModel.dispose();
 }
 
 /**
@@ -1354,7 +1458,7 @@ function disposeUltra() {
  */
 function modelReadyFor(id) {
   return id === "ultra"
-    ? UltraModel.readyFor(id) || UltraGgufModel.readyFor(id)
+    ? UltraModel.readyFor(id) || UltraGgufModel.readyFor(id) || UltraImacModel.readyFor(id)
     : LocalModel.readyFor(id);
 }
 
@@ -7271,6 +7375,10 @@ const App = {
     if (ggufChoiceBtn) {
       ggufChoiceBtn.addEventListener("click", () => void this.loadUltraGguf());
     }
+    const imacChoiceBtn = el("ultra-load-imac-btn");
+    if (imacChoiceBtn) {
+      imacChoiceBtn.addEventListener("click", () => void this.loadUltraImac());
+    }
     this.renderModelSwitch();
     this.weatherPlace = store.get(WEATHER_PLACE_KEY) || DEFAULT_WEATHER_PLACE;
     const wpInput = el("weather-place");
@@ -7446,7 +7554,9 @@ const App = {
             ? "前回は通常エンジンで読み込めました"
             : saved === "gguf"
               ? "前回は軽量エンジンで読み込めました"
-              : "";
+              : saved === "imac"
+                ? "前回はiMacサーバーで読み込めました"
+                : "";
       }
     }
     box.hidden = !show;
@@ -7511,7 +7621,7 @@ const App = {
       // 記録は各エンジン側にあり、失敗時は ready にならないので、他の
       // モデルが Ultra の名前で回答することは絶対にない。
       // (a) どちらかのエンジンが読み込み済みなら ready 表示にする。
-      if (UltraModel.ready || UltraGgufModel.ready) {
+      if (UltraModel.ready || UltraGgufModel.ready || UltraImacModel.ready) {
         this.setUltraEngineChoice(false);
         this.setUltraGgufNotice(null);
         this.setModelStatus({ kind: "ready", paramCount: ULTRA_PARAM_COUNT });
@@ -7634,6 +7744,7 @@ const App = {
      案内用）、GGUF のフェーズ記録は消す（古い生成落下の誤通知防止）。 */
   async loadUltraOnnx() {
     if (this.modelId !== "ultra" || UltraModel.ready) return;
+    UltraImacModel.dispose();
     this.setUltraEngineChoice(false);
     const seq = ++this.ultraLoadSeq;
     this.modelBusy = true;
@@ -7689,6 +7800,7 @@ const App = {
     if (this.modelId !== "ultra" || UltraGgufModel.ready) return;
     const seq = ++this.ultraLoadSeq;
     UltraModel.dispose();
+    UltraImacModel.dispose();
     this.setUltraEngineChoice(false);
     this.modelBusy = true;
     this.renderModelSwitch();
@@ -7719,6 +7831,50 @@ const App = {
       // タブ落下で2回止まった場合（UltraGgufModel.load の例外）は印が
       // "gguf2" のまま残るので、ボタンは出さない。
       if (readUltraStage() !== "gguf2") this.setUltraGgufNotice("gguf-failed");
+    } finally {
+      if (seq === this.ultraLoadSeq) {
+        this.modelBusy = false;
+        this.renderModelSwitch();
+      }
+    }
+  },
+
+  /* iMacサーバーエンジンの開始：エンジン選択ブロックのボタンが押された
+     ときだけ始める。端末へのダウンロードは無く、iMac への到達確認だけ。
+     開始時に他のエンジン（通常版・軽量エンジン）は破棄する（アクティブな
+     エンジンは常に1つだけ）。成功したら読み込めたエンジンを保存する。
+     届かなかったら素直な文面をエラー表示にし、エンジン選択ブロックを
+     出し直して、他のエンジンや他のモデルを選べるようにする。 */
+  async loadUltraImac() {
+    if (this.modelId !== "ultra" || UltraImacModel.ready) return;
+    const seq = ++this.ultraLoadSeq;
+    UltraModel.dispose();
+    UltraGgufModel.dispose();
+    this.setUltraEngineChoice(false);
+    this.setUltraGgufNotice(null);
+    this.modelBusy = true;
+    this.renderModelSwitch();
+    this.setModelStatus({
+      kind: "loading",
+      loadedBytes: 0,
+      totalBytes: 0,
+      label: "Cube Ultra（iMacサーバーに接続しています）",
+    });
+    try {
+      await loadUltraImac((loaded, total, label) => {
+        if (seq !== this.ultraLoadSeq) return;
+        this.setModelStatus({ kind: "loading", loadedBytes: loaded, totalBytes: total, label });
+      });
+      if (seq !== this.ultraLoadSeq) return;
+      // 読み込めたエンジンを保存する（次回の選択ブロックの案内用）。
+      store.set(ULTRA_ENGINE_KEY, "imac");
+      this.setModelStatus({ kind: "ready", paramCount: ULTRA_PARAM_COUNT });
+    } catch (e) {
+      if (seq !== this.ultraLoadSeq) return;
+      const message = e instanceof Error ? e.message : String(e);
+      this.setModelStatus({ kind: "error", message });
+      // もう一度選べるよう、エンジン選択ブロックを出し直す。
+      this.setUltraEngineChoice(true);
     } finally {
       if (seq === this.ultraLoadSeq) {
         this.modelBusy = false;
@@ -8452,6 +8608,7 @@ if (typeof module !== "undefined" && module.exports) {
     MODELS, modelDef, validateManifest,
     UltraModel, loadUltra, generateUltra, disposeUltra, modelReadyFor,
     UltraGgufModel, loadUltraGguf,
+    UltraImacModel, loadUltraImac, ULTRA_IMAC_BASE_URL, ULTRA_IMAC_UNREACHABLE,
     readUltraStage, writeUltraStage,
     ULTRA_REPO, ULTRA_PARAM_COUNT, ULTRA_MAX_NEW_TOKENS,
     ULTRA_GGUF_URL, WLLAMA_ESM_URL, WLLAMA_WASM_FROM_CDN_URL,
