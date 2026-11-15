@@ -1500,6 +1500,31 @@ function isUltraAbstention(generation) {
   return ULTRA_ABSTENTION_PREFIXES.some((p) => t.startsWith(p));
 }
 
+/* Ultra が書いた提示文の文末だけを、です・ます調にそろえる表示側の
+ * 整形。Ultra は記事の文体（である調）を写しやすく、せっかく自分の
+ * 言葉で書いても文末が「である。」になってしまうため、文末（「。」の
+ * 直前と、文の末尾）だけを変換する。文中の「である」や「…」『…』の
+ * 引用の中は触らない。対象の文末が無ければ無変換（そのまま返す）。
+ * 適用先は Ultra が書いた提示文だけ：事実文のフォールバック・根拠・
+ * メモ帳・他モデルの表示には一切かからない。 */
+function normalizeUltraWrittenStyle(text) {
+  const parts = String(text || "").split(/(「[^」]*」|『[^』]*』)/g);
+  return parts
+    .map((part, i) => {
+      if (i % 2 === 1) return part; // 引用の中は触らない
+      let out = part.replace(/であった。/g, "でした。");
+      out = out.replace(/である。/g, "です。");
+      out = out.replace(/だ。/g, "です。");
+      if (i === parts.length - 1) {
+        // 文の末尾（「。」で終わっていない文末）だけを対象にする。
+        out = out.replace(/である$/, "です");
+        out = out.replace(/だ$/, "です");
+      }
+      return out;
+    })
+    .join("");
+}
+
 /* 対象記事の本文を Ultra に読ませ、「ネット検索の答え」の提示文を     */
 /* 書かせる。読ませるのはこのフローが既に持っている記事本文（冒頭      */
 /* 最大5,000字）の先頭で、上限に収まる長さに切ってから組み立て        */
@@ -1521,7 +1546,9 @@ async function ultraWriteFactAnswer(question, article, fact) {
     const out = await generateUltra(`文：${passage}\n質問：${question}`);
     const written = (out || "").trim();
     if (!written || isUltraAbstention(written)) return null;
-    return written;
+    // 提示文としてだけ使う戻り値なので、ここで文末をです・ます調に
+    // そろえる（棄権判定は変換前の文で済ませてある）。
+    return normalizeUltraWrittenStyle(written);
   } catch {
     return null;
   }
@@ -8823,6 +8850,7 @@ if (typeof module !== "undefined" && module.exports) {
     MODELS, modelDef, validateManifest,
     UltraModel, loadUltra, generateUltra, disposeUltra, modelReadyFor,
     assembleUltraPassage, isUltraAbstention, ultraWriteFactAnswer, ULTRA_PASSAGE_CAP,
+    normalizeUltraWrittenStyle,
     UltraGgufModel, loadUltraGguf,
     UltraImacModel, loadUltraImac, ULTRA_IMAC_BASE_URL, ULTRA_IMAC_UNREACHABLE,
     readUltraStage, writeUltraStage,
