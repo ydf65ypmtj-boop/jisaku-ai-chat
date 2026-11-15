@@ -17,18 +17,11 @@
             <span id="model-status-text">モデル未配置</span>
           </span>
           <span id="model-note" class="model-note">回答は検索のみで行います</span>
-          <div id="ultra-gguf-notice" class="ultra-gguf-notice" hidden>
-            <p id="ultra-gguf-notice-text" class="ultra-gguf-notice-text"></p>
-            <button type="button" id="ultra-gguf-btn" class="primary-btn ultra-gguf-btn">軽量エンジンで試す（GGUF版）</button>
-          </div>
-          <div id="ultra-engine-choice" class="ultra-engine-choice" hidden>
-            <p class="ultra-engine-choice-text">Cube Ultra のエンジンを選んでください。<span id="ultra-engine-saved-note"></span></p>
+          <div id="server-connect" class="ultra-engine-choice" hidden>
+            <p class="ultra-engine-choice-text">このモデルは自宅のiMacサーバーで動かします。端末へのダウンロードはありませんが、iMacが起動しているときだけ使えます。</p>
             <div class="ultra-engine-choice-btns">
-              <button type="button" id="ultra-load-onnx-btn" class="primary-btn">通常エンジンで読み込む（ONNX）</button>
-              <button type="button" id="ultra-load-gguf-btn" class="primary-btn">軽量エンジンで読み込む（GGUF版）</button>
-              <button type="button" id="ultra-load-imac-btn" class="primary-btn">iMacサーバーで使う</button>
+              <button type="button" id="server-connect-btn" class="primary-btn">iMacサーバーに接続</button>
             </div>
-            <p class="ultra-engine-choice-note">iPad では軽量エンジン（GGUF版）がおすすめです（約986MB）。通常エンジンは約1.2GBです。iMacサーバーはダウンロード不要ですが、自宅のiMacが起動中のときだけ使えます。</p>
           </div>
           <div class="model-switch" role="group" aria-label="モデルの切り替え">
             <button type="button" class="model-switch-btn" data-model="v1" aria-pressed="true">Cube Nano</button>
@@ -59,8 +52,9 @@
                 約11億8,965万パラメータ。
                 ヘッダーで切り替えられます）。6つ目の
                 Cube Ultraは、Qwen2.5-1.5Bに追加学習を統合したモデル
-                （約15億パラメータ）をHugging Faceから読み込んで動かす
-                もので、初回読み込みでは約1.2GBのダウンロードがあります。
+                （約15億パラメータ）です。Cube Twin・Cube Pro・Cube Max・
+                Cube Ultraは端末に読み込まず、自宅のiMacサーバーで
+                動かします（iMacが起動しているときだけ使えます）。
                 答えには必ず「出どころ」のラベルがつきます。基本はCubeの
                 答えを主表示し、ネット検索は裏づけとして添えます。Cubeと
                 ネットで食い違ったら、ネットの事実を正として表示し、
@@ -133,10 +127,10 @@
               <h3><label for="base-url">モデルの重みベースURL</label></h3>
               <p class="desc">
                 manifest.json / bpe.json / weights-*.bin が置いてある場所を指定します。
-                このURLは選択中のモデル（Cube Nano / Cube Flash / Cube Twin / Cube Pro / Cube Max）ごとの上書きとして
+                このURLは選択中のモデル（Cube Nano / Cube Flash）ごとの上書きとして
                 この端末に保存され、次回から自動で読み込みます。ヘッダーでモデルを
                 切り替えると、そのモデルのURLに切り替わります。
-                Cube Ultra は Hugging Face（FMA03/cube-ultra）から読み込むため、この上書きは適用されません（自作モデル専用です）。
+                Cube Twin / Cube Pro / Cube Max / Cube Ultra はiMacサーバーで動かすため、この上書きは適用されません。
               </p>
               <div class="url-row">
                 <input id="base-url" class="mono" type="url" />
@@ -209,7 +203,8 @@
               <h3>このAIについて</h3>
               <p class="desc">
                 このAIの名前はCubeです。
-                GPT方式Transformerの自作LLMをブラウザの中で直接動かしています。
+                GPT方式Transformerの自作LLMを、ブラウザの中と自宅の
+                iMacサーバーで動かしています。
                 モデルは6つあり、ヘッダーで切り替えられます。Cube Nanoは
                 12層・幅448・語彙6,000の自作BPEで約3,177万パラメータ、
                 Cube Flashは18層・幅512・語彙6,000の自作BPEで約5,995万
@@ -229,12 +224,13 @@
                 単位のint4量子化で書き出したものです。語彙が他の自作
                 モデルと違うので、BPEはMaxの場所から読み込みます）。
                 Cube Ultraは、Qwen2.5-1.5Bに追加学習（LoRA）を統合した
-                モデル（約15億パラメータ）で、自作エンジンではなく
-                @huggingface/transformers を使って Hugging Face
-                （FMA03/cube-ultra）から読み込み、WebGPUで動かします。
-                初めて選んだときにだけ読み込みが始まり、初回は約1.2GBの
-                ダウンロードがあります。ベースURLの上書きや manifest の
-                照合は自作モデル専用で、Ultraには適用されません。
+                モデル（約15億パラメータ）です。Cube Twin・Cube Pro・
+                Cube Max・Cube Ultraは、端末のメモリに収まらないため
+                ブラウザには読み込まず、自宅のiMacサーバー
+                （Tailscale経由）で動かして答えだけを受け取ります。
+                そのため、iMacが起動していないときは使えません。
+                ベースURLの上書きや manifest の照合は、端末で動かす
+                Cube Nano / Cube Flash 専用です。
                 外部AIのAPIは使っていません。
                 回答は表示前にウェブ検索と照合し、計算は検算します。
                 照合で「確認済み」になるのは、その質問の対象についての

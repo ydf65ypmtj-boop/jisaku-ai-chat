@@ -637,6 +637,13 @@ function pruneModelCache(db, basePrefix, keepPrefix) {
 /* （WebGPU）で動かす。ベースURL・manifest 照合・ベースURL上書きは    */
 /* 自作モデル専用の仕組みなので Ultra には適用しない（engine が       */
 /* "ultra" のモデルは LocalModel を一切通らない）。                   */
+/*                                                                    */
+/* 2026-11-15 のサーバー固定化（本人決定）：Twin / Pro / Max は端末に  */
+/* 読み込まず、自宅の iMac サーバー（ServerModel）で動かす。engine が */
+/* "server" のモデルは LocalModel を一切通らず、ベースURL・manifest   */
+/* 照合・端末キャッシュも使わない。Ultra も同じ iMac サーバー固定に   */
+/* なり、エンジン選択（ONNX / GGUF）は廃止した（エンジン本体のコード  */
+/* は互換のため残置してあるが、UI からは到達できない）。              */
 /* ================================================================== */
 
 const MODEL_ID_KEY = "jisaku-ai-model-id";
@@ -667,7 +674,7 @@ const MODELS = {
   twin: {
     id: "twin",
     label: "Cube Twin",
-    engine: "local",
+    engine: "server",
     defaultBaseUrl: "https://ydf65ypmtj-boop.github.io/llm-chat/twin/",
     urlKey: "jisaku-ai-model-base-url-twin",
     maxNew: 96,
@@ -683,7 +690,7 @@ const MODELS = {
   pro: {
     id: "pro",
     label: "Cube Pro",
-    engine: "local",
+    engine: "server",
     defaultBaseUrl: "https://ydf65ypmtj-boop.github.io/llm-chat/pro/",
     urlKey: "jisaku-ai-model-base-url-pro",
     maxNew: 48,
@@ -701,7 +708,7 @@ const MODELS = {
   max: {
     id: "max",
     label: "Cube Max",
-    engine: "local",
+    engine: "server",
     defaultBaseUrl: "https://ydf65ypmtj-boop.github.io/llm-chat/max/",
     urlKey: "jisaku-ai-model-base-url-max",
     maxNew: 48,
@@ -1420,6 +1427,139 @@ const UltraImacModel = {
   },
 };
 
+/* ================================================================== */
+/* 自作モデル iMacサーバーエンジン（Cube Twin / Pro / Max）            */
+/*                                                                    */
+/* Twin（約121MB）・Pro（約156MB）・Max（約583MB）の int4 重みは、     */
+/* 端末（iPad 等）のブラウザのメモリ上限に当たって読み込めないため、   */
+/* 2026-11-15 の本人決定で、自宅の iMac 上の Node サーバーで動かす    */
+/* 方式に固定した（Ultra の iMac エンジンと同じ考え方）。サーバーは   */
+/* 公開版と同一の int4 パッケージと同一のエンジンで生成するため、     */
+/* 答えはブラウザ版とバイト単位で一致する（サーバー側で検証済み）。   */
+/* ページ側は質問文をそのまま渡し、学習時のQA形式（質問：…\n答え：）  */
+/* の組み立て・greedy 生成・末尾処理はサーバー側が LocalModel.generate */
+/* と同一に行う。エンドポイントは Tailscale Serve の HTTPS            */
+/* （tailnet 内のみ、専用ポート 8443）。iMac が起動していない等で     */
+/* 届かない場合は例外にして素直な文面で知らせ、他のモデルで黙って     */
+/* 代答することは絶対にしない。                                       */
+/* ================================================================== */
+
+const CUBE_SERVER_BASE_URL = "https://imac.tail9ed76a.ts.net:8443";
+const CUBE_SERVER_HEALTH_TIMEOUT_MS = 15000;
+const CUBE_SERVER_GENERATE_TIMEOUT_MS = 300000;
+const CUBE_SERVER_POLL_INTERVAL_MS = 3000;
+const CUBE_SERVER_POLL_DEADLINE_MS = 120000;
+const CUBE_SERVER_UNREACHABLE =
+  "iMacに届きませんでした。iMacが起動しているか確認してください";
+
+const ServerModel = {
+  /* モデルIDごとの接続状態 { ready, paramCount }。サーバー側はモデルを
+     常駐させているので、ここで保持するのは「このページのセッションで
+     到達と ready を確認済みか」だけ。他のモデルが選択されたら破棄し、
+     選び直したときに health を引き直す。 */
+  states: {},
+  readyFor(id) { return this.states[id]?.ready === true; },
+  paramCountFor(id) { return this.states[id]?.paramCount || 0; },
+  /* GET /health を1回引く。到達不能・形式不正は「届かない」例外にする。 */
+  async fetchHealth() {
+    let res;
+    try {
+      res = await fetchWithTimeout(
+        `${CUBE_SERVER_BASE_URL}/health`,
+        { method: "GET" },
+        CUBE_SERVER_HEALTH_TIMEOUT_MS,
+      );
+    } catch {
+      throw new Error(CUBE_SERVER_UNREACHABLE);
+    }
+    if (!res || !res.ok) throw new Error(CUBE_SERVER_UNREACHABLE);
+    const data = await res.json().catch(() => null);
+    if (!data || data.status !== "ok" || !data.models) {
+      throw new Error(CUBE_SERVER_UNREACHABLE);
+    }
+    return data.models;
+  },
+  /**
+   * 接続：health を引き、対象モデルが ready になるまでポーリングする
+   * （サーバー起動直後はモデル読み込み中のことがある）。「iMac側で
+   * 読み込み中」が分かったら onPolling を1回呼ぶ（表示の切り替え用）。
+   * 届かない・サーバー側エラー・時間切れは例外にする。
+   */
+  async connect(id, onPolling) {
+    const deadline = Date.now() + CUBE_SERVER_POLL_DEADLINE_MS;
+    let notified = false;
+    for (;;) {
+      const models = await this.fetchHealth();
+      const st = models[id];
+      if (!st) throw new Error(CUBE_SERVER_UNREACHABLE);
+      if (st.state === "ready") {
+        this.states[id] = { ready: true, paramCount: st.paramCount || 0 };
+        return;
+      }
+      if (st.state === "error") {
+        throw new Error(
+          "iMac側でモデルの読み込みに失敗しました。iMacのサーバーを確認してください",
+        );
+      }
+      // state === "loading"：少し待って引き直す。
+      if (!notified) {
+        notified = true;
+        if (onPolling) onPolling();
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          "iMac側のモデルの読み込みが時間内に終わりませんでした。少し待ってから接続し直してください",
+        );
+      }
+      await new Promise((r) => setTimeout(r, CUBE_SERVER_POLL_INTERVAL_MS));
+    }
+  },
+  /**
+   * 生成：アプリがモデルへ渡す質問文をそのまま prompt として渡す。
+   * 失敗したら接続状態を忘れ（次に選び直したとき health から確認
+   * し直す）、素直な文面の例外にする（Ultra の iMac エンジンと同じ）。
+   */
+  async generate(id, question) {
+    if (!this.readyFor(id)) {
+      throw new Error(`${modelDef(id).label}（iMacサーバー）が接続されていません`);
+    }
+    let res;
+    try {
+      res = await fetchWithTimeout(
+        `${CUBE_SERVER_BASE_URL}/generate`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: id,
+            prompt: question,
+            max_new_tokens: modelDef(id).maxNew,
+          }),
+        },
+        CUBE_SERVER_GENERATE_TIMEOUT_MS,
+      );
+    } catch {
+      this.states[id] = { ready: false, paramCount: 0 };
+      throw new Error(CUBE_SERVER_UNREACHABLE);
+    }
+    const data = res ? await res.json().catch(() => null) : null;
+    if (!res || !res.ok || !data || typeof data.text !== "string") {
+      this.states[id] = { ready: false, paramCount: 0 };
+      const detail = data && typeof data.error === "string" ? data.error : "";
+      throw new Error(
+        detail ? `${CUBE_SERVER_UNREACHABLE}（サーバーの応答: ${detail}）` : CUBE_SERVER_UNREACHABLE,
+      );
+    }
+    return data.text.trim();
+  },
+  /* 接続状態を忘れる（他のモデルが選択されたとき）。引数なしで全部、
+     ID を渡せばそのモデルだけ。サーバー側の常駐には触れない。 */
+  dispose(id) {
+    if (id) delete this.states[id];
+    else this.states = {};
+  },
+};
+
 async function loadUltra(onProgress) {
   return UltraModel.load(onProgress);
 }
@@ -1432,9 +1572,11 @@ async function loadUltraImac(onProgress) {
   return UltraImacModel.load(onProgress);
 }
 
-/* Ultra の生成：このセッションで軽量エンジン（GGUF版）が読み込み
-   済みならそちらを使い続け、それ以外は通常版（ONNX）を使う。回答
-   フロー・バッジ・出典表示はどちらでも同一に扱う。 */
+/* Ultra の生成：iMacサーバーエンジンが接続済みならそれを使う。
+   2026-11-15 のサーバー固定化で、UI から開始できるのは iMac
+   エンジンだけになった。通常版（ONNX）・軽量エンジン（GGUF版）の
+   振り分けは互換のため残してあるが、どちらも UI からは到達
+   できない。回答フロー・バッジ・出典表示はどのエンジンでも同一。 */
 async function generateUltra(prompt) {
   if (UltraImacModel.ready) return UltraImacModel.generate(prompt);
   return UltraGgufModel.ready
@@ -1447,6 +1589,16 @@ function disposeUltra() {
   UltraModel.dispose();
   UltraGgufModel.dispose();
   UltraImacModel.dispose();
+}
+
+/* 選択中モデルの生成ディスパッチャ：Ultra は generateUltra、自作の
+   サーバーモデル（Twin / Pro / Max）は iMac サーバーの ServerModel、
+   それ以外（Nano / Flash）は端末内の LocalModel。LocalModel.generate
+   は同期だが、呼び出し側は常に await するので形をそろえてある。 */
+async function generateForModel(id, question) {
+  if (id === "ultra") return generateUltra(question);
+  if (modelDef(id).engine === "server") return ServerModel.generate(id, question);
+  return LocalModel.generate(question, modelDef(id).maxNew);
 }
 
 /* ================================================================== */
@@ -1555,16 +1707,19 @@ async function ultraWriteFactAnswer(question, article, fact) {
 }
 
 /**
- * 「回答可能」の判定：読み込み完了したエンジンが選択中モデルと一致
- * するときだけ真。自作モデルは LocalModel、Ultra は UltraModel
- * （通常版）か UltraGgufModel（軽量エンジン）のどちらかが読み込み
- * 済みなら真。それぞれ判定し、切り替え先の読み込みに失敗した状態で
+ * 「回答可能」の判定：準備完了したエンジンが選択中モデルと一致する
+ * ときだけ真。端末内モデル（Nano / Flash）は LocalModel、サーバー
+ * モデル（Twin / Pro / Max）は ServerModel の接続確認、Ultra は
+ * いずれかのエンジン（サーバー固定化後は iMac エンジンのみ到達
+ * 可能）の読み込み済みで判定する。切り替え先の準備に失敗した状態で
  * 前のモデルが新しいモデルの名前で回答することは絶対にない。
  */
 function modelReadyFor(id) {
-  return id === "ultra"
-    ? UltraModel.readyFor(id) || UltraGgufModel.readyFor(id) || UltraImacModel.readyFor(id)
-    : LocalModel.readyFor(id);
+  if (id === "ultra") {
+    return UltraModel.readyFor(id) || UltraGgufModel.readyFor(id) || UltraImacModel.readyFor(id);
+  }
+  if (modelDef(id).engine === "server") return ServerModel.readyFor(id);
+  return LocalModel.readyFor(id);
 }
 
 /* ================================================================== */
@@ -7533,6 +7688,7 @@ const App = {
   modelId: "v1", // 選択中のモデルID（localStorage に保存。初期値は v1）
   modelBusy: false, // モデル読み込み中は切り替えボタンを無効化する
   ultraLoadSeq: 0, // Ultra 読み込みの世代。通常版の読み込み中に軽量エンジン（GGUF版）へ引き継いだとき、古い読み込みの後処理（状態表示の上書き）を無効化するために使う
+  serverLoadSeq: 0, // サーバーモデル（Twin / Pro / Max）接続の世代。接続中にモデルが切り替わったとき、古い接続の後処理（状態表示の上書き）を無効化するために使う
   baseUrl: DEFAULT_BASE_URL,
   weatherPlace: DEFAULT_WEATHER_PLACE,
   confirmMarkAll: false,
@@ -7544,8 +7700,9 @@ const App = {
     const savedId = store.get(MODEL_ID_KEY);
     this.modelId = MODELS[savedId] ? savedId : "v1";
     const def = modelDef(this.modelId);
-    // Ultra にはベースURLが無い（Hugging Face から読み込む）。
-    this.baseUrl = def.engine === "ultra"
+    // Ultra とサーバーモデル（Twin / Pro / Max）にはベースURLが無い
+    // （どちらも iMac サーバーで動かす）。
+    this.baseUrl = def.engine === "ultra" || def.engine === "server"
       ? ""
       : store.get(def.urlKey) || def.defaultBaseUrl;
     el("base-url").value = this.baseUrl;
@@ -7553,26 +7710,13 @@ const App = {
     for (const btn of document.querySelectorAll(".model-switch-btn")) {
       btn.addEventListener("click", () => void this.switchModel(btn.dataset.model));
     }
-    // 軽量エンジン（GGUF版）の開始ボタン：通常版の読み込みがブラウザの
-    // 再読み込みで中断されたときにだけ通知エリアへ出す。自動では
-    // 始めず、押されたときだけ GGUF 版の読み込みを始める。
-    const ggufBtn = el("ultra-gguf-btn");
-    if (ggufBtn) {
-      ggufBtn.addEventListener("click", () => void this.loadUltraGguf());
-    }
-    // エンジン選択ブロックの2ボタン：Ultra を選んだら最初から出し、
-    // 押されたエンジンだけを開始する（どちらも自動では開始しない）。
-    const onnxChoiceBtn = el("ultra-load-onnx-btn");
-    if (onnxChoiceBtn) {
-      onnxChoiceBtn.addEventListener("click", () => void this.loadUltraOnnx());
-    }
-    const ggufChoiceBtn = el("ultra-load-gguf-btn");
-    if (ggufChoiceBtn) {
-      ggufChoiceBtn.addEventListener("click", () => void this.loadUltraGguf());
-    }
-    const imacChoiceBtn = el("ultra-load-imac-btn");
-    if (imacChoiceBtn) {
-      imacChoiceBtn.addEventListener("click", () => void this.loadUltraImac());
+    // サーバー接続ボタン：iMac で動かすモデル（Twin / Pro / Max /
+    // Ultra）が未接続・接続エラーのときに状態バーへ出し、押された
+    // ときだけ接続する。エンジン選択（ONNX / GGUF）はサーバー固定化
+    // で廃止した（ボタン自体を index.html から外してある）。
+    const serverConnectBtn = el("server-connect-btn");
+    if (serverConnectBtn) {
+      serverConnectBtn.addEventListener("click", () => void this.connectServerModel());
     }
     this.renderModelSwitch();
     this.weatherPlace = store.get(WEATHER_PLACE_KEY) || DEFAULT_WEATHER_PLACE;
@@ -7674,13 +7818,20 @@ const App = {
     this.modelId = id;
     store.set(MODEL_ID_KEY, id);
     const def = modelDef(id);
-    this.baseUrl = def.engine === "ultra"
+    this.baseUrl = def.engine === "ultra" || def.engine === "server"
       ? ""
       : store.get(def.urlKey) || def.defaultBaseUrl;
     el("base-url").value = this.baseUrl;
     el("current-url").textContent = this.baseUrl;
     this.renderModelSwitch();
-    await this.loadModel(this.baseUrl);
+    // iMac で動かすモデル（Twin / Pro / Max / Ultra）は、選ばれた
+    // 時点でそのまま接続する（待機表示で止めない）。端末内モデルは
+    // 従来どおり loadModel で読み込む。
+    if (def.engine === "ultra" || def.engine === "server") {
+      await this.connectServerModel();
+    } else {
+      await this.loadModel(this.baseUrl);
+    }
   },
 
   setModelStatus(st) {
@@ -7697,7 +7848,7 @@ const App = {
     // 見た目は not_loaded と同じ（ドット・色・メモ欄の扱いも同じ）。
     if (st.kind === "standby") text.textContent = st.message;
     if (st.kind === "loading") {
-      text.textContent = `${label} 読み込み中… ${formatBytes(st.loadedBytes)}${st.totalBytes > 0 ? ` / ${formatBytes(st.totalBytes)}` : ""}（${st.label}）${this.modelId === "ultra" ? " ※Cube Ultraの初回読み込みは約1.2GBのダウンロードがあります" : ""}`;
+      text.textContent = `${label} 読み込み中… ${formatBytes(st.loadedBytes)}${st.totalBytes > 0 ? ` / ${formatBytes(st.totalBytes)}` : ""}（${st.label}）`;
     }
     if (st.kind === "ready") {
       text.textContent = `${label} 読み込み完了（パラメータ数 ${formatParams(st.paramCount)}）`;
@@ -7717,26 +7868,43 @@ const App = {
               : "モデル未配置"
       );
     }
-    // Ultra 選択中は、ベースURLの上書き欄（自作モデル専用）を無効化し、
-    // 現在のベースURL欄には Ultra には無い旨を表示する。
-    const isUltra = this.modelId === "ultra";
+    // iMac で動かすモデル（Twin / Pro / Max / Ultra）の選択中は、
+    // ベースURLの上書き欄（端末内モデル専用）を無効化し、現在の
+    // ベースURL欄にはその旨を表示する。未接続（standby）・接続
+    // エラー（error）のときは、接続／再試行のボタンも出す。
+    const def = modelDef(this.modelId);
+    const noBaseUrl = def.engine === "ultra" || def.engine === "server";
     const baseInput = el("base-url");
-    if (baseInput) baseInput.disabled = isUltra;
+    if (baseInput) baseInput.disabled = noBaseUrl;
     const loadBtn = el("load-model-btn");
-    if (loadBtn) loadBtn.disabled = isUltra;
-    if (isUltra) {
+    if (loadBtn) loadBtn.disabled = noBaseUrl;
+    if (noBaseUrl) {
       const cur = el("current-url");
       if (cur) {
-        cur.textContent =
-          "（Cube Ultraにはありません。Hugging Face の FMA03/cube-ultra から読み込みます）";
+        cur.textContent = def.engine === "ultra"
+          ? "（Cube Ultraにはありません。iMacサーバーで動かします）"
+          : "（このモデルはiMacサーバーで動かすため、ベースURLはありません）";
       }
     }
+    this.setServerConnect(noBaseUrl && (st.kind === "standby" || st.kind === "error"));
+  },
+
+  /* サーバー接続ブロック（未接続・接続エラー時の「接続／再試行」
+     ボタン）の表示／非表示。表示条件の判定は setModelStatus 側で
+     行い、ここは表示だけを受け持つ。 */
+  setServerConnect(show) {
+    const box = el("server-connect");
+    if (!box) return;
+    box.hidden = !show;
   },
 
   /* エンジン選択ブロックの表示／非表示。show のときは、前回読み込みに
      成功したエンジンが保存されていれば、その案内を添える。Ultra の
      エンジンはどちらも自動では開始せず、このブロックのボタンが
-     押されたときだけ開始する。 */
+     押されたときだけ開始する。
+     ※サーバー固定化で選択ブロック自体を index.html から外したため、
+     現在は常に何もしない（要素が無い）。旧エンジンの読み込みメソッド
+     （loadUltraOnnx / loadUltraGguf）互換のために残してある。 */
   setUltraEngineChoice(show) {
     const box = el("ultra-engine-choice");
     if (!box) return;
@@ -7804,111 +7972,125 @@ const App = {
     box.hidden = false;
   },
 
+  /* iMac で動かすモデルへの接続：モデルが選ばれたとき（switchModel）
+     と、未接続・接続エラー時に出る接続ボタンから使う。Ultra は既存の
+     loadUltraImac（llama-server への到達確認）、サーバーモデル
+     （Twin / Pro / Max）は ServerModel.connect（health の確認と、
+     サーバー側が読み込み中なら ready までのポーリング）。どちらも
+     端末へのダウンロードは無い。失敗したら素直な文面をエラー表示に
+     し、接続ボタンで再試行できるようにする（setModelStatus が
+     standby / error のときにボタンを出す）。 */
+  async connectServerModel() {
+    const def = modelDef(this.modelId);
+    if (def.engine === "ultra") return this.loadUltraImac();
+    if (def.engine !== "server") return;
+    if (ServerModel.readyFor(def.id)) {
+      this.setModelStatus({
+        kind: "ready",
+        paramCount: ServerModel.paramCountFor(def.id),
+      });
+      return;
+    }
+    const seq = ++this.serverLoadSeq;
+    // 他のエンジン（Ultra 系）があれば破棄する（アクティブな
+    // エンジンは常に1つだけ）。
+    disposeUltra();
+    this.setUltraGgufNotice(null);
+    this.setUltraEngineChoice(false);
+    this.modelBusy = true;
+    this.renderModelSwitch();
+    this.setModelStatus({
+      kind: "loading",
+      loadedBytes: 0,
+      totalBytes: 0,
+      label: `${def.label}（iMacサーバーに接続しています）`,
+    });
+    try {
+      await ServerModel.connect(def.id, () => {
+        if (seq !== this.serverLoadSeq) return;
+        this.setModelStatus({
+          kind: "loading",
+          loadedBytes: 0,
+          totalBytes: 0,
+          label: `${def.label}（iMac側で読み込み中です）`,
+        });
+      });
+      if (seq !== this.serverLoadSeq) return;
+      this.setModelStatus({
+        kind: "ready",
+        paramCount: ServerModel.paramCountFor(def.id),
+      });
+    } catch (e) {
+      if (seq !== this.serverLoadSeq) return;
+      const message = e instanceof Error ? e.message : String(e);
+      this.setModelStatus({ kind: "error", message });
+    } finally {
+      if (seq === this.serverLoadSeq) {
+        this.modelBusy = false;
+        this.renderModelSwitch();
+      }
+    }
+  },
+
   async loadModel(url) {
     const def = modelDef(this.modelId);
     if (def.engine === "ultra") {
-      // Cube Ultra：エンジンは transformers.js の pipeline（通常版）か
-      // wllama（軽量エンジン・GGUF版）。ベースURL・manifest 照合・
-      // IndexedDB キャッシュは使わない。ここは「待機ディスパッチャ」で、
-      // Ultra が選ばれてもどちらのエンジンも自動では開始しない。
-      // 前回の試行の痕跡（試行の印・GGUF フェーズ記録）から状態表示と
-      // 通知を出し、エンジン選択ブロックを表示して待つ。読み込み完了の
-      // 記録は各エンジン側にあり、失敗時は ready にならないので、他の
-      // モデルが Ultra の名前で回答することは絶対にない。
-      // (a) どちらかのエンジンが読み込み済みなら ready 表示にする。
-      if (UltraModel.ready || UltraGgufModel.ready || UltraImacModel.ready) {
-        this.setUltraEngineChoice(false);
-        this.setUltraGgufNotice(null);
+      // Cube Ultra（サーバー固定）：UI から開始できるのは iMac
+      // エンジンだけ。ここ（ページ表示時・選択の復元時）は自動では
+      // 接続せず、未接続の待機表示にする。接続はモデルが選ばれた
+      // とき（switchModel）と接続ボタンから、connectServerModel
+      // 経由で行う。旧エンジン（ONNX / GGUF）の試行の印・フェーズ
+      // 記録が残っていても、その文面はもう出さない（両エンジンとも
+      // UI から到達できない。印はモデルを選び直したときに
+      // switchModel が消す）。
+      this.ultraLoadSeq++;
+      this.setUltraGgufNotice(null);
+      this.setUltraEngineChoice(false);
+      ServerModel.dispose();
+      if (UltraImacModel.ready) {
         this.setModelStatus({ kind: "ready", paramCount: ULTRA_PARAM_COUNT });
         return;
       }
-      const stage = readUltraStage();
-      // (b) GGUF の落下が合計2回に達していた：停止理由を表示し、
-      // 選択ブロックを出す（通常版は選べるようにする）。
-      if (stage === "gguf2") {
-        this.setUltraGgufNotice(null);
-        this.setModelStatus({
-          kind: "error",
-          message:
-            "Cube Ultra（軽量エンジン）の起動中にブラウザが繰り返し再読み込みされたため、自動の再試行を止めました。" +
-            "この端末ではメモリが足りず Ultra を起動できない可能性があります。" +
-            "他のタブやアプリを閉じるか、他のモデルをお使いください。" +
-            "他のモデルを選んでから Ultra を選び直すと、もう一度試せます",
-        });
-        this.setUltraEngineChoice(true);
-        return;
-      }
-      // (c) GGUF の試行が前回のタブ落下で中断されていた：割り込みの
-      // 通知（フェーズ記録つき）と選択ブロックを出す。
-      if (stage === "gguf") {
-        this.setModelStatus({
-          kind: "error",
-          message: "Cube Ultra（軽量エンジン）の起動の途中でブラウザが再読み込みされました",
-        });
-        this.setUltraGgufNotice("gguf-retry");
-        this.setUltraEngineChoice(true);
-        return;
-      }
-      // (d) 通常版の落下が合計2回に達していた：UltraModel.load が投げる
-      // のと同じ停止理由を表示し、選択ブロックを出す。
-      if (stage === "build2") {
-        this.setModelStatus({
-          kind: "error",
-          message:
-            "Cube Ultra の起動中にブラウザが繰り返し再読み込みされたため、自動の再試行を止めました。" +
-            "この端末ではメモリが足りず Ultra を起動できない可能性があります。" +
-            "他のタブやアプリを閉じるか、他のモデルをお使いください。" +
-            "他のモデルを選んでから Ultra を選び直すと、もう一度試せます",
-        });
-        this.setUltraGgufNotice("onnx-stopped");
-        this.setUltraEngineChoice(true);
-        return;
-      }
-      // (e) 通常版の試行が前回のタブ落下で中断されていた：通知と
-      // 選択ブロックを出す（自動では再試行しない）。
-      if (stage === "build") {
-        this.setModelStatus({
-          kind: "error",
-          message: "Cube Ultra の起動の途中でブラウザが再読み込みされました",
-        });
-        this.setUltraGgufNotice("onnx-interrupted");
-        this.setUltraEngineChoice(true);
-        return;
-      }
-      // (f) 試行の印が無い場合：GGUF フェーズ記録が「読み込み完了後に
-      // 落ちた」ことを示していたら、その落下通知を出して報告済みに
-      // する。"answered" の記録は静かに消す。"download" / "load" の
-      // 記録だけが残っている場合（タブを閉じた等）は通知を出さずに
-      // 記録を消す。
-      const phaseRec = readGgufPhase();
-      if (phaseRec) {
-        if (!phaseRec.reported && phaseRec.phase === "generating") {
-          this.setUltraGgufNotice("gguf-gen-crash");
-          writeGgufPhase({ ...phaseRec, reported: true });
-        } else if (!phaseRec.reported && phaseRec.phase === "ready") {
-          this.setUltraGgufNotice("gguf-ready-crash");
-          writeGgufPhase({ ...phaseRec, reported: true });
-        } else {
-          writeGgufPhase(null);
-        }
-      }
-      // (g) 待機表示にして、エンジン選択ブロックを出す。
       this.setModelStatus({
         kind: "standby",
-        message: "Cube Ultra は未読み込みです。エンジンを選んでください",
+        message: "Cube Ultra は未接続です。iMacサーバーに接続してください",
       });
-      this.setUltraEngineChoice(true);
       return;
     }
-    // 自作モデルが選択された：Ultra のエンジン（通常版・軽量エンジン
-    // とも）があれば破棄し、GGUF の案内も隠す（アクティブなエンジンは
-    // 常に1つだけ）。進行中の Ultra 読み込みの後処理も無効化する。
+    if (def.engine === "server") {
+      // サーバーモデル（Twin / Pro / Max）：端末には読み込まない。
+      // ここ（ページ表示時・選択の復元時）は自動では接続せず、
+      // 未接続の待機表示にする。接続はモデルが選ばれたとき
+      // （switchModel）と接続ボタンから、connectServerModel 経由で
+      // 行う。
+      this.ultraLoadSeq++;
+      this.setUltraGgufNotice(null);
+      this.setUltraEngineChoice(false);
+      disposeUltra();
+      if (ServerModel.readyFor(def.id)) {
+        this.setModelStatus({
+          kind: "ready",
+          paramCount: ServerModel.paramCountFor(def.id),
+        });
+        return;
+      }
+      this.setModelStatus({
+        kind: "standby",
+        message: `${def.label} は未接続です。iMacサーバーに接続してください`,
+      });
+      return;
+    }
+    // 端末内モデル（Nano / Flash）が選択された：Ultra のエンジンと
+    // サーバーモデルの接続状態があれば破棄し、GGUF の案内も隠す
+    // （アクティブなエンジンは常に1つだけ）。進行中の Ultra 読み込み
+    // の後処理も無効化する。
     this.ultraLoadSeq++;
     this.setUltraGgufNotice(null);
     this.setUltraEngineChoice(false);
     disposeUltra();
+    ServerModel.dispose();
     // ベースURLの上書きは選択中モデルごとのキーに保存する
-    // （Nano は従来の jisaku-ai-model-base-url、Flash / Twin / Pro / Max は専用キー）。
+    // （Nano は従来の jisaku-ai-model-base-url、Flash は専用キー）。
     store.set(def.urlKey, url);
     this.modelBusy = true;
     this.renderModelSwitch();
@@ -7920,9 +8102,9 @@ const App = {
       this.setModelStatus({ kind: "ready", paramCount: LocalModel.paramCount });
     } catch (e) {
       let message = e instanceof Error ? e.message : String(e);
-      // Flash / Twin / Pro / Max の重みがまだアップロードされていない
-      // 場合の案内を添える（黙って Nano で回答することは絶対にしない）。
-      if ((def.id === "v2" || def.id === "twin" || def.id === "pro" || def.id === "max") && message.includes("manifest.json")) {
+      // Flash の重みがまだアップロードされていない場合の案内を
+      // 添える（黙って Nano で回答することは絶対にしない）。
+      if (def.id === "v2" && message.includes("manifest.json")) {
         message += `。${def.label} の重みはまだ GitHub にアップロードされていない可能性があります。Cube Nano に戻すと今まで通り使えます`;
       }
       this.setModelStatus({ kind: "error", message });
@@ -8034,17 +8216,20 @@ const App = {
     }
   },
 
-  /* iMacサーバーエンジンの開始：エンジン選択ブロックのボタンが押された
-     ときだけ始める。端末へのダウンロードは無く、iMac への到達確認だけ。
-     開始時に他のエンジン（通常版・軽量エンジン）は破棄する（アクティブな
-     エンジンは常に1つだけ）。成功したら読み込めたエンジンを保存する。
-     届かなかったら素直な文面をエラー表示にし、エンジン選択ブロックを
-     出し直して、他のエンジンや他のモデルを選べるようにする。 */
+  /* iMacサーバーエンジンの開始：サーバー固定化後の Ultra の唯一の
+     接続経路で、モデルが選ばれたとき（switchModel）と接続ボタンから
+     connectServerModel 経由で始める。端末へのダウンロードは無く、
+     iMac への到達確認だけ。開始時に他のエンジン（通常版・軽量
+     エンジン）とサーバーモデルの接続状態は破棄する（アクティブな
+     エンジンは常に1つだけ）。成功したら接続済みの印を保存する。
+     届かなかったら素直な文面をエラー表示にし、接続ボタンで再試行
+     できるようにする。 */
   async loadUltraImac() {
     if (this.modelId !== "ultra" || UltraImacModel.ready) return;
     const seq = ++this.ultraLoadSeq;
     UltraModel.dispose();
     UltraGgufModel.dispose();
+    ServerModel.dispose();
     this.setUltraEngineChoice(false);
     this.setUltraGgufNotice(null);
     this.modelBusy = true;
@@ -8068,8 +8253,8 @@ const App = {
       if (seq !== this.ultraLoadSeq) return;
       const message = e instanceof Error ? e.message : String(e);
       this.setModelStatus({ kind: "error", message });
-      // もう一度選べるよう、エンジン選択ブロックを出し直す。
-      this.setUltraEngineChoice(true);
+      // 再試行は接続ボタンから（エラー表示にすると setModelStatus が
+      // サーバー接続ブロックを出す）。
     } finally {
       if (seq === this.ultraLoadSeq) {
         this.modelBusy = false;
@@ -8355,11 +8540,9 @@ const App = {
         this.setPhase("thinking");
         await new Promise((r) => setTimeout(r, 30)); // 「考え中…」を先に描く
         try {
-          // 検算経路のモデル生成にも、選択中モデルを使う。Ultra の
-          // 生成は非同期（transformers.js）で、上限は Ultra 固定の128。
-          const modelAns = this.modelId === "ultra"
-            ? await generateUltra(question)
-            : LocalModel.generate(question, modelDef(this.modelId).maxNew);
+          // 検算経路のモデル生成にも、選択中モデルを使う（生成先は
+          // generateForModel がモデルごとに振り分ける）。
+          const modelAns = await generateForModel(this.modelId, question);
           const modelNums = numbersIn(modelAns);
           if (
             modelAns &&
@@ -8422,12 +8605,11 @@ const App = {
       this.setPhase("thinking");
       await new Promise((r) => setTimeout(r, 30));
       try {
-        // 通常の質問応答の生成にも、選択中モデルの生成上限
-        // （Nano・Pro: 48 / Flash・Twin: 96）を明示的に渡す。Ultra の生成は
-        // 非同期（transformers.js）で、上限は Ultra 固定の128。
-        modelAnswer = this.modelId === "ultra"
-          ? await generateUltra(question)
-          : LocalModel.generate(question, modelDef(this.modelId).maxNew);
+        // 通常の質問応答の生成：生成先は generateForModel がモデル
+        // ごとに振り分ける（端末内／iMacサーバー／Ultra）。生成上限は
+        // 各エンジン側が持つ（Nano・Pro・Max: 48 / Flash・Twin: 96 /
+        // Ultra: 128）。
+        modelAnswer = await generateForModel(this.modelId, question);
         if (!modelAnswer) modelIssue = "empty";
       } catch (e) {
         modelAnswer = "";
@@ -8853,6 +9035,7 @@ if (typeof module !== "undefined" && module.exports) {
     normalizeUltraWrittenStyle,
     UltraGgufModel, loadUltraGguf,
     UltraImacModel, loadUltraImac, ULTRA_IMAC_BASE_URL, ULTRA_IMAC_UNREACHABLE,
+    ServerModel, generateForModel, CUBE_SERVER_BASE_URL, CUBE_SERVER_UNREACHABLE,
     readUltraStage, writeUltraStage,
     ULTRA_REPO, ULTRA_PARAM_COUNT, ULTRA_MAX_NEW_TOKENS,
     ULTRA_GGUF_URL, WLLAMA_ESM_URL, WLLAMA_WASM_FROM_CDN_URL,
