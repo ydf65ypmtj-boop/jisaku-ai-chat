@@ -381,6 +381,50 @@ function bufferForFile(fileBuffers, manifest, fileRef) {
   return fileBuffers[name];
 }
 
+/**
+ * テンソルのバイト列を読む（ファイルまたぎ＝span read 対応）。
+ * 開始ファイルは bufferForFile で引き、offset + length がそのファイルに
+ * 収まる場合は従来どおりのゼロコピーのビューを返す。収まらない場合のみ、
+ * manifest.files の開始インデックスから後続ファイルへ順に連結して
+ * length バイトを集める（Cube Max の weights-0.bin を GitHub の25MB
+ * 上限に合わせて2分割し、tok_emb.weight が files[0]+files[1] に
+ * またがる新レイアウトを読むため）。後続ファイルが尽きても足りなければ
+ * エラーにする。またぎを含まない manifest では常にゼロコピー経路になる。
+ */
+function readTensorBytes(fileBuffers, manifest, fileRef, offset, length) {
+  const buf = bufferForFile(fileBuffers, manifest, fileRef);
+  if (!buf) throw new Error("テンソルのファイルがありません");
+  if (offset + length <= buf.byteLength) {
+    return new Uint8Array(buf.buffer, buf.byteOffset + offset, length);
+  }
+  const startIdx = typeof fileRef === "number"
+    ? fileRef
+    : manifest.files.indexOf(fileRef);
+  if (startIdx < 0) {
+    throw new Error(`テンソルの開始ファイルが manifest.files にありません（${fileRef}）`);
+  }
+  const out = new Uint8Array(length);
+  let written = 0;
+  for (let i = startIdx; written < length; i++) {
+    const cur = i === startIdx
+      ? buf
+      : bufferForFile(fileBuffers, manifest, i);
+    if (!cur) break;
+    const curOff = i === startIdx ? offset : 0;
+    const avail = cur.byteLength - curOff;
+    if (avail <= 0) continue;
+    const take = Math.min(avail, length - written);
+    out.set(cur.subarray(curOff, curOff + take), written);
+    written += take;
+  }
+  if (written < length) {
+    throw new Error(
+      `テンソルのデータがファイル範囲を超えています（${length} バイト必要ですが ${written} バイトしか読めませんでした）`,
+    );
+  }
+  return out;
+}
+
 function buildEngine(manifest, bpeJson, fileBuffers) {
   const tensors = {};
   const isInt4 = manifest.format === "jisaku-llm-int4";
@@ -389,7 +433,8 @@ function buildEngine(manifest, bpeJson, fileBuffers) {
     for (const t of manifest.tensors) {
       const buf = bufferForFile(fileBuffers, manifest, t.file);
       if (!buf) throw new Error(`テンソル ${t.name} のファイルがありません`);
-      const bytes = new Int8Array(buf.buffer, buf.byteOffset + t.offset, t.length);
+      const u8 = readTensorBytes(fileBuffers, manifest, t.file, t.offset, t.length);
+      const bytes = new Int8Array(u8.buffer, u8.byteOffset, u8.length);
       tensors[canonicalTensorName(t.name)] = new QTensor(bytes, t.scale, t.shape);
     }
   } else {
@@ -432,8 +477,8 @@ function buildEngine(manifest, bpeJson, fileBuffers) {
         for (let i = 0; i < scaleCount; i++) {
           scales[i] = fp16ToFloat32(scalesView.getUint16(scaleOff + i * 2, true));
         }
-        const packed = new Uint8Array(
-          buf.buffer, buf.byteOffset + (t.offset ?? 0), t.packed_len ?? 0,
+        const packed = readTensorBytes(
+          fileBuffers, manifest, t.file, t.offset ?? 0, t.packed_len ?? 0,
         );
         tensors[canon] = new Int4Tensor(packed, scales, t.shape, groupSize);
       } else {
