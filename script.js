@@ -1449,6 +1449,84 @@ function disposeUltra() {
   UltraImacModel.dispose();
 }
 
+/* ================================================================== */
+/* Ultra 統合：索引レーンの事実を Ultra が自分の言葉で書く              */
+/*                                                                    */
+/* 「ネット検索の答え」の提示に限った統合（2026-11-15 本人決定）。      */
+/* 一般ウェブ検索は静的版では CORS で不可能なため、検索は従来どおり    */
+/* 索引レーン一本に統一し、Ultra が選択されているときにだけ、見つ      */
+/* かった記事を Ultra の訓練済み読解形式で読ませて、提示文を Ultra     */
+/* の言葉で書かせる。他モデル・確認済み経路・根拠・出典・メモ帳        */
+/* 保存はすべて従来どおり。棄権・失敗・空の生成では、従来どおり        */
+/* 記事から組み立てた事実文をそのまま出す（フェイルソフト）。          */
+/* ================================================================== */
+
+/* 読ませる本文の上限（区切りの改行込み）。Muse版ウェブレーンと       */
+/* 同じ 1,800 字。本文が上限を超えるページは丸ごと含めない。           */
+const ULTRA_PASSAGE_CAP = 1800;
+
+/* ページ群 [{title, url, text}] から読解用の本文を組み立てる。        */
+/* 各ページは「改行＋本文」で寄与し、合計が上限を超えるページは        */
+/* 本文からも出典からも外す（後続の短いページは入ることがある）。      */
+function assembleUltraPassage(pages) {
+  let passage = "";
+  const included = [];
+  for (const page of pages || []) {
+    const text = typeof page?.text === "string" ? page.text : "";
+    if (!text) continue;
+    const piece = `\n${text}`;
+    if (passage.length + piece.length > ULTRA_PASSAGE_CAP) continue;
+    passage += piece;
+    included.push({ title: page.title, url: page.url });
+  }
+  return { passage, sources: included };
+}
+
+/* Ultra の訓練済み棄権文。これらで始まる生成は「文には書かれて        */
+/* いない」という回答として扱い、事実文の提示に落とす。                */
+const ULTRA_ABSTENTION_PREFIXES = [
+  "文には書かれていません",
+  "文に書かれていません",
+  "文には記載されていません",
+  "文に記載されていません",
+  "文には載っていません",
+  "文に載っていません",
+  "本文には書かれていません",
+  "本文に書かれていません",
+];
+
+function isUltraAbstention(generation) {
+  const t = String(generation || "").trim();
+  return ULTRA_ABSTENTION_PREFIXES.some((p) => t.startsWith(p));
+}
+
+/* 対象記事の本文を Ultra に読ませ、「ネット検索の答え」の提示文を     */
+/* 書かせる。読ませるのはこのフローが既に持っている記事本文（冒頭      */
+/* 最大5,000字）の先頭で、上限に収まる長さに切ってから組み立て        */
+/* 規則を通す。書けなければ（本文なし・生成失敗・空・棄権）null を     */
+/* 返し、呼び出し側は従来の事実文をそのまま提示する。                  */
+async function ultraWriteFactAnswer(question, article, fact) {
+  try {
+    const lead = article?.lead || fact?.evidence || "";
+    if (!lead) return null;
+    const text = lead.slice(0, ULTRA_PASSAGE_CAP - 1);
+    const { passage } = assembleUltraPassage([
+      {
+        title: article?.title ?? fact.sourceTitle,
+        url: article?.url ?? fact.sourceUrl,
+        text,
+      },
+    ]);
+    if (!passage) return null;
+    const out = await generateUltra(`文：${passage}\n質問：${question}`);
+    const written = (out || "").trim();
+    if (!written || isUltraAbstention(written)) return null;
+    return written;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * 「回答可能」の判定：読み込み完了したエンジンが選択中モデルと一致
  * するときだけ真。自作モデルは LocalModel、Ultra は UltraModel
@@ -8383,6 +8461,21 @@ const App = {
           fact: fact.value,
         });
       };
+      // 「ネット検索の答え」として提示する文。原則は記事から組み立てた
+      // 事実文だが、Ultra が選択され読み込み済みのときだけ、対象記事を
+      // Ultra に読ませて Ultra の言葉で書かせる（統合の設計）。
+      // 確認済み経路（モデルの答えが事実と一致）では使わない。書けな
+      // ければ事実文のまま。生成の間はフェーズを「検索中」のままに
+      // して、二重の送信を防ぐ。
+      let netText = fact.answer;
+      if (
+        this.modelId === "ultra" &&
+        modelReady &&
+        !(modelAnswer && modelAgreesWithFact(modelAnswer, fact))
+      ) {
+        const written = await ultraWriteFactAnswer(question, article, fact);
+        if (written) netText = written;
+      }
       this.setPhase("idle");
       // モデル優先：モデルが答えを出したなら、それが主表示になる。
       // ウェブの事実は裏づけの確認——表記のゆれ（空白・カンマ・単位・
@@ -8403,7 +8496,7 @@ const App = {
       }
       if (modelAnswer) {
         this.pushAssistant({
-          text: fact.answer,
+          text: netText,
           badge: "net",
           sourceTitle: fact.sourceTitle,
           sourceUrl: fact.sourceUrl,
@@ -8426,7 +8519,7 @@ const App = {
               ? `Cubeの生成でエラーが起きたため、ネット検索の答えを表示しています。（エラー内容: ${modelError}）`
               : "対象記事から抜いた事実で組み立てた答えを表示しています。";
       this.pushAssistant({
-        text: fact.answer,
+        text: netText,
         badge: "net",
         sourceTitle: fact.sourceTitle,
         sourceUrl: fact.sourceUrl,
@@ -8722,6 +8815,7 @@ if (typeof module !== "undefined" && module.exports) {
     buildEngine, LocalModel,
     MODELS, modelDef, validateManifest,
     UltraModel, loadUltra, generateUltra, disposeUltra, modelReadyFor,
+    assembleUltraPassage, isUltraAbstention, ultraWriteFactAnswer, ULTRA_PASSAGE_CAP,
     UltraGgufModel, loadUltraGguf,
     UltraImacModel, loadUltraImac, ULTRA_IMAC_BASE_URL, ULTRA_IMAC_UNREACHABLE,
     readUltraStage, writeUltraStage,
