@@ -2005,6 +2005,28 @@ function modelAgreesWithFact(modelAnswer, fact) {
   return false;
 }
 
+/**
+ * 事実の出典記事が、質問の対象（題名か『…』の対象）と関係するか。
+ * 食い違い時に「ネットの事実」を正としてモデルの答えを上書きする
+ * 前の安全弁：タイトルが対象を指すか、記事の冒頭か根拠文が対象を
+ * 名指していれば関係ありとする。リダイレクト先の記事（モーリー
+ * ファンタジー → イオンファンタジー）はタイトルが対象と一致しない
+ * が、冒頭で元の名前を名指すため、本文側の名指しでも拾う。
+ */
+function factSourceRelatedToEntity(fact, article, entity) {
+  if (!fact || !entity) return false;
+  if (titleMatchesSubject(fact.sourceTitle, entity)) return true;
+  const normEntity = normalizeJa(entity);
+  if (normEntity.length < 2) return false;
+  if (normalizeJa(fact.sourceTitle).includes(normEntity)) return true;
+  const lead = article?.lead ?? "";
+  if (lead && normalizeJa(lead).includes(normEntity)) return true;
+  if (fact.evidence && normalizeJa(fact.evidence).includes(normEntity)) {
+    return true;
+  }
+  return false;
+}
+
 /* ------------------------------------------------------------------ */
 /* Cube自身についての質問（固定情報）                                  */
 /*                                                                    */
@@ -5018,13 +5040,27 @@ function parseWeatherQuery(q) {
         maxRequests: qopts.maxRequests ?? 20000,
         deadline: Date.now() + (qopts.maxMs ?? 120000),
         aborted: false,
+        // A budget the host opened explicitly for one question is
+        // sticky (see autoBegin). Implicit budgets are not.
+        sticky: qopts.sticky !== false,
       };
     }
     function budgetActive() {
       return !!budget && !budget.aborted && Date.now() <= budget.deadline;
     }
     function autoBegin() {
-      if (!budgetActive()) beginQuestion();
+      // An explicit per-question budget is sticky: once it has been
+      // exceeded or has expired, later adapter calls in the same
+      // question keep failing fast (checkBudget throws) instead of
+      // silently minting a fresh budget — otherwise the question's
+      // cap never bounds the question as a whole (same repair as the
+      // fullstack lane v31). Calls made with no explicit question
+      // budget (standalone seam use) keep the historical behavior of
+      // refreshing an implicit, non-sticky budget.
+      if (!budget) beginQuestion({ sticky: false });
+      else if (!budget.sticky && !budgetActive()) {
+        beginQuestion({ sticky: false });
+      }
     }
     function checkBudget() {
       if (!budget) return;
@@ -5119,6 +5155,24 @@ function parseWeatherQuery(q) {
     };
   }
 
+  /* The host's query language is the Wikipedia API's: it builds
+   * operator queries (intitle:…) and quoted phrases ("…") meant for
+   * the web API. The index engine has no such operators — fed
+   * verbatim, an intitle: query degrades into a keyword search over
+   * the operator text and returns unrelated short titles (e.g.
+   * intitle:モーリーファンタジーと -> ファンタジー, ファン, リーファ).
+   * Translate at the lane boundary: strip a leading intitle: and one
+   * pair of surrounding quotes. The dispatcher's web fallback keeps
+   * the original query untouched. */
+  function engineQuery(q) {
+    let s = String(q).trim();
+    s = s.replace(/^intitle:/i, "");
+    if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+      s = s.slice(1, -1);
+    }
+    return s.trim();
+  }
+
   function create(deps) {
     const T = createIndexTransport(INDEX_BASE, BODY_BASE, deps.transportOpts);
     let engine = null;
@@ -5179,7 +5233,7 @@ function parseWeatherQuery(q) {
       try {
         T.autoBegin();
         const e = await ensureEngine();
-        const hits = await e.search(q, limit);
+        const hits = await e.search(engineQuery(q), limit);
         return hits.map((h) => h.title);
       } catch (err) {
         lane.lastError = err instanceof Error ? err.message : String(err);
@@ -5192,7 +5246,7 @@ function parseWeatherQuery(q) {
       try {
         T.autoBegin();
         const e = await ensureEngine();
-        const hits = await e.search(q, limit, { withBody: true });
+        const hits = await e.search(engineQuery(q), limit, { withBody: true });
         return hits.map((h) => ({
           title: h.title,
           url: deps.wikiUrl(h.title),
@@ -5254,13 +5308,30 @@ function parseWeatherQuery(q) {
         const listy =
           firstLines.filter((l) => /^.+?\s-\s/.test(l)).length >= 2;
         const templateMark = /[（(]曖昧さ回避[）)]$/.test(t);
+        // The web version only calls a page a disambiguation when it
+        // has NO infobox fields; the index stores plain text, so no
+        // infobox ever survives here and that condition cannot be
+        // applied as-is. Closest proxy: an article that opens with a
+        // substantive prose sentence naming the title is a real
+        // article, even when list-shaped lines follow in the first
+        // lines — e.g. イオンファンタジー, whose chronology lines
+        // ("1988年（昭和63年） - …") otherwise trip `listy` and got
+        // the company article misjudged as a disambiguation page.
+        const baseTitle = t.replace(/[（(][^（）()]*[）)]\s*$/, "").trim();
+        const firstLine = firstLines[0] ?? "";
+        const opensWithProseLead =
+          firstLine.length >= 40 &&
+          /。$/.test(firstLine) &&
+          (firstLine.includes(t) ||
+            (baseTitle.length >= 2 && firstLine.includes(baseTitle)));
         return {
           title: t,
           url: deps.wikiUrl(t),
           lead: body.slice(0, 5000),
           fields: {},
           disambiguation:
-            templateMark || (candidates.length > 0 && listy),
+            templateMark ||
+            (candidates.length > 0 && listy && !opensWithProseLead),
           candidates,
         };
       } catch (err) {
@@ -5819,6 +5890,11 @@ function topicFromQuestion(q) {
   t = t.replace(/(とは|って)(何|なに|どんな).*$/, "");
   t = t.replace(/(は|が)(誰|だれ|いつ|どこ|何|なに|いくつ|どんな|どう).*$/, "");
   t = t.replace(/(ですか|ますか|でしょうか|だろうか)$/, "");
+  // 末尾に残った「とは」（「モーリーファンタジーとは？」型）：後段の
+  // 助詞落としでは「は」だけが落ちて「…と」が残り、題名のタイトル
+  // 完全一致もリダイレクト解決も外れてしまうため、ここで丸ごと落とす。
+  const defTail = t.replace(/とは$/, "");
+  if (defTail.length >= 2) t = defTail;
   // 末尾に残った助詞と質問の名詞を落とす：「イオン株式会社の本社は？」
   // のような裸の「〜は？」型では上の置換が効かず、題名に「の本社」が
   // くっついて記事が見つからなくなる（タイトル完全一致が外れる）ため。
@@ -7270,6 +7346,13 @@ const Notebook = {
 /* 画面まわり                                                          */
 /* ================================================================== */
 
+/* 照合フェーズ全体の予算（約20秒）：索引レーンの質問予算と、生成後に
+   照合結果を待つ締切の両方に使う。重い質問（索引の証拠レーンが大量の
+   Range 取得を要する質問）でも、回答が1分近く「検索で確認中…」の
+   まま止まらないようにするための上限。予算内に終わった照合は
+   従来どおりそのまま使う。 */
+const CORROBORATION_BUDGET_MS = 20000;
+
 const BADGES = {
   notebook: { label: "知識メモ帳の答え", className: "badge-notebook" },
   "notebook-stale": {
@@ -8206,7 +8289,12 @@ const App = {
     // 開始する：生成はメインスレッドの重い処理だが、ネットワークは
     // その裏で進むため、Wikipediaの往復がモデルの思考の後ろに
     // 並ばずに済む。
-    IndexLane.beginQuestion();
+    // 照合フェーズ全体に予算（約20秒）を付ける：索引レーンの質問
+    // 予算をこの時間にし、下の待ち合わせも同じ締切で打ち切る。
+    // 予算を超えた照合は結果なしとして進み、この先の既存フローが
+    // モデルの答えを「ネットで確認できなかった」（未確認）として出す。
+    const corrobStart = Date.now();
+    IndexLane.beginQuestion({ maxMs: CORROBORATION_BUDGET_MS });
     const articlePromise = fetchArticle(question).catch(() => null);
     const searchPromise = searchWikipedia(question).catch(() => []);
     // モデルが何も生まなかった理由を追う——未読み込み・空の生成・
@@ -8238,16 +8326,29 @@ const App = {
 
     this.setPhase("searching");
     let results = [];
+    let article = null;
     let fact = null;
     try {
-      const [article, searchResults] = await Promise.all([
-        articlePromise,
-        searchPromise,
+      // 締切（照合開始から約20秒）前に終わっていれば結果はそのまま
+      // 使う。締切を過ぎたら照合を打ち切って結果なしとして進める。
+      const remainMs = Math.max(
+        0,
+        CORROBORATION_BUDGET_MS - (Date.now() - corrobStart),
+      );
+      const settled = await Promise.race([
+        Promise.all([articlePromise, searchPromise]).then(
+          ([a, s]) => ({ article: a, searchResults: s }),
+        ),
+        new Promise((resolve) => setTimeout(() => resolve(null), remainMs)),
       ]);
-      results = searchResults;
-      fact = extractFact(question, article);
+      if (settled) {
+        article = settled.article;
+        results = settled.searchResults;
+        fact = extractFact(question, article);
+      }
     } catch {
       results = [];
+      article = null;
       fact = null;
     }
     // 検索への接続そのものが失敗していたら、その理由を覚えておく
@@ -8255,6 +8356,19 @@ const App = {
     const searchError = WikiNet.lastError;
     // 『…』の質問では、その作品自身の証拠だけを数える。
     results = scopeToSubject(question, results);
+
+    // 食い違い時の上書きガード：事実の出典記事が質問の対象と無関係
+    // なら、その記事を「ネットの事実」としてモデルの答えを上書き
+    // しない（対象違いの記事が検索で混ざった場合の安全弁。例：
+    // 「モーリーファンタジーとは」に小説ジャンルの記事が当たる）。
+    // ガードが働いた場合は事実なしとして進み、モデルの答えは
+    // 照合〜未確認の通常経路で扱われる。
+    if (fact && modelAnswer && !modelAgreesWithFact(modelAnswer, fact)) {
+      const entity = subjectOf(question) ?? topicFromQuestion(question);
+      if (entity && !factSourceRelatedToEntity(fact, article, entity)) {
+        fact = null;
+      }
+    }
 
     // 4) 事実の道（本命）：対象記事から抜いた種類つき事実で組み立てた答え。
     if (fact) {
@@ -8503,6 +8617,7 @@ const App = {
     wikiFetchBroken = false;
     WikiNet.via = "";
     WikiNet.lastError = "";
+    IndexLane.beginQuestion();
     const titles = await wikiSearchTitles("富士山", 3);
     // タイトルが引けるだけでは不十分：照合に使う記事本文まで取得
     // できるかも確かめる（本文が取れなければ「確認済み」は出ない）。
@@ -8618,6 +8733,7 @@ if (typeof module !== "undefined" && module.exports) {
     isCorroborated, findCorroboratingResult,
     answerContentTerms, numbersMatchLoose,
     cubeSelfAnswer, isTautologicalAnswer,
+    factSourceRelatedToEntity,
     isUsableEvidenceResult, resultAnchoredToQuestion, resultSupportsAnswer,
     modelAnswerFitsQuestion, answerClaimKind,
     parseWeatherQuery, fetchWeather, fetchJmaForecast, resolveJmaArea,
