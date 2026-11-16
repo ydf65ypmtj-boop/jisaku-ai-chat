@@ -2403,8 +2403,39 @@ function factSourceRelatedToEntity(fact, article, entity) {
   if (!fact || !entity) return false;
   if (titleMatchesSubject(fact.sourceTitle, entity)) return true;
   const normEntity = normalizeJa(entity);
-  if (normEntity.length < 2) return false;
+  if (normEntity.length < 2) {
+    // 1文字の対象は通常は証拠にならないが、「音」→「音速」のように
+    // 対象＋属性の語幹でできた複合タイトルは、その属性を聞く質問の
+    // 記事そのものなので認める（語幹の集合は属性の略称だけに限る）。
+    const nTitle1 = normalizeJa(fact.sourceTitle);
+    if (
+      nTitle1.startsWith(normEntity) &&
+      nTitle1.length === normEntity.length + 1 &&
+      /[速高長重深広低熱圧]/.test(nTitle1.slice(normEntity.length))
+    ) {
+      return true;
+    }
+    return false;
+  }
   if (normalizeJa(fact.sourceTitle).includes(normEntity)) return true;
+  // 題名が文節ごと落ちた質問（「徳川家康が江戸幕府を開いた」→題名は
+  // 「江戸幕府」）では、対象文字列の中に記事タイトルがそのまま
+  // 含まれていることが、記事と質問の関係の証拠になる。ただし
+  // タイトルの直前が助詞や文の区切りである場合に限る：「東京
+  // スカイタワー」の中の「スカイタワー」（実在する別物の塔）の
+  // ように、複合名の一部として現れる場合は別の対象なので認めない。
+  {
+    const nTitle = normalizeJa(fact.sourceTitle);
+    if (normEntity.length >= 4 && nTitle.length >= 2) {
+      const idx = normEntity.indexOf(nTitle);
+      if (
+        idx === 0 ||
+        (idx > 0 && /[がはをにの、・「]/.test(normEntity[idx - 1]))
+      ) {
+        return true;
+      }
+    }
+  }
   const lead = article?.lead ?? "";
   if (lead && normalizeJa(lead).includes(normEntity)) return true;
   if (fact.evidence && normalizeJa(fact.evidence).includes(normEntity)) {
@@ -2774,7 +2805,13 @@ function findCorroboratingResult(modelAnswer, results, question = "") {
   if (qKind && aKind && qKind !== aKind && STRICT_KINDS.includes(qKind)) {
     return null;
   }
-  const content = effectiveContentTerms(modelAnswer, question);
+  let content = effectiveContentTerms(modelAnswer, question);
+  if (content.length === 0) {
+    // 答えの中心が1文字の語（「元素記号Feは鉄の元素です」の鉄）だと
+    // 主張語が空になる。値の位置から拾う短い1語で代用する（下の
+    // 単独語ルール＝タイトル錨＋同じ窓の共起がそのまま縛る）。
+    content = gateContentTerms(modelAnswer, question);
+  }
   if (content.length >= 2) {
     for (const r of results) {
       if (
@@ -2782,6 +2819,30 @@ function findCorroboratingResult(modelAnswer, results, question = "") {
         resultSupportsAnswer(r, modelAnswer, content)
       ) {
         return r;
+      }
+    }
+    return null;
+  }
+  // 日付の質問で、答えの主張が数字（年）だけの場合：「人類が初めて
+  // 月面に着陸したのは1969年です」のような文は、主張語が全部質問の
+  // 言い換えとして消えて数字だけが残るため、通常の照合では通らない。
+  // その数字と質問の大事な語3つ以上が同じ窓にそろう記事だけを
+  // 裏づけにする（語のそろいが話題の錨、数字の一致が出来事の裏づけ）。
+  if (content.length === 1 && /^\d{4}$/.test(content[0]) && qKind === "date") {
+    const qTerms = keyTerms(normalizeJa(question)).filter(
+      (t) => !/^\d/.test(t) && t.length >= 2,
+    );
+    if (qTerms.length >= 3) {
+      for (const r of results) {
+        if (!isUsableEvidenceResult(r)) continue;
+        for (const w of evidenceWindows(r)) {
+          if (!windowSupportsAnswer(w, modelAnswer, content)) continue;
+          // 年は「N年」の形で窓に現れていなければならない（「8」の
+          // ような数字の断片や、無関係な箇所の同じ数字では通さない）。
+          if (!w.includes(`${content[0]}年`)) continue;
+          const hits = qTerms.filter((t) => w.includes(t)).length;
+          if (hits >= 3) return r;
+        }
       }
     }
     return null;
@@ -2807,6 +2868,11 @@ function findCorroboratingResult(modelAnswer, results, question = "") {
     /は「?([^。「」]{1,30}?)」?(?:です|である)[。]?$/,
   );
   const value = valueMatch?.[1]?.trim();
+  // 単独語は答えの値そのもの（または「Xの〜」の X）でなければならない。
+  // 「元素記号Feは元素記号の記号です」のような循環文では、質問の
+  // 枠語（記号）が主張語として残り、その語の記事で通ってしまう。
+  if (!value) return null;
+  if (term !== value && term !== value.split("の")[0]) return null;
   for (const r of results) {
     const titleAnchored =
       (aSubject && titleMatchesSubject(r.title, aSubject)) ||
@@ -2923,6 +2989,22 @@ function gateContentTerms(sentence, question) {
     const s = t.replace(/(は|が|を|に|の|へ|と|も|から|まで|より)+$/, "");
     if (s.length >= 2 && !out.includes(s)) out.push(s);
   }
+  if (out.length === 0) {
+    // 答えの中心が1文字の語（水・鉄など）だと、2文字以上の語だけを
+    // 集める上の処理では主張語が空になる。は〜です／は〜をの値の
+    // 位置から短い1語（「Xの〜」ならX）だけを拾う。拾った語は
+    // 各経路の単独語ルール（対象との共起＋アンカー）で縛られる。
+    const vm = /は「?(.{1,10}?)」?(?:です|である|を|が|に)/.exec(
+      sentence ?? "",
+    );
+    const v = (vm?.[1] ?? "").trim();
+    if (v && v.length <= 3 && !/^\d+$/.test(v)) {
+      out.push(v);
+    } else if (v) {
+      const hm = /^(.{1,3}?)の/.exec(v);
+      if (hm && !/^\d+$/.test(hm[1])) out.push(hm[1]);
+    }
+  }
   return out;
 }
 
@@ -2965,8 +3047,172 @@ function superlativeHeadNoun(question) {
   return noun.length >= 1 ? noun : null;
 }
 
+/** 最上級の質問の属性語と、その属性での最大級・最小級の言い方。 */
+function superlativeAttrWord(q) {
+  const small = /(小さい|少ない|短い|低い|狭い|軽い|最小|最少|最短|最低)/.test(
+    q,
+  );
+  const table = [
+    [/人口/, "人口", "最大", "最小"],
+    [/面積/, "面積", "最大", "最小"],
+    [/長さ|全長|長い|短い/, "長さ", "最長", "最短"],
+    [/高さ|標高|高い|低い/, "高さ", "最高", "最低"],
+    [/大きさ|大きい|小さい/, "大きさ", "最大", "最小"],
+    [/重さ|重量|重い|軽い/, "重さ", "最大", "最小"],
+    [/速さ|速度|速い|遅い/, "速さ", "最速", "最遅"],
+    [/深さ|深い|浅い/, "深さ", "最大", "最小"],
+  ];
+  for (const [re, word, big, sml] of table) {
+    if (re.test(q)) return { word, rank: small ? sml : big };
+  }
+  return null;
+}
+
+/** 拡張検索の語並べから落とす、質問の言い回しだけの語。 */
+const EXTRA_QUERY_STOP = new Set([
+  "何年",
+  "何人",
+  "何",
+  "ですか",
+  "ますか",
+  "一番",
+  "最も",
+  "教えて",
+  "について",
+  "ください",
+  "どんな",
+  "どこ",
+  "いつ",
+  "誰",
+]);
+
+/** 文章の最上級の向き：大きい側なら 1、小さい側なら -1、無ければ 0。 */
+function superlativeDirection(text) {
+  const t = String(text ?? "");
+  const big =
+    /(最大|最多|最長|最高|最速|最も多|一番多|大きい|大きな|多い|長い|高い|広い|重い|速い)/.test(
+      t,
+    );
+  const small =
+    /(最小|最少|最短|最低|最も小|一番小|小さい|少ない|短い|低い|狭い|軽い|遅い)/.test(
+      t,
+    );
+  if (big && !small) return 1;
+  if (small && !big) return -1;
+  return 0;
+}
+
+const SUPERLATIVE_ATTRS = [
+  [/人口/, ["人口"]],
+  [/面積/, ["面積"]],
+  [/長さ|全長|長い|短い/, ["長さ", "全長", "長い"]],
+  [/高さ|標高|高い|低い/, ["高さ", "標高", "高い"]],
+  [/大きさ|大きい|小さい/, ["大きさ", "大きい", "大きな"]],
+  [/重さ|重量|重い|軽い/, ["重さ", "重量", "重い"]],
+  [/深さ|深い|浅い/, ["深さ", "深い"]],
+  [/速さ|速度|速い|遅い/, ["速さ", "速度", "速い"]],
+];
+
+/**
+ * 最上級の質問への「勝者」型の答え（「世界で一番人口が多い国は
+ * インドです」）の裏づけ。勝者の記事自身のリードが、同じ範囲・
+ * 同じ属性・同じ順位・同じ向きの最上級を自称している場合に限る。
+ * 一覧記事が「香川県が最も狭い」の形で勝者を名指している場合も、
+ * その形（勝者＋が＋最も／一番）でだけ認める。勝者の記事が最上級を
+ * 自称していない答えは、ここでは通さない。
+ */
+function superlativeWinnerSource(sentence, results, question) {
+  const qRank = superlativeRank(question);
+  if (!qRank) return null;
+  // 答えが名指す勝者：「はXです／はXで、」の X を候補にする。
+  const winners = [];
+  for (const m of String(sentence ?? "").matchAll(
+    /は「?([^、。！？]{1,24}?)」?(?=です|である|だ|で、|、)/g,
+  )) {
+    const w = (m[1] ?? "").replace(/^(約|およそ)/, "").trim();
+    if (w && !/^\d/.test(w) && !/[はがをにへと]/.test(w) && !winners.includes(w)) {
+      winners.push(w);
+    }
+  }
+  if (winners.length === 0) return null;
+  const attr = SUPERLATIVE_ATTRS.find(([re]) => re.test(question));
+  if (!attr) return null;
+  const scope = /(世界|日本|太陽系|全国)/.exec(question)?.[1] ?? null;
+  const scopeAlt =
+    scope === "日本" && /(県|都道府県)/.test(question) ? "都道府県" : null;
+  const qDir = superlativeDirection(question);
+  const claimNums = numbersIn(sentence);
+  for (const r of results ?? []) {
+    if (!isUsableEvidenceResult(r)) continue;
+    const lead = (r.text ?? "").slice(0, 1600);
+    if (claimNums.length > 0) {
+      const leadNums = numbersIn(
+        normalizeUnits(normalizeJa(`${r.title}\n${lead}`)),
+      );
+      if (
+        !claimNums.every((n) => leadNums.some((e) => numbersMatchLoose(n, e)))
+      ) {
+        continue;
+      }
+    }
+    for (const winner of winners) {
+      const titleEq =
+        titleMatchesSubject(r.title, winner) ||
+        normalizeJa(
+          (r.title ?? "").replace(/[（(][^（）()]*[）)]\s*$/, ""),
+        ) === normalizeJa(winner);
+      for (const ls of splitSentences(lead)) {
+        const rankOk =
+          superlativeRank(ls) === qRank ||
+          /第1位|世界一|日本一|首位/.test(ls);
+        if (!rankOk) continue;
+        if (!attr[1].some((w) => ls.includes(w))) continue;
+        if (
+          scope &&
+          !ls.includes(scope) &&
+          !(scopeAlt && ls.includes(scopeAlt)) &&
+          !(r.title ?? "").includes(scope) &&
+          !(scopeAlt && (r.title ?? "").includes(scopeAlt))
+        ) {
+          continue;
+        }
+        const d = superlativeDirection(ls);
+        if (qDir !== 0 && d !== 0 && d !== qDir) continue;
+        const asserts =
+          titleEq ||
+          ls.includes(`${winner}が最も`) ||
+          ls.includes(`${winner}が一番`) ||
+          ls.includes(`${winner}は最も`) ||
+          ls.includes(`${winner}は日本一`) ||
+          ls.includes(`${winner}は世界一`) ||
+          ls.includes(`のは${winner}`) ||
+          ls.includes(`は${winner}である`);
+        if (!asserts) continue;
+        if (/ではなく|でなく|誤り|間違い/.test(ls)) continue;
+        return r;
+      }
+    }
+  }
+  return null;
+}
+
 function definitionSentenceSource(sentence, results, question) {
-  const content = gateContentTerms(sentence, question);
+  let content = gateContentTerms(sentence, question);
+  if (content.length === 0) {
+    // 「H2Oは水を表します」のように、答えの値が1文字の語だと主張語が
+    // 空になる。値の位置（は〜です／は〜を）から短い1語だけを拾い、
+    // 対象名と同じ窓にある場合だけ使う（下の1語ルールがそのまま効く）。
+    const vm = /は「?(.{1,10}?)」?(?:です|である|を|が|に)/.exec(sentence);
+    const v = (vm?.[1] ?? "").trim();
+    if (v && v.length <= 3 && !/^\d+$/.test(v)) {
+      content = [v];
+    } else if (v) {
+      // 「元素記号Feは鉄の元素です」のように値が「Xの〜」の形で、
+      // X自体が1〜3文字の場合はXを唯一の主張語として扱う。
+      const hm = /^(.{1,3}?)の/.exec(v);
+      if (hm && !/^\d+$/.test(hm[1])) content = [hm[1]];
+    }
+  }
   // 主張語が1つも無い文は裏づけない（英数字の綴りから取れた数字
   // だけで「裏づけられた」ことになる穴を塞ぐ）。
   if (content.length === 0) return null;
@@ -3249,6 +3495,11 @@ function verifySentence(sentence, question, ctx) {
       return { source: src, via: "window" };
     }
   }
+  // 最上級の質問への勝者型の答えは、勝者の記事自身が最上級を
+  // 自称しているかで裏づける（通常の窓照合では、順位の文と数字の
+  // 文が分かれているだけで正しい答えまで落ちてしまうため）。
+  const ssrc = superlativeWinnerSource(sentence, results, question);
+  if (ssrc) return { source: ssrc, via: "superlative" };
   if (qKind === "definition") {
     const dsrc = definitionSentenceSource(sentence, results, question);
     if (dsrc) return { source: dsrc, via: "definition" };
@@ -3449,6 +3700,7 @@ function answerClaimKind(answer) {
   if (/の名物は|が名物|の特産品?は|名物です/.test(a)) return "specialty";
   if (/の運営会社は|の運営元は|を運営しているのは/.test(a)) return "operator";
   if (/の国歌は|の首都は/.test(a)) return "attribute";
+  if (/元素記号/.test(a)) return "attribute";
   if (/の(総理大臣|首相|知事|社長|会長|代表者?|創業者|創立者|市長|町長|村長|大統領)は/.test(a)) {
     return "person";
   }
@@ -3571,12 +3823,17 @@ function classifyQuestion(q) {
   // 「大阪の名物は？」「日本の国歌は？」には何/どこ/誰の印が無いため、
   // この2種類が無いと全パターンを素通りして事実が一切取れなかった。
   if (/名物|特産|名産|郷土料理|有名な食べ物/.test(q)) return "specialty";
-  if (/国歌|首都/.test(q)) return "attribute";
+  if (/国歌|首都|元素記号/.test(q)) return "attribute";
+  // 紙幣の肖像：「新しい千円札の肖像は誰ですか」は人物の質問として
+  // 扱い、紙幣の記事から肖像の人物を取りに行く（extractPortrait）。
+  if (/肖像/.test(q) && /(誰|どなた|何|なに|どの|どれ)/.test(q)) {
+    return "person";
+  }
   if (/いつ|何年|設立|創立|創業|結成|完成|竣工|開業|できた/.test(q)) {
     return "date";
   }
   if (
-    /高さ|標高|海抜|全長|長さ|重さ|面積|人口|何メートル|何キロ|いくつ|何人|何円|何歳/.test(
+    /高さ|標高|海抜|全長|長さ|重さ|面積|人口|何メートル|何キロ|いくつ|何人|何円|何歳|何本|何個|何枚/.test(
       q,
     )
   ) {
@@ -3742,8 +3999,8 @@ function extractHq(article, label) {
     );
   }
   const patterns = [
-    /(.+?)に本社を置く/,
-    /(.+?)に本店を置く/,
+    /(.+?)に本社を(?:置く|置き|置いて|置いた)/,
+    /(.+?)に本店を(?:置く|置き|置いて|置いた)/,
     /本社所在地は、?(.{3,50}?)(?:である|です|にあたる)[。]?/,
     /本社は、?(.{3,40}?)(?:に所在|に位置|にあります)/,
     /本社が?、?(.{3,40}?)に所在/,
@@ -3752,7 +4009,26 @@ function extractHq(article, label) {
     const hit = findSentence(article.lead, (s) => re.test(s), 14);
     if (!hit) continue;
     const m = re.exec(hit);
-    const place = m?.[1] ? placeFromSpan(m[1]) : null;
+    if (!m?.[1]) continue;
+    // 捕捉部は文頭（会社名）から始まるため、そのまま placeFromSpan に
+    // 渡すと会社名の途中から切れてしまう。都道府県名（漢字2〜4字＋
+    // 都・府・県）の最初の出現位置から切り直してから場所として
+    // 整える（「新都心」の都のような紛れを避けるため、直前が文の
+    // 区切りや助詞である出現を優先する）。
+    let cut = m[1];
+    let idx = -1;
+    let firstIdx = -1;
+    for (const mm of cut.matchAll(/(?:[一-鿿]{2,4}(?:都|府|県)|北海道)/g)) {
+      if (firstIdx < 0) firstIdx = mm.index;
+      const prev = mm.index > 0 ? cut[mm.index - 1] : "";
+      if (mm.index === 0 || /[はが、）)\s　]/.test(prev)) {
+        idx = mm.index;
+        break;
+      }
+    }
+    if (idx < 0) idx = firstIdx;
+    if (idx > 0) cut = cut.slice(idx);
+    const place = placeFromSpan(cut);
     if (place) {
       return makeFact(
         article,
@@ -3879,6 +4155,54 @@ function extractPlace(question, article, label) {
       );
     }
   }
+  // 発祥地：「讃岐うどんは、香川県（旧讃岐国）のうどんである」の形。
+  // 料理自身の記事が本場を自称している場合だけ、その土地を答えにする。
+  if (/発祥/.test(question)) {
+    const hit = findSentence(
+      article.lead,
+      (s) =>
+        /の(?:郷土料理|名物|名産品?|うどん|料理|食べ物)/.test(s) ||
+        /発祥/.test(s),
+      8,
+    );
+    if (hit) {
+      const m =
+        /は、?(.{2,20}?)(?:（[^）]*）)?の(?:郷土料理|名物|名産品?|うどん|料理|食べ物)/.exec(
+          hit,
+        ) ?? /発祥地は、?(.{2,20}?)(?:です|である|にあ)/.exec(hit);
+      const place = m?.[1] ? placeFromSpan(m[1]) : null;
+      if (place) {
+        return makeFact(
+          article,
+          "place",
+          place,
+          `${label}の発祥地は${place}です。`,
+          hit,
+        );
+      }
+    }
+  }
+  // 複数の都道府県に跨る対象（富士山は山梨県と静岡県）：所在地が
+  // 1つに定まらないため、「XとYに跨る」の形そのものを事実にする。
+  {
+    const hit = findSentence(article.lead, (s) => /に跨[がりる]/.test(s), 8);
+    if (hit) {
+      const m =
+        /([一-鿿]{2,10}?(?:都|道|府|県)(?:（[^）]*）)?と[一-鿿]{2,10}?(?:都|道|府|県)(?:（[^）]*）)?)に跨/.exec(
+          hit,
+        );
+      if (m) {
+        const value = m[1].replace(/（[^）]*）/g, "");
+        return makeFact(
+          article,
+          "place",
+          value,
+          `${label}は${value}に跨っています。`,
+          hit,
+        );
+      }
+    }
+  }
   const hit = findSentence(
     article.lead,
     (s) => /は、?.+?に(?:ある|位置する|立地する)/.test(s),
@@ -3951,10 +4275,86 @@ function extractDate(question, article, label) {
       return makeFact(article, "date", value, answer, hit);
     }
   }
+  // 出来事の語幹フォールバック：質問が名指す出来事（施行・初出場・
+  // 着陸など）を含む文から、その出来事の節の日付だけを取る。節単位で
+  // 見るのは、「1946年…公布、1947年…施行」のように複数の出来事と
+  // 日付が並ぶ文で、聞かれた出来事の日付を取り違えないため。節で
+  // 決まらない場合は、文中の年が1種類だけのときに限って文全体から取る。
+  const stemMatch =
+    /(?:が|に|を|は)([一-鿿々]{2,7}?)(?:された|した|する|だった)(?:のは|のが|いつ|何年|何月|何日)/.exec(
+      question,
+    ) ??
+    /(?:が|に|を|は)([一-鿿々]{2,7}?)(?:された|した)(?:こと|年|日)/.exec(
+      question,
+    );
+  const stem = stemMatch?.[1];
+  if (stem && !/設立|創立|創業|結成|完成|竣工|開業/.test(stem)) {
+    const hitStem = findSentence(
+      article.lead,
+      (s) => s.includes(stem) && dateRe.test(s),
+      60,
+    );
+    if (hitStem) {
+      let value = null;
+      for (const clause of hitStem.split(/[、；;]/)) {
+        if (!clause.includes(stem)) continue;
+        const m = dateRe.exec(clause.replace(/（[^）]*）/g, ""));
+        if (m) {
+          value = m[0];
+          break;
+        }
+      }
+      if (!value) {
+        const bare = hitStem.replace(/（[^）]*）/g, "");
+        const years = [
+          ...new Set([...bare.matchAll(/(\d{3,4})年/g)].map((x) => x[1])),
+        ];
+        if (years.length === 1) {
+          const m = dateRe.exec(bare);
+          if (m) value = m[0];
+        }
+      }
+      if (value) {
+        return makeFact(
+          article,
+          "date",
+          value,
+          `${label}の${stem}は${value}です。`,
+          hitStem,
+        );
+      }
+    }
+  }
   return null;
 }
 
 const MEASURE_SPECS = [
+  {
+    // 速さは「何キロメートル」と聞かれるため、重さの判定（何キロ）より
+    // 先に見る。値は「秒速340m」の形でリードに現れることが多い。
+    test: /速さ|速度/,
+    fields: ["速さ", "速度"],
+    name: "速さ",
+    defaultUnit: "メートル",
+    leadKeyword: /速さ|速度|秒速/,
+    leadPatterns: [
+      /秒速\s*(\d+(?:\.\d+)?)\s*(?:メートル|m(?![a-zA-Z]))/,
+      /毎秒\s*(\d+(?:\.\d+)?)\s*(?:メートル|m(?![a-zA-Z]))/,
+    ],
+    valuePrefix: "秒速",
+  },
+  {
+    // 距離も「何キロメートル」と聞かれるため重さより先に見る。
+    test: /距離/,
+    fields: ["距離"],
+    name: "距離",
+    defaultUnit: "キロメートル",
+    leadKeyword: /距離/,
+    leadPatterns: [
+      /平均距離は\s*([\d,]+(?:\.\d+)?[億万]?[\d,千]*)\s*(?:km|キロメートル)/,
+      /距離は\s*([\d,]+(?:\.\d+)?[億万]?[\d,千]*)\s*(?:km|キロメートル)/,
+    ],
+  },
   {
     test: /高さ|標高|海抜|何メートル/,
     fields: ["標高", "高さ", "海抜"],
@@ -3990,21 +4390,71 @@ const MEASURE_SPECS = [
     defaultUnit: "人",
     leadKeyword: /人口/,
   },
+  {
+    // 骨の数：「成人になるにつれ…206個になる」の形でリードに現れる。
+    // 生まれた時の数（270個）と取り違えないよう、成人の言及がある
+    // パターンを優先する。
+    test: /骨.*(?:何本|何個)|(?:何本|何個).*骨/,
+    fields: [],
+    name: "骨の数",
+    defaultUnit: "個",
+    leadKeyword: /骨/,
+    leadPatterns: [
+      /(?:成人|大人)[^。]{0,40}?(\d+)\s*個になる/,
+      /(\d+)\s*個の骨からなる/,
+    ],
+  },
 ];
 
 const MEASURE_RE =
   /([\d,]+(?:\.\d+)?)\s*(メートル|キロメートル|センチメートル|ミリメートル|平方キロメートル|キログラム|グラム|トン|km2|km²|km|cm|mm|kg|m|t|g|人|名|円|歳)?/;
 
+// 億・万を含む表記（「14億人」「38万4,403km」）：素の正規表現だと
+// 「14」だけを拾って「14人」という誤った事実を作ってしまうため、
+// 億・万の塊ごと表面の表記を値として保持する。
+const MEASURE_RE_JP =
+  /([\d,]+(?:\.\d+)?億(?:[\d,千]+万)?|[\d,]+(?:\.\d+)?万(?:[\d,千]+)?(?:\.\d+)?)\s*(メートル|キロメートル|センチメートル|ミリメートル|平方キロメートル|キログラム|グラム|トン|km2|km²|km|cm|mm|kg|m|t|g|人|名|円|歳)?/;
+
 function measureValue(raw, defaultUnit) {
-  const m = MEASURE_RE.exec(raw.replace(/,/g, ","));
+  const s = raw.replace(/,/g, ",");
+  const mj = MEASURE_RE_JP.exec(s);
+  const m = mj ?? MEASURE_RE.exec(s);
   if (!m || !m[1]) return null;
-  const num = withCommas(m[1]);
+  const num = mj ? m[1] : withCommas(m[1]);
   const unitRaw = m[2] ?? defaultUnit;
   const unit = UNIT_NORM[unitRaw] ?? unitRaw;
   return `${num}${unit}`;
 }
 
 function extractMeasure(question, article, label) {
+  // チームの人数：「サッカーの1チームの人数は何人ですか」は人口の
+  // 質問ではない。記事の中で「1チームN人／N人制」の形が1種類だけ
+  // 現れる場合に限って取り出す（15人制と13人制が併記される記事では
+  // どちらの人数か決められないため取り出さない）。
+  if (/チーム/.test(question) && /(何人|人数)/.test(question)) {
+    const values = new Set();
+    for (const m of (article.lead ?? "").matchAll(
+      /1チーム(?:は|が|の)?[^。]{0,10}?(\d+)\s*人/g,
+    )) {
+      values.add(m[1]);
+    }
+    for (const m of (article.lead ?? "").matchAll(/(\d+)\s*人制/g)) {
+      values.add(m[1]);
+    }
+    if (values.size === 1) {
+      const n = [...values][0];
+      const hit =
+        findSentence(article.lead, (s) => /1チーム\d+\s*人|\d+\s*人制/.test(s), 20) ??
+        article.lead.slice(0, 200);
+      return makeFact(
+        article,
+        "measure",
+        `${n}人`,
+        `${label}の1チームの人数は${n}人です。`,
+        hit,
+      );
+    }
+  }
   const spec = MEASURE_SPECS.find((s) => s.test.test(question));
   if (!spec) return null;
   for (const name of spec.fields) {
@@ -4019,6 +4469,27 @@ function extractMeasure(question, article, label) {
         `${label}の${spec.name}は${value}です。`,
         fieldEvidence(article, name, fromField, value.replace(/[^\d]/g, "").slice(0, 4) || value),
       );
+    }
+  }
+  // 専用パターン（秒速N・平均距離はN・成人はN個）：パターンの優先順に
+  // リード全体から探す。一般のキーワード探索より先に試すのは、
+  // 「0℃では毎秒331.5メートル」のような条件つきの値より先に、
+  // 標準の値（「一般に音速を秒速340m」）を拾うため。
+  if (spec.leadPatterns) {
+    for (const re of spec.leadPatterns) {
+      const hitP = findSentence(article.lead, (s) => re.test(s), 120);
+      if (!hitP) continue;
+      const m = re.exec(hitP);
+      if (m?.[1]) {
+        const value = `${spec.valuePrefix ?? ""}${m[1]}${spec.defaultUnit}`;
+        return makeFact(
+          article,
+          "measure",
+          value,
+          `${label}の${spec.name}は${value}です。`,
+          hitP,
+        );
+      }
     }
   }
   const hit = findSentence(
@@ -4171,7 +4642,51 @@ function extractGovernor(question, article) {
   return null;
 }
 
+/**
+ * 紙幣の肖像：紙幣の記事は「2024年（令和6年）から発行されている
+ * 北里柴三郎の肖像のF号券である」の形で、発行年と肖像の人物を並べる。
+ * 質問が年を名指していればその年の肖像だけを、名指していなければ
+ * 記事中の肖像が1人だけのときに限って取り出す（旧券と新券の肖像が
+ * 併記される記事で、どちらか分からない肖像は出さない）。
+ */
+function extractPortrait(question, article, label) {
+  const re =
+    /(\d{4})年[^。]{0,32}?から発行されている([^、。\s]{2,12})の肖像/g;
+  const found = [];
+  for (const m of (article.lead ?? "").matchAll(re)) {
+    found.push({ year: m[1], name: (m[2] ?? "").trim() });
+  }
+  if (found.length === 0) return null;
+  const qYear = /(\d{4})年/.exec(question)?.[1];
+  let pick = null;
+  if (qYear) {
+    pick = found.find((f) => f.year === qYear) ?? null;
+    if (!pick) return null;
+  } else {
+    const names = [...new Set(found.map((f) => f.name))];
+    if (names.length !== 1) return null;
+    pick = found[0];
+  }
+  if (!pick.name || pick.name.length < 2) return null;
+  const hit =
+    findSentence(
+      article.lead,
+      (s) => s.includes(pick.name) && s.includes("肖像"),
+      20,
+    ) ?? article.lead.slice(0, 200);
+  return makeFact(
+    article,
+    "person",
+    pick.name,
+    `${label}の肖像は${pick.name}です。`,
+    hit,
+  );
+}
+
 function extractPerson(question, article, label) {
+  if (/肖像/.test(question)) {
+    return extractPortrait(question, article, label);
+  }
   if (/知事/.test(question)) {
     return extractGovernor(question, article);
   }
@@ -4289,6 +4804,7 @@ function extractSpecialty(article, label) {
 const ATTRIBUTE_SPECS = [
   { test: /国歌/, field: "国歌", name: "国歌", quote: true },
   { test: /首都/, field: "首都", name: "首都", quote: false },
+  { test: /元素記号/, field: "元素記号", name: "元素記号", quote: false },
 ];
 
 /**
@@ -4339,6 +4855,24 @@ function extractAttribute(question, article, label) {
           "attribute",
           value,
           `${label}の国歌は「${value}」です。`,
+          hit,
+        );
+      }
+    }
+  }
+  if (spec.field === "元素記号") {
+    // 元素の記事は冒頭で「元素記号はFe」と自称する。その形だけを拾う。
+    const re = /元素記号は\s*([A-Z][a-z]?\d?)\b/;
+    const hit = findSentence(article.lead, (s) => re.test(s), 6);
+    if (hit) {
+      const m = re.exec(hit);
+      const value = (m?.[1] ?? "").trim();
+      if (value) {
+        return makeFact(
+          article,
+          "attribute",
+          value,
+          `${label}の元素記号は${value}です。`,
           hit,
         );
       }
@@ -6662,9 +7196,9 @@ function kindSearchPhrase(q) {
     case "specialty":
       return "名物";
     case "attribute":
-      return /国歌/.test(q) ? "国歌" : "首都";
+      return /国歌/.test(q) ? "国歌" : /元素記号/.test(q) ? "元素記号" : "首都";
     case "person": {
-      const role = /(知事|総理大臣|首相|社長|会長|創業者|創立者)/.exec(q);
+      const role = /(知事|総理大臣|首相|社長|会長|創業者|創立者|肖像)/.exec(q);
       return role?.[1] ?? "";
     }
     case "date":
@@ -6758,6 +7292,33 @@ async function searchWikipedia(q) {
       const fetchedExtra = await Promise.all(extra.map(wikiFetchExtract));
       for (const r of fetchedExtra) push(r);
     }
+    // 拡張検索（後ろに足すだけ）：最上級の質問は、質問文のままだと
+    // 勝者の記事が検索に現れないことが多い（「世界で一番人口が多い
+    // 国」ではインドが出ない）。「属性＋範囲＋最大級」の形に言い換えた
+    // 検索（「人口 世界最大」「面積 日本最小」）と、質問の大事な語だけ
+    // を並べた検索（「人類 月面 着陸」）を併せ、新しく見つかった記事
+    // だけを後ろに足す。既存の候補と並びは変えず、照合の厳しさも
+    // 変えない（裏づけの判定は従来どおり記事の中身で行う）。
+    const extraQueries = [];
+    if (superlativeRank(q) > 0) {
+      const attr = superlativeAttrWord(q);
+      const scope = /(世界|日本|太陽系|全国)/.exec(q)?.[1];
+      if (attr && scope) {
+        extraQueries.push(`${attr.word} ${scope}${attr.rank}`);
+        const head = superlativeHeadNoun(q);
+        if (head) extraQueries.push(`${head} ${attr.word} ${scope}一`);
+      }
+    }
+    const kwTerms = keyTerms(normalizeJa(q))
+      .filter((t) => !/^\d+$/.test(t) && !EXTRA_QUERY_STOP.has(t))
+      .slice(0, 5);
+    if (kwTerms.length >= 2) extraQueries.push(kwTerms.join(" "));
+    for (const eq of extraQueries) {
+      if (normalizeJa(eq) === normalizeJa(q)) continue;
+      const titles = await wikiSearchTitles(eq, 4).catch(() => []);
+      const fetchedEq = await Promise.all(titles.map(wikiFetchExtract));
+      for (const r of fetchedEq) push(r);
+    }
   } catch {
     /* 集まった分だけ返す */
   }
@@ -6770,10 +7331,10 @@ async function searchWikipedia(q) {
   const kindRes = {
     author: /作者|著者|による/,
     hq: /本社/,
-    person: /社長|会長|代表|創業者|総理大臣|首相|知事|現職/,
+    person: /社長|会長|代表|創業者|総理大臣|首相|知事|現職|肖像/,
     operator: /運営/,
     specialty: /名物|郷土料理|特産/,
-    attribute: /国歌|首都/,
+    attribute: /国歌|首都|元素記号/,
     date: /設立|創立|創業|竣工|開業|完成/,
     measure: /\d/,
     place: /所在地|位置する|にある/,
@@ -6847,6 +7408,10 @@ async function searchWikipedia(q) {
 function topicFromQuestion(q) {
   const subj = q.match(/『(.+?)』/)?.[1]?.trim();
   if (subj) return subj;
+  // 紙幣の肖像の質問：題名は額面の紙幣そのもの（「千円札」→千円紙幣）。
+  // 文全体を題名にすると紙幣の記事に届かないため、額面だけを抜く。
+  const den = q.match(/([一二三四五六七八九十千万円]{2,}札)/);
+  if (den && /肖像/.test(q)) return den[1].replace(/札$/, "紙幣");
   let t = q.trim().replace(/[？?！!。]+$/, "");
   // 「光合成では…何が放出される？」型：題名は では/には の前。
   // 後段の疑問詞カットより先に切り取る（「では何が」の は+何 に
@@ -6861,6 +7426,12 @@ function topicFromQuestion(q) {
   const famousCut = t.match(/^(.{2,16}?)(?:が|で)有名/);
   if (famousCut?.[1]) {
     t = famousCut[1];
+  }
+  // 「地球から月までの距離」型：題名は到着点の側（月）。文全体では
+  // どちらの天体の記事にも届かない。
+  const distCut = t.match(/^.{1,12}?から(.{1,8}?)までの距離/);
+  if (distCut?.[1]) {
+    t = distCut[1];
   }
   t = t.replace(
     /(の)?(本社|本店|所在地|住所|場所)(は|が|って|を)?(どこ|どちら|なに|何|教えて|教え).*$/,
@@ -6878,14 +7449,14 @@ function topicFromQuestion(q) {
   // ある）の質問、「大阪の名物は？」は大阪の質問。これを落とさないと
   // 題名が「日本の国歌」「大阪の名物」になって記事が見つからない。
   t = t.replace(
-    /(の|で)(名物|特産品?|名産品?|郷土料理|国歌|首都|有名な食べ物)(は|が|って)?.*$/,
+    /(の|で)(名物|特産品?|名産品?|郷土料理|国歌|首都|元素記号|化学式|有名な食べ物)(は|が|って)?.*$/,
     "",
   );
   t = t.replace(
     // 「人口とは何ですか」「人口の意味は？」のような定義質問では、
     // 数値の名詞の後ろの とは／の意味 を数値カットで食わない
     // （題名そのものが消えてしまうため）。
-    /(の)?(高さ|標高|海抜|全長|長さ|重さ|面積|人口|値段|価格|年齢)(?!(?:とは|の意味|の定義))(は|が|って)?.*$/,
+    /(の)?(高さ|標高|海抜|全長|長さ|重さ|面積|人口|速さ|値段|価格|年齢)(?!(?:とは|の意味|の定義))(は|が|って)?.*$/,
     "",
   );
   // 疑問詞のカット：「何／なに」の口語形「なん」も同じ位置に来る
@@ -6933,7 +7504,9 @@ function topicFromQuestion(q) {
     if (stripped.length >= 2) t = stripped;
   }
   t = t.trim();
-  return t.length >= 2 ? t : null;
+  // 1文字の漢字の題名（鉄・月・音など）は、それ自体が記事名なので
+  // 題名として認める（かな1文字のような断片は従来どおり認めない）。
+  return t.length >= 2 ? t : t.length === 1 && /[一-鿿]/.test(t) ? t : null;
 }
 
 /** 1記事のウィキテキスト（インフォボックス解析用）。失敗時は null。 */
@@ -7286,6 +7859,34 @@ async function resolveArticleSourceInner(q) {
           if (!titles.includes(t)) titles.push(t);
         }
       };
+      // 複合タイトル候補：「音の速さ」→音速、「光の速さ」→光速のよう
+      // に、題名の頭の名詞＋質問の属性語がそのまま記事名になる場合。
+      // 実在し、種類つき事実が実際に抜ける記事だけを採用する。
+      {
+        const head = topic.split("の")[0] ?? "";
+        if (head.length >= 1 && head.length <= 4) {
+          // 質問の属性語→記事名の接尾辞（速さ→速、高さ→高、長さ→長）。
+          const suffixes = [
+            ["速さ", "速"],
+            ["速度", "速度"],
+            ["高さ", "高"],
+            ["長さ", "長"],
+            ["重さ", "重"],
+            ["深さ", "深"],
+            ["広さ", "広"],
+            ["面積", "面積"],
+          ];
+          for (const [qw, suf] of suffixes) {
+            if (!q.includes(qw)) continue;
+            const cand = `${head}${suf}`;
+            if (cand === topic) continue;
+            const src = await wikiArticleSource(cand);
+            if (src && !src.disambiguation && extractFact(q, src)) {
+              return src;
+            }
+          }
+        }
+      }
       addTitles(await wikiSearchTitles(topic, 6));
       if (!/\s/.test(topic)) {
         addTitles(await wikiSearchTitles(`intitle:${topic}`, 4));
