@@ -3107,9 +3107,9 @@ const SUPERLATIVE_ATTRS = [
   [/面積/, ["面積"]],
   [/長さ|全長|長い|短い/, ["長さ", "全長", "長い"]],
   [/高さ|標高|高い|低い/, ["高さ", "標高", "高い"]],
-  [/大きさ|大きい|小さい/, ["大きさ", "大きい", "大きな"]],
+  [/大きさ|大きい|小さい/, ["大きさ", "大きい", "大きな", "面積"]],
   [/重さ|重量|重い|軽い/, ["重さ", "重量", "重い"]],
-  [/深さ|深い|浅い/, ["深さ", "深い"]],
+  [/深さ|深い|浅い/, ["深さ", "深い", "水深"]],
   [/速さ|速度|速い|遅い/, ["速さ", "速度", "速い"]],
 ];
 
@@ -3196,6 +3196,60 @@ function superlativeWinnerSource(sentence, results, question) {
   return null;
 }
 
+/**
+ * 答えの文が名指す「勝者」（最上級の答えの値）を1つ取り出す。
+ * 「XはYです」型は Y、「Xは、ZにあるWです」型（「日本で一番深い
+ * 湖は、滋賀県にある琵琶湖です」）は末尾の W を取る。取れなければ
+ * null（その場合は勝者の一致は主張語の照合に任せる）。
+ */
+function superlativeClaimWinner(sentence) {
+  const s = String(sentence ?? "");
+  for (const m of s.matchAll(
+    /は「?([^、。！？]{1,24}?)」?(?=です|である|だ|で、|、)/g,
+  )) {
+    const w = (m[1] ?? "").replace(/^(約|およそ)/, "").trim();
+    if (w && !/^\d/.test(w) && !/[はがをにへと]/.test(w)) return w;
+  }
+  const vm = /は「?([^。「」]{1,30}?)」?(?:です|である)[。]?$/.exec(s);
+  let v = (vm?.[1] ?? "").replace(/^[、,]/, "").trim();
+  if (v) {
+    const tail = v.split(/にある|に位置する/).pop().trim();
+    if (tail && !/^\d/.test(tail) && !/[はがをにへと]/.test(tail)) {
+      return tail;
+    }
+  }
+  return null;
+}
+
+/**
+ * 証拠側の1文が、質問の最上級と「同じ主張」をしているか：
+ * 順位が同じで、属性（深さ・面積・高さ…）が同じ系統で、向き
+ * （大きい側／小さい側）が矛盾せず、答えの名指す勝者がその文の
+ * 中に現れていること。順位と頭名詞だけでは「日本最大の湖である
+ * 琵琶湖」（面積の主張）が「日本で一番深い湖」（深さの質問）の
+ * 裏づけになってしまう（第2回実測 a15 の誤確認）。属性の系統が
+ * 質問から読み取れない場合は、その項目は判定しない。
+ */
+function superlativeSentenceAgrees(ls, question, claimSentence) {
+  const qRank = superlativeRank(question);
+  if (qRank) {
+    const rankOk =
+      superlativeRank(ls) === qRank ||
+      (qRank === 1 && /第1位|世界一|日本一|首位/.test(ls));
+    if (!rankOk) return false;
+  }
+  const attr = SUPERLATIVE_ATTRS.find(([re]) => re.test(question));
+  if (attr && !attr[1].some((w) => ls.includes(w))) return false;
+  const qDir = superlativeDirection(question);
+  const d = superlativeDirection(ls);
+  if (qDir !== 0 && d !== 0 && d !== qDir) return false;
+  const winner = superlativeClaimWinner(claimSentence);
+  if (winner && !normalizeJa(ls).includes(normalizeJa(winner))) {
+    return false;
+  }
+  return true;
+}
+
 function definitionSentenceSource(sentence, results, question) {
   let content = gateContentTerms(sentence, question);
   if (content.length === 0) {
@@ -3219,6 +3273,9 @@ function definitionSentenceSource(sentence, results, question) {
   // 順位・最上級の質問では、順位そのものが主張の一部：裏づけ窓にも
   // 同じ順位の印と、対象の頭名詞（山・湖・ビル等）が無ければ通さない
   // （「二番目に高い山は富士山」と言っても、一番の記事では裏づけない）。
+  // さらに属性（深さ・面積など）と勝者の一致も必須にする：順位と
+  // 頭名詞だけだと、面積で日本一の琵琶湖が「一番深い湖」の裏づけに
+  // なってしまう（第2回実測 a15 の誤確認の経路）。
   const qRank = superlativeRank(question);
   const headNoun = qRank ? superlativeHeadNoun(question) : null;
   const usable = (results ?? []).filter(
@@ -3249,10 +3306,16 @@ function definitionSentenceSource(sentence, results, question) {
         if (qRank) {
           if (superlativeRank(ls) !== qRank) continue;
           if (headNoun && !ls.includes(headNoun)) continue;
+          if (!superlativeSentenceAgrees(ls, question, sentence)) continue;
         }
         const w = normalizeUnits(normalizeJa(`${r.title}\n${ls}`));
         if (content.length === 1 && !/^\d/.test(content[0]) && ne) {
           if (!w.includes(ne)) continue;
+          // 1語だけの主張では、対象名がタイトルではなく文そのものに
+          // 現れていることも求める。タイトルにだけ対象名がある記事の
+          // 無関係な文（例：ドラマ記事のあらすじに出てくる「水」）が、
+          // 窓へのタイトル添えで共起したことになって通るのを防ぐ。
+          if (!normalizeJa(ls).includes(ne)) continue;
         }
         if (windowSupportsAnswer(w, sentence, content)) return r;
       }
@@ -3413,7 +3476,9 @@ function placeWindowComplete(sentence, question, source) {
 /**
  * 順位・最上級の質問に対する窓の追加条件：裏づけ記事の中に、同じ順位
  * の印と対象の頭名詞を持ち、文の数字と主張語（少なくとも1つ）を
- * 含む文が1つあること。
+ * 含む文が1つあること。加えて、その文が質問と同じ属性・向きで、
+ * 答えの名指す勝者を名指していること（superlativeSentenceAgrees）：
+ * 順位と頭名詞だけでは、別の属性で1位の対象が裏づけになってしまう。
  */
 function rankWindowSupports(result, sentence, question, qRank) {
   const headNoun = superlativeHeadNoun(question);
@@ -3435,6 +3500,7 @@ function rankWindowSupports(result, sentence, question, qRank) {
       ) {
         continue;
       }
+      if (!superlativeSentenceAgrees(ws, question, sentence)) continue;
       return true;
     }
   }
@@ -8953,12 +9019,23 @@ const Notebook = {
 /* 画面まわり                                                          */
 /* ================================================================== */
 
-/* 照合フェーズ全体の予算（約20秒）：索引レーンの質問予算と、生成後に
-   照合結果を待つ締切の両方に使う。重い質問（索引の証拠レーンが大量の
-   Range 取得を要する質問）でも、回答が1分近く「検索で確認中…」の
-   まま止まらないようにするための上限。予算内に終わった照合は
-   従来どおりそのまま使う。 */
-const CORROBORATION_BUDGET_MS = 20000;
+/* 証拠取得の予算（第2回実測の教訓で再設計）：
+   1問の証拠集め（対象記事＋検索）は、索引レーンへの Range 取得が
+   約1,000〜15,000リクエストに及ぶ（実測：富士山の所在で約3,000、
+   「日本で一番深い湖」で約15,000）。以前は照合全体に20秒の締切を
+   質問開始時点から掛けていたため、生成の速いモデルでは証拠が
+   そろう前に締切が来て、集めた証拠ごと捨てられていた（実在する
+   記事でも「記事が見つかりませんでした」になる事故）。生成の遅い
+   Max だけが、生成の裏で証拠が間に合い、設計どおりに動いた。
+   そこで予算を2つに分ける：
+   - レーン予算（EVIDENCE_LANE_BUDGET_MS / EVIDENCE_LANE_MAX_REQUESTS）：
+     索引レーンの暴走防止だけに使う大きな上限。
+   - 待ち予算（EVIDENCE_WAIT_MS）：生成が終わってから証拠の到着を
+     待つ上限。生成時間とは独立に数えるため、モデルの速さで
+     証拠のそろい方が変わらない。証拠が早くそろえば即座に進む。 */
+const EVIDENCE_LANE_BUDGET_MS = 150000;
+const EVIDENCE_LANE_MAX_REQUESTS = 60000;
+const EVIDENCE_WAIT_MS = 90000;
 
 const BADGES = {
   notebook: { label: "知識メモ帳の答え", className: "badge-notebook" },
@@ -10022,14 +10099,28 @@ const App = {
     // 開始する：生成はメインスレッドの重い処理だが、ネットワークは
     // その裏で進むため、Wikipediaの往復がモデルの思考の後ろに
     // 並ばずに済む。
-    // 照合フェーズ全体に予算（約20秒）を付ける：索引レーンの質問
-    // 予算をこの時間にし、下の待ち合わせも同じ締切で打ち切る。
-    // 予算を超えた照合は結果なしとして進み、この先の既存フローが
-    // モデルの答えを「ネットで確認できなかった」（未確認）として出す。
-    const corrobStart = Date.now();
-    IndexLane.beginQuestion({ maxMs: CORROBORATION_BUDGET_MS });
+    // 証拠の到着は生成と並行に追跡する（後段の待ち合わせで、到着
+    // 済みの分だけでも使えるようにするため）。レーン予算は暴走防止
+    // の大きな上限だけにし、実際の待ちは生成後に EVIDENCE_WAIT_MS
+    // で数える（定数のコメント参照）。
+    IndexLane.beginQuestion({
+      maxMs: EVIDENCE_LANE_BUDGET_MS,
+      maxRequests: EVIDENCE_LANE_MAX_REQUESTS,
+    });
     const articlePromise = fetchArticle(question).catch(() => null);
     const searchPromise = searchWikipedia(question).catch(() => []);
+    let articleSettled = false;
+    let searchSettled = false;
+    let articleValue = null;
+    let searchValue = [];
+    articlePromise.then((a) => {
+      articleSettled = true;
+      articleValue = a;
+    });
+    searchPromise.then((s) => {
+      searchSettled = true;
+      searchValue = s;
+    });
     // モデルが何も生まなかった理由を追う——未読み込み・空の生成・
     // 例外は以前は見分けがつかず、すべて黙って「確認できませんでした」
     // や理由のないネット検索ラベルに潰れていた。
@@ -10060,28 +10151,30 @@ const App = {
     let results = [];
     let article = null;
     let fact = null;
-    try {
-      // 締切（照合開始から約20秒）前に終わっていれば結果はそのまま
-      // 使う。締切を過ぎたら照合を打ち切って結果なしとして進める。
-      const remainMs = Math.max(
-        0,
-        CORROBORATION_BUDGET_MS - (Date.now() - corrobStart),
-      );
-      const settled = await Promise.race([
-        Promise.all([articlePromise, searchPromise]).then(
-          ([a, s]) => ({ article: a, searchResults: s }),
-        ),
-        new Promise((resolve) => setTimeout(() => resolve(null), remainMs)),
-      ]);
-      if (settled) {
-        article = settled.article;
-        results = settled.searchResults;
-        fact = extractFact(question, article);
+    // 証拠の到着を、生成が終わったこの時点から EVIDENCE_WAIT_MS まで
+    // 待つ（質問開始からの締切ではない：モデルの速さに依存しない）。
+    // 両方そろえば即座に進む。締切までに片方しか届かなかったら、
+    // 届いた分だけを使う（以前は締切で証拠を丸ごと捨てていた）。
+    // どちらが欠けたかは evidenceTimedOut に残し、「記事が見つから
+    // なかった」という断定は、証拠集めが完走した場合にだけ使う。
+    let evidenceTimedOut = false;
+    {
+      const waitDeadline = Date.now() + EVIDENCE_WAIT_MS;
+      while (!(articleSettled && searchSettled)) {
+        const remain = waitDeadline - Date.now();
+        if (remain <= 0) break;
+        await new Promise((r) => setTimeout(r, Math.min(200, remain)));
       }
-    } catch {
-      results = [];
-      article = null;
-      fact = null;
+      evidenceTimedOut = !(articleSettled && searchSettled);
+      if (articleSettled) article = articleValue;
+      if (searchSettled) results = searchValue;
+      if (article) {
+        try {
+          fact = extractFact(question, article);
+        } catch {
+          fact = null;
+        }
+      }
     }
     // 検索への接続そのものが失敗していたら、その理由を覚えておく
     // （下の「確認できませんでした」で、理由なしにごまかさないため）。
@@ -10307,7 +10400,17 @@ const App = {
       // gate.status === "none"：裏づけの取れた主張文が1つも無い。
       // モデルの答えは表示しない。対象そのものが見つからない場合は
       // その旨を言う（実在しないものにあるように答えないため）。
-      if (entityNotFound(question, article, results, searchError)) {
+      // ただし証拠集めが時間切れで完走していない場合は「見つから
+      // なかった」とは断定しない（確かめ切れなかっただけであり、
+      // 実在する記事でも同じ見た目になるため）。
+      if (
+        entityNotFound(
+          question,
+          article,
+          results,
+          searchError || (evidenceTimedOut ? "evidence-timeout" : ""),
+        )
+      ) {
         const entity = subjectOf(question) ?? topicFromQuestion(question);
         this.pushAssistant({
           text: "確認できませんでした。",
@@ -10319,9 +10422,11 @@ const App = {
       this.pushAssistant({
         text: "確認できませんでした。",
         badge: "unknown",
-        note: searchError
-          ? `検索に接続できなかったため、記事の事実では確認できませんでした（理由：${searchError}）。Cubeの答えも裏づけが取れなかったため、表示しませんでした。設定の「検索テスト」で接続を確かめられます。`
-          : "Cubeの答えは、記事の事実で裏づけが取れなかったため表示しませんでした。",
+        note: evidenceTimedOut
+          ? "記事の取得が時間内に終わらなかったため、裏づけの確認ができませんでした。Cubeの答えも表示しませんでした。"
+          : searchError
+            ? `検索に接続できなかったため、記事の事実では確認できませんでした（理由：${searchError}）。Cubeの答えも裏づけが取れなかったため、表示しませんでした。設定の「検索テスト」で接続を確かめられます。`
+            : "Cubeの答えは、記事の事実で裏づけが取れなかったため表示しませんでした。",
       });
       return;
     }
@@ -10331,9 +10436,11 @@ const App = {
       this.pushAssistant({
         text: "確認できませんでした。",
         badge: "unknown",
-        note: searchError
-          ? `検索に接続できませんでした（理由：${searchError}）。設定の「検索テスト」で接続を確かめられます。`
-          : modelIssue === "not_ready"
+        note: evidenceTimedOut
+          ? "記事の取得が時間内に終わらなかったため、確認できませんでした。"
+          : searchError
+            ? `検索に接続できませんでした（理由：${searchError}）。設定の「検索テスト」で接続を確かめられます。`
+            : modelIssue === "not_ready"
             ? "対象記事から、質問に対応する事実を抜き出せませんでした。Cubeは読み込まれていないため、モデルの答えもありません。関係ありそうな文を貼ってごまかすことはしません。"
             : modelIssue === "empty"
               ? "対象記事から、質問に対応する事実を抜き出せませんでした。Cubeにも聞きましたが、この聞き方では答えが生成されませんでした。聞き方を変えると答えが出ることがあります。関係ありそうな文を貼ってごまかすことはしません。"
