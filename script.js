@@ -2824,6 +2824,618 @@ function isCorroborated(modelAnswer, results, question = "") {
   return findCorroboratingResult(modelAnswer, results, question) !== null;
 }
 
+/* ------------------------------------------------------------------ */
+/* 文単位の出典検証ゲート（2026-11-16）                                */
+/*                                                                    */
+/* モデルの答えを文（主張）単位に割り、各文を手元の証拠（種類つき      */
+/* 事実・検索結果）で裏づける。表示側は「裏づけの取れた文だけ」を      */
+/* 使う——裏づけの無い主張文は、モデル優先表示でも出さない。          */
+/* 設計は hybrid/VERIFICATION_LAYER_DESIGN.md を参照。                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ゲート用の文分割：既存 splitSentences は8字未満の文を捨てるが、
+ * 「水です。」のような短い主張も検証対象にしなければならないため、
+ * 句点・感嘆符・疑問符・改行で割り、空でない断片を全部残す。
+ */
+function splitForGate(text) {
+  const parts = String(text ?? "").split(/(?<=[。！？\n])/);
+  const out = [];
+  for (const p of parts) {
+    const s = p.trim();
+    if (s) out.push(s);
+  }
+  if (out.length === 0 && String(text ?? "").trim()) {
+    out.push(String(text).trim());
+  }
+  return out;
+}
+
+/** 棄権の表明か（「分かりません」等で、主張語も数字も持たない文）。 */
+function isAbstentionSentence(sentence, question) {
+  if (
+    !/分かりません|わかりません|分からない|確認できません|不明です|知りません|存じ上げません|分かりかねます/.test(
+      sentence,
+    )
+  ) {
+    return false;
+  }
+  // 棄権の言い回し自体を取り除いてから中身を測る（「分かりません」
+  // は語の抽出で「かりません」に断片化し、主張語に見えてしまうため）。
+  const rest = sentence.replace(
+    /分かりません|わかりません|分からない|確認できません|不明です|知りません|存じ上げません|分かりかねます/g,
+    "",
+  );
+  return (
+    effectiveContentTerms(rest, question).length === 0 &&
+    numbersIn(rest).length === 0
+  );
+}
+
+/**
+ * 定義質問用のアンカー：その記事が質問の対象についての記事か。
+ * タイトルが対象を指すか、冒頭600字が対象を名指していること。
+ * リダイレクト先の記事（モーリーファンタジー → イオンファンタジー）は
+ * タイトルが対象と一致しないが冒頭で元の名前を名指すため、本文側の
+ * 名指しでも拾う（factSourceRelatedToEntity と同じ基準）。
+ */
+function definitionAnchored(result, question) {
+  const entity = subjectOf(question) ?? topicFromQuestion(question);
+  if (!entity) return false;
+  if (titleMatchesSubject(result.title, entity)) return true;
+  const ne = normalizeJa(entity);
+  if (ne.length >= 2) {
+    if (normalizeJa(result.title).includes(ne)) return true;
+    if (normalizeJa((result.text ?? "").slice(0, 600)).includes(ne)) {
+      return true;
+    }
+  }
+  // 最上級の質問では話題文（「太陽系で一番大きい惑星」）が記事に
+  // そのまま出てこないため、基底の主語（「太陽系」）でも拾う。
+  if (superlativeRank(question)) {
+    const base = String(entity).split(/で(?:一番|最も|最大|最高)/)[0];
+    const nb = normalizeJa(base ?? "");
+    if (nb.length >= 2 && nb !== ne) {
+      if (titleMatchesSubject(result.title, base)) return true;
+      if (normalizeJa((result.text ?? "").slice(0, 600)).includes(nb)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * 経路C用の主張語：effectiveContentTerms の語から末尾の助詞を落とした
+ * もの。かな主体の語（モーリーファンタジー等）は質問文の中では1つの
+ * かなの連なりとして抽出されるため、答え側の「モーリーファンタジーは」
+ * のような助詞つきの語が質問語と一致せず主張語に残り、そのままでは
+ * 記事の窓（「モーリーファンタジー」をはじめとする…）と一致しない。
+ * 窓照合の前に助詞を落として、語の芯で比べる。
+ */
+function gateContentTerms(sentence, question) {
+  const out = [];
+  for (const t of effectiveContentTerms(sentence, question)) {
+    if (/^\d/.test(t)) {
+      if (!out.includes(t)) out.push(t);
+      continue;
+    }
+    const s = t.replace(/(は|が|を|に|の|へ|と|も|から|まで|より)+$/, "");
+    if (s.length >= 2 && !out.includes(s)) out.push(s);
+  }
+  return out;
+}
+
+/**
+ * 定義質問専用の裏づけ（経路C）：対象にアンカーされた記事の冒頭窓
+ * （タイトル＋リード）に、文の主張語と数字が全部そろっているか。
+ * 経路B（findCorroboratingResult）は定義質問を意図的に通さないため、
+ * 定義文はこの窓限定の経路でだけ裏づける。タイトルに限定（（…））の
+ * 付く記事（同名別エンティティ）は後回しにし、まず限定の無い記事で
+ * 裏づけを探す。
+ */
+/** 順位・最上級の印（順位の食い違いを検出するため、順位で比べる）。 */
+function superlativeRank(text) {
+  const t = String(text ?? "");
+  if (/二番目|2番目|第二/.test(t)) return 2;
+  if (/三番目|3番目|第三/.test(t)) return 3;
+  if (/一番|最も|最大|最高|1番|第一/.test(t)) return 1;
+  return 0;
+}
+
+/**
+ * 順位・最上級の質問の対象の頭名詞：「日本で二番目に高い山」なら
+ * 「山」、「日本で一番高いビル」なら「ビル」。順位の印の後ろから
+ * 形容詞を除いて取る。取れなければ null。
+ */
+function superlativeHeadNoun(question) {
+  const topic = topicFromQuestion(question) ?? "";
+  const m =
+    /(二番目|2番目|三番目|3番目|一番|最も|最大|最小|最高|最低|最古|最新|最長|最短)/.exec(
+      topic,
+    );
+  if (!m) return null;
+  let rest = topic.slice(m.index + m[0].length);
+  rest = rest.replace(/^(に|の|は|が)+/, "");
+  rest = rest.replace(
+    /^(高い|大きい|大きな|小さい|深い|長い|短い|古い|新しい|多い|少ない|強い|広い|狭い|重い|軽い|速い|早い)/,
+    "",
+  );
+  const noun = rest.match(/^[一-鿿々ァ-ヶー]+/)?.[0] ?? "";
+  return noun.length >= 1 ? noun : null;
+}
+
+function definitionSentenceSource(sentence, results, question) {
+  const content = gateContentTerms(sentence, question);
+  // 主張語が1つも無い文は裏づけない（英数字の綴りから取れた数字
+  // だけで「裏づけられた」ことになる穴を塞ぐ）。
+  if (content.length === 0) return null;
+  // 順位・最上級の質問では、順位そのものが主張の一部：裏づけ窓にも
+  // 同じ順位の印と、対象の頭名詞（山・湖・ビル等）が無ければ通さない
+  // （「二番目に高い山は富士山」と言っても、一番の記事では裏づけない）。
+  const qRank = superlativeRank(question);
+  const headNoun = qRank ? superlativeHeadNoun(question) : null;
+  const usable = (results ?? []).filter(
+    (r) => isUsableEvidenceResult(r) && definitionAnchored(r, question),
+  );
+  const passes = [
+    usable.filter((r) => !/[（(][^（）()]+[）)]/.test(r.title ?? "")),
+    usable,
+  ];
+  // 窓はリードの1文単位（タイトルを添える）。リード全体を1つの窓に
+  // すると、語が別々の文に散らばっているだけでも裏づけになって
+  // しまう（日本の記事に富士山と3,776が別々の文にある等）ため。
+  // 主張語が1つだけの文は、その語と対象名が同じ1文にそろっている
+  // ことも求める（別対象の記事に偶然出てくる語で通さない）。
+  const entity = subjectOf(question) ?? topicFromQuestion(question);
+  let ne = entity ? normalizeJa(entity) : "";
+  // 最上級の質問では、共起を求める対象名も基底の主語にする（話題文
+  // そのままは記事の文に出てこないため）。
+  if (qRank && entity) {
+    const base = String(entity).split(/で(?:一番|最も|最大|最高)/)[0];
+    const nb = normalizeJa(base ?? "");
+    if (nb.length >= 2) ne = nb;
+  }
+  for (const pass of passes) {
+    for (const r of pass) {
+      const leadSentences = splitSentences((r.text ?? "").slice(0, 1600));
+      for (const ls of leadSentences) {
+        if (qRank) {
+          if (superlativeRank(ls) !== qRank) continue;
+          if (headNoun && !ls.includes(headNoun)) continue;
+        }
+        const w = normalizeUnits(normalizeJa(`${r.title}\n${ls}`));
+        if (content.length === 1 && !/^\d/.test(content[0]) && ne) {
+          if (!w.includes(ne)) continue;
+        }
+        if (windowSupportsAnswer(w, sentence, content)) return r;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * その文が事実の主張を含むか。主張語・数字がある場合はもちろん、
+ * 「Feは鉄です」のように値が1文字で主張語の抽出（2文字以上の語が
+ * 対象）から漏れる文や、「鉄の肖像です」のように主語の無い値だけの
+ * 文も、断定形（〜です／〜である等）で終わっていれば主張として拾う。
+ * 拾い漏らすと検証を素通りして表示されてしまうため、安全側に倒す。
+ * 会話の定型（相づち・挨拶）だけは主張から除く。
+ */
+function isClaimSentence(sentence, question) {
+  // 定型の挨拶・相づちで始まり、値の言明も数字も無い文は主張ではない
+  // （語の抽出では挨拶も「主張語」を持ってしまうため、先に落とす）。
+  if (
+    /^(そう|はい|ええ|うん|なるほど|ありがとう|ごめん|すみません|こんにちは|こんばんは|おはよう|よろしく|お疲れさま|おつかれさま|またね|じゃあ|では)/.test(
+      sentence,
+    ) &&
+    numbersIn(sentence).length === 0 &&
+    !/は「?[^。「」]{1,30}」?(?:です|である)[。！]?$/.test(sentence)
+  ) {
+    return false;
+  }
+  if (effectiveContentTerms(sentence, question).length > 0) return true;
+  if (numbersIn(sentence).length > 0) return true;
+  if (!/(です|である|ます|でした|だった)[。！]?$/.test(sentence)) {
+    return false;
+  }
+  if (
+    /^(そう|はい|ええ|うん|なるほど|ありがとう|ごめん|すみません|こんにちは|こんばんは|おはよう|よろしく|お疲れさま|おつかれさま|またね|じゃあ|では)/.test(
+      sentence,
+    )
+  ) {
+    return false;
+  }
+  const m = sentence.match(/は「?([^。「」]{1,30}?)」?(?:です|である)[。]?$/);
+  const v = m?.[1]?.trim();
+  if (
+    v &&
+    (EVIDENCE_STOP_TERMS.has(v) || /^(そう|これ|それ|はい|いいえ)$/.test(v))
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 崩壊出力か：同じ4文字の並びが何度も繰り返される生成（モデルの
+ * ループ）は、事実の主張として扱わず丸ごと表示しない。普通の答えで
+ * 同じ4文字が5回以上繰り返されることはまず無い。
+ */
+function isDegenerateAnswer(text) {
+  const s = String(text ?? "");
+  if (s.length < 24) return false;
+  const grams = new Map();
+  for (let i = 0; i + 4 <= s.length; i += 1) {
+    const g = s.slice(i, i + 4);
+    grams.set(g, (grams.get(g) ?? 0) + 1);
+  }
+  for (const c of grams.values()) {
+    if (c >= 5) return true;
+  }
+  return false;
+}
+
+/**
+ * 『…』の質問で、括弧の外側にある文脈語（対象を修飾する語）。
+ * 「夏目漱石の小説『東京の空』」なら夏目漱石——その作品が実在する
+ * 前提の材料であり、裏づけ記事がこの文脈を満たさなければ、その記事は
+ * 同名の別物（同名のアルバム等）だと疑う。種類・役割・質問形式の語は
+ * 文脈に数えない（『羅生門』の作者は…の「作者」は文脈ではない）。
+ */
+const CONTEXT_STOP_TERMS = new Set([
+  "作者", "著者", "監督", "小説", "映画", "アニメ", "漫画", "本社", "本店",
+  "高さ", "標高", "海抜", "全長", "長さ", "重さ", "面積", "人口", "人数",
+  "発売日", "所在地", "場所", "名前", "意味", "首都", "国歌", "名物", "特産",
+  "運営会社", "運営元", "社長", "会長", "知事", "総理大臣", "大統領", "国王",
+  "首相", "創業者", "代表", "駅", "路線",
+]);
+
+function questionContextTerms(question) {
+  if (!subjectOf(question)) return [];
+  const outside = String(question ?? "").replace(/『[^』]*』/g, "");
+  return keyTerms(normalizeJa(outside)).filter((t) => {
+    if (/^\d/.test(t)) return false;
+    if (t.length < 2) return false;
+    if (EVIDENCE_STOP_TERMS.has(t)) return false;
+    if (CONTEXT_STOP_TERMS.has(t)) return false;
+    if (/教えて|ください|ですか|ますか|でしょう|知りたい|聞きたい|ほしい/.test(t)) {
+      return false;
+    }
+    return true;
+  });
+}
+
+/** そのテキストが質問の文脈語を（1つでも）満たしているか。 */
+function contextSatisfiedByText(text, question) {
+  const terms = questionContextTerms(question);
+  if (terms.length === 0) return true;
+  const nt = normalizeJa(text ?? "");
+  return terms.some((t) => nt.includes(normalizeJa(t)));
+}
+
+/**
+ * 1文の裏づけ。{source, via} か null を返す。
+ * 経路A：種類つき事実との一致（出典＝事実の記事）。
+ * 経路B：窓照合（findCorroboratingResult の厳格さそのまま）。
+ * 経路C：定義質問専用の冒頭窓照合。
+ * 経路B/Cの前には2つの関門を置く：
+ * - 種類の適合：質問の種類と文の主張する種類が食い違えば裏づけない
+ *   （ビルを聞かれて山の答えが窓照合を通る、を防ぐ。本社と場所は
+ *   どちらも所在地の答えなので相互に許す）。
+ * - 文脈の適合：『…』の質問では、文脈語を満たす記事だけで裏づける
+ *   （同名別物の記事で裏づけられないようにする）。
+ */
+/**
+ * 場所の事実が複数の都道府県を値に持つのに、答えが一部しか言って
+ * いないか（「富士山は静岡県にあります」vs 事実「静岡県と山梨県」）。
+ * 部分的な答えを「事実と一致した」ことにしないための点検。
+ */
+function placeAnswerMissesFactValue(modelAnswer, fact, question) {
+  if (!fact || classifyQuestion(question) !== "place") return false;
+  const factPrefs = new Set(
+    (fact.value ?? "").match(/[一-鿿々]{1,5}[都道府県]/g) ?? [],
+  );
+  if (factPrefs.size < 2) return false;
+  const ansPrefs = new Set(
+    String(modelAnswer ?? "").match(/[一-鿿々]{1,5}[都道府県]/g) ?? [],
+  );
+  return [...factPrefs].some((p) => !ansPrefs.has(p));
+}
+
+/**
+ * 場所の文の窓照合の完全性：裏づけ窓が「A県とB県」のように複数の
+ * 都道府県を並べているのに、文が一部しか言っていない場合は、部分的な
+ * 答えを裏づけられたことにしない。
+ */
+function placeWindowComplete(sentence, question, source) {
+  if (!source || !source.text) return true;
+  const content = effectiveContentTerms(sentence, question);
+  const inSentence = new Set(
+    sentence.match(/[一-鿿々]{1,5}[都道府県]/g) ?? [],
+  );
+  for (const w of evidenceWindows(source)) {
+    if (!windowSupportsAnswer(w, sentence, content)) continue;
+    const prefs = new Set(w.match(/[一-鿿々]{1,5}[都道府県]/g) ?? []);
+    const extra = [...prefs].filter((p) => !inSentence.has(p));
+    if (extra.length > 0 && /(と|、|および|またが)/.test(w)) return false;
+  }
+  return true;
+}
+
+/**
+ * 順位・最上級の質問に対する窓の追加条件：裏づけ記事の中に、同じ順位
+ * の印と対象の頭名詞を持ち、文の数字と主張語（少なくとも1つ）を
+ * 含む文が1つあること。
+ */
+function rankWindowSupports(result, sentence, question, qRank) {
+  const headNoun = superlativeHeadNoun(question);
+  const content = gateContentTerms(sentence, question);
+  const nums = numbersIn(sentence);
+  const texts = [result?.text ?? "", result?.snippet ?? ""];
+  for (const t of texts) {
+    if (!t) continue;
+    for (const ws of splitForGate(t)) {
+      if (superlativeRank(ws) !== qRank) continue;
+      if (headNoun && !ws.includes(headNoun)) continue;
+      const w = normalizeUnits(normalizeJa(ws)).replace(/,/g, "");
+      if (!nums.every((n) => w.includes(String(n).replace(/,/g, "")))) {
+        continue;
+      }
+      if (
+        content.length > 0 &&
+        !content.some((term) => w.includes(normalizeJa(term)))
+      ) {
+        continue;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+function verifySentence(sentence, question, ctx) {
+  const fact = ctx?.fact ?? null;
+  if (
+    fact &&
+    modelAgreesWithFact(sentence, fact) &&
+    !placeAnswerMissesFactValue(sentence, fact, question)
+  ) {
+    return {
+      source: { title: fact.sourceTitle, url: fact.sourceUrl },
+      via: "fact",
+    };
+  }
+  const qKind = classifyQuestion(question);
+  const aKind = answerClaimKind(sentence);
+  if (qKind && aKind && qKind !== aKind) {
+    const locationPair =
+      (qKind === "hq" && aKind === "place") ||
+      (qKind === "place" && aKind === "hq");
+    if (!locationPair) return null;
+  }
+  // 質問が特定の英数字トークン（Fe、H2O等）を名指している場合、
+  // そのトークンに触れていない文は質問への答えとして裏づけない
+  // （Feを聞かれて元素記号一般の定義が照合を通る、を防ぐ）。
+  const latinTokens = (
+    String(question).match(/[A-Za-z][A-Za-z0-9]{1,}/g) ?? []
+  ).map((t) => t.toLowerCase());
+  if (latinTokens.length > 0) {
+    const ls = String(sentence).toLowerCase();
+    if (!latinTokens.every((t) => ls.includes(t))) return null;
+  }
+  let results = ctx?.results ?? [];
+  if (questionContextTerms(question).length > 0) {
+    results = results.filter((r) =>
+      contextSatisfiedByText(
+        `${r?.title ?? ""}\n${(r?.text ?? "").slice(0, 600)}`,
+        question,
+      ),
+    );
+  }
+  const src = findCorroboratingResult(sentence, results, question);
+  if (src) {
+    if (qKind === "place" && !placeWindowComplete(sentence, question, src)) {
+      return null;
+    }
+    // 順位・最上級の質問では、裏づけ窓にも順位の印と頭名詞が要る
+    // （値と数字がそろうだけの窓は順位を裏づけない）。満たさなければ
+    // この経路は不成立として、定義経路の順位つき窓を探し直す。
+    const qRank = superlativeRank(question);
+    if (qRank && !rankWindowSupports(src, sentence, question, qRank)) {
+      // fall through
+    } else {
+      return { source: src, via: "window" };
+    }
+  }
+  if (qKind === "definition") {
+    const dsrc = definitionSentenceSource(sentence, results, question);
+    if (dsrc) return { source: dsrc, via: "definition" };
+  }
+  return null;
+}
+
+/**
+ * モデルの答え全体の検証ゲート。
+ * 返り値：{ status, text, source, perSentence }
+ * - status: "all" | "partial" | "none" | "abstain" | "nonclaim"
+ * - text: 表示してよい文だけをつないだもの（all は元の答えそのまま）
+ * - source: 最初に裏づけをくれた記事（出典表示用）
+ */
+function verifyModelAnswer(modelAnswer, question, ctx) {
+  // 同語反復の答え（「日本で一番高いビルは日本で一番高いビルです」）
+  // は中身の無い文であり、どの文も裏づけない。断片化した語の偶然の
+  // 一致で照合を通ることがあるため、入り口で落とす。
+  if (isTautologicalAnswer(modelAnswer)) {
+    return {
+      status: "none",
+      text: "",
+      source: null,
+      perSentence: splitForGate(modelAnswer).map((s) => ({
+        sentence: s,
+        kind: "claim",
+        verified: false,
+        via: "tautology",
+      })),
+    };
+  }
+  // 崩壊出力（同じ並びの繰り返し）は、どの文も裏づけない。
+  if (isDegenerateAnswer(modelAnswer)) {
+    return {
+      status: "none",
+      text: "",
+      source: null,
+      perSentence: splitForGate(modelAnswer).map((s) => ({
+        sentence: s,
+        kind: "claim",
+        verified: false,
+        via: "degenerate",
+      })),
+    };
+  }
+  const sentences = splitForGate(modelAnswer);
+  const perSentence = [];
+  let claimCount = 0;
+  let verifiedCount = 0;
+  let firstSource = null;
+  let hasAbstention = false;
+  const kept = [];
+  for (const s of sentences) {
+    if (isAbstentionSentence(s, question)) {
+      hasAbstention = true;
+      perSentence.push({ sentence: s, kind: "abstention", verified: true });
+      kept.push(s);
+      continue;
+    }
+    const isClaim = isClaimSentence(s, question);
+    if (!isClaim) {
+      perSentence.push({ sentence: s, kind: "filler", verified: true });
+      kept.push(s);
+      continue;
+    }
+    claimCount += 1;
+    const v = verifySentence(s, question, ctx);
+    if (v) {
+      verifiedCount += 1;
+      if (!firstSource) firstSource = v.source;
+      perSentence.push({
+        sentence: s,
+        kind: "claim",
+        verified: true,
+        via: v.via,
+      });
+      kept.push(s);
+    } else {
+      perSentence.push({ sentence: s, kind: "claim", verified: false });
+    }
+  }
+  if (claimCount === 0) {
+    return {
+      status: hasAbstention ? "abstain" : "nonclaim",
+      text: String(modelAnswer ?? ""),
+      source: null,
+      perSentence,
+    };
+  }
+  if (verifiedCount === 0) {
+    return { status: "none", text: "", source: null, perSentence };
+  }
+  if (verifiedCount === claimCount) {
+    return {
+      status: "all",
+      text: String(modelAnswer ?? ""),
+      source: firstSource,
+      perSentence,
+    };
+  }
+  return {
+    status: "partial",
+    text: kept.join(""),
+    source: firstSource,
+    perSentence,
+  };
+}
+
+/**
+ * 「争いのある事実」か：定義の質問で、事実の記事タイトルに限定
+ * （（…））が付くか、検索結果に曖昧さ回避ページが含まれる場合。
+ * 同名で意味が複数ある語の定義は、1記事の冒頭だけでは質問の意味だと
+ * 断定できない（H2O＝水 vs H2O (Webサーバ) の事故の一般化）。
+ */
+function factIsContested(fact, results) {
+  if (!fact || fact.kind !== "definition") return false;
+  if (/[（(][^（）()]+[）)]/.test(fact.sourceTitle ?? "")) return true;
+  return (results ?? []).some((r) => /曖昧さ回避/.test(r?.title ?? ""));
+}
+
+/**
+ * 質問の対象が「見つからない」状態か：対象が特定でき、対象記事が
+ * 取れず、検索は実行できたのにタイトルに対象を持つ結果が1件も無い。
+ * 実在しないもの（架空の建物・作品・製品）への捏造表示を止める判定。
+ * 検索の接続失敗時は false（見つからないのではなく確かめられなかった）。
+ */
+function entityNotFound(question, article, results, searchError) {
+  if (searchError) return false;
+  if (article) return false;
+  const entity = subjectOf(question) ?? topicFromQuestion(question);
+  if (!entity || normalizeJa(entity).length < 2) return false;
+  return !(results ?? []).some((r) =>
+    titleMatchesSubject(r?.title ?? "", entity),
+  );
+}
+
+/**
+ * 数値の事実の値が、根拠文の中で「年」としてしか現れないか。
+ * 例：エベレストの標高の根拠文「1954年にインド測量局が…8848 m」から
+ * 抽出が「1,954メートル」を作ってしまう事故——年を測った値を事実と
+ * して出さないための点検。値の数字の出現がすべて「年」の直前なら
+ * 年とみなす（どこか1か所でも単位等を伴って現れれば事実として通す）。
+ */
+function factValueIsYearOnly(fact) {
+  const nums = numbersIn(fact?.value ?? "");
+  if (nums.length === 0) return false;
+  const ev = toHalfWidth(fact.evidence ?? "").replace(/,/g, "");
+  const n = String(Math.trunc(Number(nums[0])));
+  if (!n || !ev.includes(n)) return false;
+  let idx = 0;
+  let found = 0;
+  while (true) {
+    const i = ev.indexOf(n, idx);
+    if (i < 0) break;
+    found += 1;
+    if (ev[i + n.length] !== "年") return false;
+    idx = i + n.length;
+  }
+  return found > 0;
+}
+
+/**
+ * 種類つき事実を表示・保存に使う前の点検（事実も検証を通す）：
+ * - 出典記事が質問の対象と関係していること（アンカー）。
+ * - 『…』の質問では、記事の冒頭か根拠文が質問の文脈語を満たすこと
+ *   （同名別物の記事の事実を出さない）。
+ * - 数値の事実は、値が根拠文で「年」としてしか現れないものは落とす。
+ * どれかに落ちれば事実なしとして進む。
+ */
+function sanitizeFact(fact, article, question) {
+  if (!fact) return null;
+  const entity = subjectOf(question) ?? topicFromQuestion(question);
+  if (entity && !factSourceRelatedToEntity(fact, article, entity)) {
+    return null;
+  }
+  if (
+    !contextSatisfiedByText(
+      `${article?.lead ?? ""}\n${fact.evidence ?? ""}`,
+      question,
+    )
+  ) {
+    return null;
+  }
+  if (fact.kind === "measure" && factValueIsYearOnly(fact)) return null;
+  return fact;
+}
+
 /**
  * モデルの答えが主張している事実の種類（文の形から判定する）。
  * このモデルの答えは「Xの名物はYです」「『Z』の作者はWです」のような
@@ -8876,18 +9488,20 @@ const App = {
     // 『…』の質問では、その作品自身の証拠だけを数える。
     results = scopeToSubject(question, results);
 
-    // 食い違い時の上書きガード：事実の出典記事が質問の対象と無関係
-    // なら、その記事を「ネットの事実」としてモデルの答えを上書き
-    // しない（対象違いの記事が検索で混ざった場合の安全弁。例：
-    // 「モーリーファンタジーとは」に小説ジャンルの記事が当たる）。
-    // ガードが働いた場合は事実なしとして進み、モデルの答えは
-    // 照合〜未確認の通常経路で扱われる。
-    if (fact && modelAnswer && !modelAgreesWithFact(modelAnswer, fact)) {
-      const entity = subjectOf(question) ?? topicFromQuestion(question);
-      if (entity && !factSourceRelatedToEntity(fact, article, entity)) {
-        fact = null;
-      }
-    }
+    // 事実の点検（常時）：種類つき事実も検証を通してから使う。
+    // 出典記事が質問の対象と無関係な事実、『…』の文脈を満たさない
+    // 同名別物の事実、値を「年」と取り違えた数値の事実は、表示も
+    // 保存もしない。以前はアンカー確認がモデルと食い違うときに
+    // 限られていたため、モデルが無言・不在のときに無関係な記事の
+    // 事実がそのまま出る余地があった。
+    fact = sanitizeFact(fact, article, question);
+
+    // 文単位の検証ゲート：モデルの答えを文ごとに裏づける。以後の
+    // 表示分岐では、この結果を最上位の判断材料にする（モデル優先
+    // 表示は維持するが、裏づけの無い主張文は出さない）。
+    const gate = modelAnswer
+      ? verifyModelAnswer(modelAnswer, question, { fact, article, results })
+      : null;
 
     // 4) 事実の道（本命）：対象記事から抜いた種類つき事実で組み立てた答え。
     if (fact) {
@@ -8902,6 +9516,45 @@ const App = {
           fact: fact.value,
         });
       };
+      // 食い違い×争いのある事実×モデルの全検証がそろった場合は、
+      // モデルの答えを正とする（同名別エンティティの事実でモデルの
+      // 正答を上書きしない。例：H2O＝水 vs H2O (Webサーバ)）。
+      // 争いのある事実と食い違い、モデルの答えも全検証できない場合は
+      // どちらも出さない——誤った事実での上書きも、裏づけの無い
+      // 答えの表示も、どちらもしない。
+      const contested = factIsContested(fact, results);
+      // 一致の判定は、場所の事実が複数の都道府県を持つ場合の部分一致
+      // （一部だけ言って「一致」になる）を除いたものを使う。
+      const agrees =
+        modelAgreesWithFact(modelAnswer, fact) &&
+        !placeAnswerMissesFactValue(modelAnswer, fact, question);
+      if (modelAnswer && !agrees && contested) {
+        this.setPhase("idle");
+        if (gate && gate.status === "all") {
+          this.pushAssistant({
+            text: modelAnswer,
+            badge: "model",
+            sourceTitle: gate.source?.title,
+            sourceUrl: gate.source?.url,
+            note: "Cubeの答えを主表示しています。ネットの事実とは食い違いましたが、Cubeの答えは別の記事で裏づけが取れました。知識メモ帳に保存しました。",
+          });
+          this.saveNotebook({
+            question,
+            answer: modelAnswer,
+            source_title: gate.source?.title ?? "",
+            source_url: gate.source?.url ?? "",
+            question_type: classifyQuestion(question) ?? "",
+            fact: modelAnswer,
+          });
+        } else {
+          this.pushAssistant({
+            text: "確認できませんでした。",
+            badge: "unknown",
+            note: "Cubeの答えとネットの事実が食い違い、どちらが質問の対象か裏づけが取れなかったため、どちらも表示しませんでした。",
+          });
+        }
+        return;
+      }
       // 「ネット検索の答え」として提示する文。原則は記事から組み立てた
       // 事実文だが、Ultra が選択され読み込み済みのときだけ、対象記事を
       // Ultra に読ませて Ultra の言葉で書かせる（統合の設計）。
@@ -8915,7 +9568,17 @@ const App = {
         !(modelAnswer && modelAgreesWithFact(modelAnswer, fact))
       ) {
         const written = await ultraWriteFactAnswer(question, article, fact);
-        if (written) netText = written;
+        // 書き直し文も検証ゲートを通す：裏づけの取れた書き直しだけを
+        // 採用し、通らなければ事実文のまま出す（検索レーンの答えも
+        // 同じ検証を通す原則。単なる事実との一致判定では、圧縮した
+        // 忠実な書き直しまで落としてしまうため、ゲートで判定する）。
+        if (
+          written &&
+          verifyModelAnswer(written, question, { fact, article, results })
+            .status === "all"
+        ) {
+          netText = written;
+        }
       }
       this.setPhase("idle");
       // モデル優先：モデルが答えを出したなら、それが主表示になる。
@@ -8923,17 +9586,35 @@ const App = {
       // 小数の丸め）を許して一致すれば「ネットで確認済み」のラベルを
       // 付け、食い違えば従来の透明性ルール（ネットの事実を正として
       // 表示し、モデルの元の答えも消さずに併記する）。
-      if (modelAnswer && modelAgreesWithFact(modelAnswer, fact)) {
-        this.pushAssistant({
-          text: modelAnswer,
-          badge: "model",
-          sourceTitle: fact.sourceTitle,
-          sourceUrl: fact.sourceUrl,
-          evidence: fact.evidence,
-          note: "Cubeの答えを主表示しています。対象記事の事実と一致し、ネットで裏づけが取れました。事実ベースの答えを知識メモ帳に保存しました。",
-        });
-        saveFact();
-        return;
+      if (modelAnswer && agrees) {
+        // 一致していても、文単位ゲートを通す：事実と一致する文に
+        // 裏づけの無い主張文がくっついている場合は、その文を出さない。
+        // 全文が通れば全文を、一部だけなら取れた文だけを表示する。
+        // どの文も通らなければ、下の事実表示に落とす。
+        if (gate && gate.status === "all") {
+          this.pushAssistant({
+            text: modelAnswer,
+            badge: "model",
+            sourceTitle: fact.sourceTitle,
+            sourceUrl: fact.sourceUrl,
+            evidence: fact.evidence,
+            note: "Cubeの答えを主表示しています。対象記事の事実と一致し、ネットで裏づけが取れました。事実ベースの答えを知識メモ帳に保存しました。",
+          });
+          saveFact();
+          return;
+        }
+        if (gate && gate.status === "partial") {
+          this.pushAssistant({
+            text: gate.text,
+            badge: "model",
+            sourceTitle: fact.sourceTitle,
+            sourceUrl: fact.sourceUrl,
+            evidence: fact.evidence,
+            note: "Cubeの答えのうち、ネットで確認が取れた部分だけを表示しています。事実ベースの答えを知識メモ帳に保存しました。",
+          });
+          saveFact();
+          return;
+        }
       }
       if (modelAnswer) {
         this.pushAssistant({
@@ -8943,7 +9624,9 @@ const App = {
           sourceUrl: fact.sourceUrl,
           evidence: fact.evidence,
           modelSaid: modelAnswer,
-          note: "Cubeの答えとネットの事実が食い違ったため、ネットの事実を正として表示しています。事実ベースの答えを知識メモ帳に保存しました。",
+          note: agrees
+            ? "Cubeの答えはネットの事実と一致しましたが、文ごとの裏づけがそろわなかったため、ネットの事実を表示しています。事実ベースの答えを知識メモ帳に保存しました。"
+            : "Cubeの答えとネットの事実が食い違ったため、ネットの事実を正として表示しています。事実ベースの答えを知識メモ帳に保存しました。",
         });
         saveFact();
         return;
@@ -8971,60 +9654,79 @@ const App = {
       return;
     }
 
-    // 出典は、実際に裏づけが成立した記事そのものだけにする。文頭の
-    // 一致や先頭の記事で代替すると、裏づけてもいない記事が出典に
-    // 表示されてしまう（辞書ページが出典になった cube の件）。
-    const corrobSrc = modelAnswer
-      ? findCorroboratingResult(modelAnswer, results, question)
-      : null;
-
-    if (modelAnswer && corrobSrc) {
-      const src = corrobSrc;
-      // 先に表示する。照合できた答えも構造化して吸収する。
-      this.setPhase("idle");
-      this.pushAssistant({
-        text: modelAnswer,
-        badge: "model",
-        sourceTitle: src?.title,
-        sourceUrl: src?.url,
-        note: "Cubeの答えを、ネット検索の結果と照合しました。知識メモ帳に保存しました。",
-      });
-      this.saveNotebook({
-        question,
-        answer: modelAnswer,
-        source_title: src?.title ?? "",
-        source_url: src?.url ?? "",
-        question_type: classifyQuestion(question) ?? "",
-        fact: modelAnswer,
-      });
-      return;
-    }
-
-    // 5) 種類つき事実が取れなかった：モデルの答えは未確認として出すか、
-    // 正直に「確認できませんでした」と言う（関係ありそうな文は貼らない）。
-    // ただし未確認で出す前に、答えの種類が質問と合っているか確かめる：
-    // 知事を聞いたのに名物や作者の答えが出るような、種類の食い違う
-    // 答えは出さない（「未確認」と断っても質問への答えになっていない）。
-    // モデルが何も出さなかった場合は、その理由も注記に言う。
-    // 検索に接続できなかった場合は、その理由を必ず添える。
+    // 5) 種類つき事実が取れなかった場合の表示は、文単位ゲートの結果で
+    // 決める。出典は、実際に裏づけが成立した記事そのものだけにする
+    // （裏づけてもいない記事を出典に表示することはしない）。
     this.setPhase("idle");
-    if (modelAnswer && !modelAnswerFitsQuestion(question, modelAnswer)) {
+    if (modelAnswer && gate) {
+      if (gate.status === "all") {
+        // 全主張文が裏づけられた場合だけ、モデルの答えを全文表示し、
+        // 知識メモ帳にも保存する（確認済みの保存はこの経路だけ）。
+        this.pushAssistant({
+          text: modelAnswer,
+          badge: "model",
+          sourceTitle: gate.source?.title,
+          sourceUrl: gate.source?.url,
+          note: "Cubeの答えを、ネット検索の結果と文単位で照合しました。知識メモ帳に保存しました。",
+        });
+        this.saveNotebook({
+          question,
+          answer: modelAnswer,
+          source_title: gate.source?.title ?? "",
+          source_url: gate.source?.url ?? "",
+          question_type: classifyQuestion(question) ?? "",
+          fact: modelAnswer,
+        });
+        return;
+      }
+      if (gate.status === "partial") {
+        // 裏づけの取れた文だけを表示する。部分的な答えは保存しない。
+        this.pushAssistant({
+          text: gate.text,
+          badge: "model",
+          sourceTitle: gate.source?.title,
+          sourceUrl: gate.source?.url,
+          note: "Cubeの答えのうち、ネットの記事で確認が取れた部分だけを表示しています。確認が取れなかった部分は表示しませんでした。",
+        });
+        return;
+      }
+      if (gate.status === "abstain" || gate.status === "nonclaim") {
+        // 棄権の表明と、事実の主張を含まない会話的な答えは、嘘に
+        // なりようがないため従来どおり表示する（保存はしない）。
+        this.pushAssistant({
+          text: modelAnswer,
+          badge: "unverified",
+          note:
+            gate.status === "abstain"
+              ? "Cubeは、この質問には確認できないと答えています。"
+              : "事実の主張を含まない答えのため、そのまま表示しています。",
+        });
+        return;
+      }
+      // gate.status === "none"：裏づけの取れた主張文が1つも無い。
+      // モデルの答えは表示しない。対象そのものが見つからない場合は
+      // その旨を言う（実在しないものにあるように答えないため）。
+      if (entityNotFound(question, article, results, searchError)) {
+        const entity = subjectOf(question) ?? topicFromQuestion(question);
+        this.pushAssistant({
+          text: "確認できませんでした。",
+          badge: "unknown",
+          note: `「${entity}」についての記事が見つかりませんでした。存在が確認できないものについて、あるように答えることはしません。`,
+        });
+        return;
+      }
       this.pushAssistant({
         text: "確認できませんでした。",
         badge: "unknown",
         note: searchError
-          ? `検索に接続できなかったため、記事の事実では確認できませんでした（理由：${searchError}）。Cubeの答えは質問の種類と合っていなかったため、表示しませんでした。設定の「検索テスト」で接続を確かめられます。`
-          : "記事の事実では確認できませんでした。Cubeの答えは質問の種類と合っていなかったため、表示しませんでした。",
+          ? `検索に接続できなかったため、記事の事実では確認できませんでした（理由：${searchError}）。Cubeの答えも裏づけが取れなかったため、表示しませんでした。設定の「検索テスト」で接続を確かめられます。`
+          : "Cubeの答えは、記事の事実で裏づけが取れなかったため表示しませんでした。",
       });
-    } else if (modelAnswer) {
-      this.pushAssistant({
-        text: modelAnswer,
-        badge: "unverified",
-        note: searchError
-          ? `検索に接続できなかったため、記事の事実では確認できませんでした（理由：${searchError}）。モデルの回答をそのまま表示しています。設定の「検索テスト」で接続を確かめられます。`
-          : "記事の事実では確認できませんでした。モデルの回答をそのまま表示しています。",
-      });
-    } else {
+      return;
+    }
+    {
+      // モデルが何も出さなかった場合：その理由も注記に言う。検索に
+      // 接続できなかった場合は、その理由を必ず添える。
       this.pushAssistant({
         text: "確認できませんでした。",
         badge: "unknown",
@@ -9272,6 +9974,10 @@ if (typeof module !== "undefined" && module.exports) {
     answerContentTerms, numbersMatchLoose,
     cubeSelfAnswer, isTautologicalAnswer,
     factSourceRelatedToEntity,
+    verifyModelAnswer, splitForGate, verifySentence,
+    factIsContested, entityNotFound, scopeToSubject, subjectOf,
+    sanitizeFact, questionContextTerms, contextSatisfiedByText,
+    isClaimSentence, isDegenerateAnswer, placeAnswerMissesFactValue,
     isUsableEvidenceResult, resultAnchoredToQuestion, resultSupportsAnswer,
     modelAnswerFitsQuestion, answerClaimKind,
     parseWeatherQuery, fetchWeather, fetchJmaForecast, resolveJmaArea,
