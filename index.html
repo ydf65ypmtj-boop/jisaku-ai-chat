@@ -9,75 +9,236 @@
   </head>
   <body>
     <div class="app">
-      <!-- モデル状態バー：状態は常に正直に表示する -->
-      <header class="statusbar">
-        <div class="bar-inner">
+      <!-- 左サイドバー：ブランド／新規チャット／モデル／メニュー／状態 -->
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"><path d="M12 2.7 21 7.8v8.4l-9 5.1-9-5.1V7.8z"/><path d="M3 7.8l9 5.1 9-5.1"/><path d="M12 12.9v8.4"/></svg>
+          </span>
+          <span class="brand-text">
+            <span class="brand-name">Cube</span>
+            <span class="brand-sub">自作AIチャット</span>
+          </span>
+        </div>
+
+        <a class="new-chat" href="">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          新規チャット
+        </a>
+
+        <div class="side-group">
+          <p class="side-label">モデル</p>
+          <div class="model-switch model-switch-side" role="group" aria-label="モデルの切り替え">
+            <button type="button" class="model-switch-btn" data-model="v1" aria-pressed="true">
+              <span class="ms-name">Cube Nano</span>
+              <span class="ms-cap">約3,177万パラメータ・この端末で動作</span>
+            </button>
+            <button type="button" class="model-switch-btn" data-model="v2" aria-pressed="false">
+              <span class="ms-name">Cube Flash</span>
+              <span class="ms-cap">約5,995万パラメータ・この端末で動作</span>
+            </button>
+            <button type="button" class="model-switch-btn" data-model="twin" aria-pressed="false">
+              <span class="ms-name">Cube Twin</span>
+              <span class="ms-cap">約2億3,314万パラメータ・iMacサーバー</span>
+            </button>
+            <button type="button" class="model-switch-btn" data-model="pro" aria-pressed="false">
+              <span class="ms-name">Cube Pro</span>
+              <span class="ms-cap">約2億9,781万パラメータ・iMacサーバー</span>
+            </button>
+            <button type="button" class="model-switch-btn" data-model="max" aria-pressed="false">
+              <span class="ms-name">Cube Max</span>
+              <span class="ms-cap">約11億8,965万パラメータ・iMacサーバー</span>
+            </button>
+            <button type="button" class="model-switch-btn" data-model="ultra" aria-pressed="false">
+              <span class="ms-name">Cube Ultra</span>
+              <span class="ms-cap">Qwen2.5-1.5B＋追加学習・iMacサーバー</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="side-group">
+          <p class="side-label">メニュー</p>
+          <nav class="tabs" aria-label="画面切り替え">
+            <button type="button" class="tab-btn" data-tab="chat" aria-pressed="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M20.7 15.6a2 2 0 0 1-2 2H9.2L4 21.4V5.6a2 2 0 0 1 2-2h12.7a2 2 0 0 1 2 2z" transform="scale(0.94) translate(0.7 0.7)"/></svg>
+              チャット
+            </button>
+            <button type="button" class="tab-btn" data-tab="notebook" aria-pressed="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 3.5h11V20l-2.8-1.9-2.7 1.9-2.7-1.9L6.5 20z"/></svg>
+              知識メモ帳<span id="nb-tab-count"></span>
+            </button>
+            <button type="button" class="tab-btn" data-tab="settings" aria-pressed="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 8h9M19 8h1M4 16h3M13 16h7"/><circle cx="16" cy="8" r="2.2"/><circle cx="10" cy="16" r="2.2"/></svg>
+              設定
+            </button>
+          </nav>
+        </div>
+
+        <!-- モデル状態：状態は常に正直に表示する -->
+        <div class="side-foot">
           <span id="model-status" class="model-status mono" aria-label="モデル状態">
             <span class="dot" aria-hidden="true"></span>
             <span id="model-status-text">モデル未配置</span>
           </span>
           <span id="model-note" class="model-note">回答は検索のみで行います</span>
-          <div id="server-connect" class="ultra-engine-choice" hidden>
-            <p class="ultra-engine-choice-text">このモデルは自宅のiMacサーバーで動かします。端末へのダウンロードはありませんが、iMacが起動しているときだけ使えます。</p>
-            <div class="ultra-engine-choice-btns">
-              <button type="button" id="server-connect-btn" class="primary-btn">iMacサーバーに接続</button>
-            </div>
+          <div id="server-connect" class="server-connect" hidden>
+            <p class="server-connect-text">このモデルは自宅のiMacサーバーで動かします。端末へのダウンロードはありませんが、iMacが起動しているときだけ使えます。</p>
+            <button type="button" id="server-connect-btn" class="primary-btn">iMacサーバーに接続</button>
           </div>
-          <div class="model-switch" role="group" aria-label="モデルの切り替え">
-            <button type="button" class="model-switch-btn" data-model="v1" aria-pressed="true">Cube Nano</button>
-            <button type="button" class="model-switch-btn" data-model="v2" aria-pressed="false">Cube Flash</button>
-            <button type="button" class="model-switch-btn" data-model="twin" aria-pressed="false">Cube Twin</button>
-            <button type="button" class="model-switch-btn" data-model="pro" aria-pressed="false">Cube Pro</button>
-            <button type="button" class="model-switch-btn" data-model="max" aria-pressed="false">Cube Max</button>
-            <button type="button" class="model-switch-btn" data-model="ultra" aria-pressed="false">Cube Ultra</button>
-          </div>
-          <nav class="tabs" aria-label="画面切り替え">
-            <button type="button" class="tab-btn" data-tab="chat" aria-pressed="true">チャット</button>
-            <button type="button" class="tab-btn" data-tab="notebook" aria-pressed="false">知識メモ帳<span id="nb-tab-count"></span></button>
-            <button type="button" class="tab-btn" data-tab="settings" aria-pressed="false">設定</button>
-          </nav>
         </div>
-      </header>
+      </aside>
 
+      <main class="main">
       <!-- チャット -->
       <section id="view-chat" class="view">
         <div id="chat-scroll" class="chat-scroll">
           <div class="chat-inner">
             <div id="empty-state" class="empty">
-              <p class="big">Cubeに質問してみよう</p>
-              <p class="desc">
-                Cubeは自作LLMです（Cube Nano：約3,177万パラメータ／
-                Cube Flash：約5,995万パラメータ／Cube Twin：約2億3,314万
-                パラメータ／Cube Pro：約2億9,781万パラメータ／Cube Max：
-                約11億8,965万パラメータ。
-                ヘッダーで切り替えられます）。6つ目の
-                Cube Ultraは、Qwen2.5-1.5Bに追加学習を統合したモデル
-                （約15億パラメータ）です。Cube Twin・Cube Pro・Cube Max・
-                Cube Ultraは端末に読み込まず、自宅のiMacサーバーで
-                動かします（iMacが起動しているときだけ使えます）。
-                答えには必ず「出どころ」のラベルがつきます。基本はCubeの
-                答えを主表示し、ネット検索は裏づけとして添えます。Cubeと
-                ネットで食い違ったら、ネットの事実を正として表示し、
-                Cubeの答えも消さずに併記します。計算は検算で確かめます。
-                Cube自身への質問（作った人・名前・名前の意味・綴り）は、
-                ネットでは確かめられないので、アプリに固定した正しい
-                情報から答えます。
+              <p class="hero-kicker">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M12 2.7 21 7.8v8.4l-9 5.1-9-5.1V7.8z"/><path d="M3 7.8l9 5.1 9-5.1"/><path d="M12 12.9v8.4"/></svg>
+                出典を示す、自作AI
               </p>
-              <ul class="legend" aria-label="出どころラベルの説明">
-                <li><span class="badge mono badge-notebook">知識メモ帳の答え</span></li>
-                <li><span class="badge mono badge-calc">検算の答え</span></li>
-                <li><span class="badge mono badge-weather">天気情報（気象庁・Open-Meteo）</span></li>
-                <li><span class="badge mono badge-model">Cubeの答え（ネットで確認済み）</span></li>
-                <li><span class="badge mono badge-net">ネット検索の答え</span></li>
-                <li><span class="badge mono badge-unverified">ネットで確認できなかった（未確認）</span></li>
-                <li><span class="badge mono badge-self">Cube自身のこと（アプリ固定の情報）</span></li>
-              </ul>
-              <div class="suggestions">
-                <button type="button" class="suggestion-btn" data-q="『こころ』の作者は誰ですか？">『こころ』の作者は誰ですか？</button>
-                <button type="button" class="suggestion-btn" data-q="富士山の高さは？">富士山の高さは？</button>
-                <button type="button" class="suggestion-btn" data-q="68×11はいくつですか？">68×11はいくつですか？</button>
-                <button type="button" class="suggestion-btn" data-q="明日の郡山の天気は？">明日の郡山の天気は？</button>
+              <h1 class="hero-title">こんにちは。<br />今日はどんなことをしますか？</h1>
+              <p class="hero-sub">
+                Cubeは自作LLMのチャットです。答えには必ず「出どころ」のラベルがつき、
+                事実はネット検索で裏づけします。まずは下の例から試せます。
+              </p>
+
+              <div class="skill-chips" aria-label="Cubeにできること">
+                <button type="button" class="suggestion-btn skill-chip" data-q="『こころ』の作者は誰ですか？">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M15.8 15.8 20.5 20.5"/></svg>
+                  調べる
+                </button>
+                <button type="button" class="suggestion-btn skill-chip" data-q="68×11はいくつですか？">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8.5 7.5h7"/><path d="M8.5 12h.01M12 12h.01M15.5 12h.01M8.5 15.8h.01M12 15.8h.01M15.5 15.8h.01"/></svg>
+                  計算する
+                </button>
+                <button type="button" class="suggestion-btn skill-chip" data-q="明日の郡山の天気は？">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M7 19h9.5a4.25 4.25 0 0 0 .6-8.42A5.75 5.75 0 0 0 5.85 9.1 4.4 4.4 0 0 0 7 19z"/></svg>
+                  天気を聞く
+                </button>
+                <button type="button" class="suggestion-btn skill-chip" data-q="富士山の高さは？">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5 19 6v5.2c0 4.6-3 7.7-7 9.3-4-1.6-7-4.7-7-9.3V6z"/><path d="M9.2 12l2 2 3.8-4"/></svg>
+                  数字を確かめる
+                </button>
               </div>
+
+              <div class="pickup">
+                <input class="pickup-radio" type="radio" name="pickup-tab" id="pickup-tab-osusume" checked />
+                <input class="pickup-radio" type="radio" name="pickup-tab" id="pickup-tab-models" />
+                <input class="pickup-radio" type="radio" name="pickup-tab" id="pickup-tab-howto" />
+                <div class="pickup-head">
+                  <h2 class="pickup-title">ピックアップ</h2>
+                  <div class="pickup-tablabels" role="group" aria-label="ピックアップの切り替え">
+                    <label for="pickup-tab-osusume">おすすめ</label>
+                    <label for="pickup-tab-models">モデル</label>
+                    <label for="pickup-tab-howto">使い方</label>
+                  </div>
+                </div>
+
+                <div class="pickup-panel panel-osusume">
+                  <button type="button" class="suggestion-btn pickup-card tint-a" data-q="『こころ』の作者は誰ですか？">
+                    <span class="pickup-card-title">出典つきで調べる</span>
+                    <span class="pickup-card-desc">答えの根拠になった記事を、出典として一緒に表示します。</span>
+                    <span class="pickup-card-q">『こころ』の作者は誰ですか？</span>
+                  </button>
+                  <button type="button" class="suggestion-btn pickup-card tint-b" data-q="68×11はいくつですか？">
+                    <span class="pickup-card-title">計算は検算つき</span>
+                    <span class="pickup-card-desc">計算問題は、検算で確かめてから答えます。</span>
+                    <span class="pickup-card-q">68×11はいくつですか？</span>
+                  </button>
+                  <button type="button" class="suggestion-btn pickup-card tint-c" data-q="明日の郡山の天気は？">
+                    <span class="pickup-card-title">天気は実データで</span>
+                    <span class="pickup-card-desc">予報は気象庁、現在の状況はOpen-Meteoの実データで答えます。</span>
+                    <span class="pickup-card-q">明日の郡山の天気は？</span>
+                  </button>
+                  <button type="button" class="suggestion-btn pickup-card tint-d" data-q="富士山の高さは？">
+                    <span class="pickup-card-title">数字も裏づけ</span>
+                    <span class="pickup-card-desc">高さや人数などの数字も、記事で確かめてから表示します。</span>
+                    <span class="pickup-card-q">富士山の高さは？</span>
+                  </button>
+                </div>
+
+                <div class="pickup-panel panel-models">
+                  <div class="model-card">
+                    <p class="model-card-name">Cube Nano</p>
+                    <p class="model-card-spec mono">約3,177万パラメータ</p>
+                    <p class="model-card-desc">最初の自作モデル（12層・幅448）。この端末の中で動きます。</p>
+                  </div>
+                  <div class="model-card">
+                    <p class="model-card-name">Cube Flash</p>
+                    <p class="model-card-spec mono">約5,995万パラメータ</p>
+                    <p class="model-card-desc">18層・幅512の自作モデル。この端末の中で動きます。</p>
+                  </div>
+                  <div class="model-card">
+                    <p class="model-card-name">Cube Twin</p>
+                    <p class="model-card-spec mono">約2億3,314万パラメータ</p>
+                    <p class="model-card-desc">Flashの蒸留モデルと読解モデルを横並びに結合。iMacサーバーで動きます。</p>
+                  </div>
+                  <div class="model-card">
+                    <p class="model-card-name">Cube Pro</p>
+                    <p class="model-card-spec mono">約2億9,781万パラメータ</p>
+                    <p class="model-card-desc">語彙32,000の自作モデルに蒸留第3弾まで実施。iMacサーバーで動きます。</p>
+                  </div>
+                  <div class="model-card">
+                    <p class="model-card-name">Cube Max</p>
+                    <p class="model-card-spec mono">約11億8,965万パラメータ</p>
+                    <p class="model-card-desc">自作モデルの蒸留2系統を横並びに結合した最大モデル。iMacサーバーで動きます。</p>
+                  </div>
+                  <div class="model-card">
+                    <p class="model-card-name">Cube Ultra</p>
+                    <p class="model-card-spec mono">約15億パラメータ</p>
+                    <p class="model-card-desc">Qwen2.5-1.5Bに追加学習を統合したモデル。iMacサーバーで動きます。</p>
+                  </div>
+                  <p class="panel-note">モデルの切り替えは、左の「モデル」メニュー（狭い画面では上のメニュー）からできます。</p>
+                </div>
+
+                <div class="pickup-panel panel-howto">
+                  <div class="howto-card">
+                    <p class="howto-card-title">出どころラベル</p>
+                    <p class="howto-card-desc">答えには必ず出どころのラベルがつきます。「ネットで確認済み」は、1つの記事が答えの言葉と数字の全部を裏づけたときだけ表示されます。</p>
+                    <ul class="legend" aria-label="出どころラベルの説明">
+                      <li><span class="badge mono badge-notebook">知識メモ帳の答え</span></li>
+                      <li><span class="badge mono badge-calc">検算の答え</span></li>
+                      <li><span class="badge mono badge-weather">天気情報（気象庁・Open-Meteo）</span></li>
+                      <li><span class="badge mono badge-model">Cubeの答え（ネットで確認済み）</span></li>
+                      <li><span class="badge mono badge-net">ネット検索の答え</span></li>
+                      <li><span class="badge mono badge-unverified">ネットで確認できなかった（未確認）</span></li>
+                      <li><span class="badge mono badge-self">Cube自身のこと（アプリ固定の情報）</span></li>
+                    </ul>
+                  </div>
+                  <div class="howto-card">
+                    <p class="howto-card-title">知識メモ帳</p>
+                    <p class="howto-card-desc">検索で確認できた答えは知識メモ帳に自動でたまります。同じ質問にはメモ帳から即答し、たまった知識はあとで追加学習にも使えます。</p>
+                  </div>
+                  <div class="howto-card">
+                    <p class="howto-card-title">朝のブリーフィング</p>
+                    <p class="howto-card-desc">朝5時〜11時にCubeを開くと、その日の天気や予定をCube Ultraがまとめて話します（iMacが起動しているときだけ）。</p>
+                  </div>
+                </div>
+              </div>
+
+              <details class="hero-details">
+                <summary>Cubeについて（詳しい説明）</summary>
+                <p class="desc">
+                  Cubeは自作LLMです（Cube Nano：約3,177万パラメータ／
+                  Cube Flash：約5,995万パラメータ／Cube Twin：約2億3,314万
+                  パラメータ／Cube Pro：約2億9,781万パラメータ／Cube Max：
+                  約11億8,965万パラメータ。
+                  メニューで切り替えられます）。6つ目の
+                  Cube Ultraは、Qwen2.5-1.5Bに追加学習を統合したモデル
+                  （約15億パラメータ）です。Cube Twin・Cube Pro・Cube Max・
+                  Cube Ultraは端末に読み込まず、自宅のiMacサーバーで
+                  動かします（iMacが起動しているときだけ使えます）。
+                  答えには必ず「出どころ」のラベルがつきます。基本はCubeの
+                  答えを主表示し、ネット検索は裏づけとして添えます。Cubeと
+                  ネットで食い違ったら、ネットの事実を正として表示し、
+                  Cubeの答えも消さずに併記します。計算は検算で確かめます。
+                  Cube自身への質問（作った人・名前・名前の意味・綴り）は、
+                  ネットでは確かめられないので、アプリに固定した正しい
+                  情報から答えます。
+                </p>
+              </details>
             </div>
             <ul id="msg-list" class="msg-list"></ul>
             <div id="phase-row" class="phase-row mono" aria-live="polite" hidden>
@@ -89,9 +250,19 @@
         <form id="ask-form" class="composer-wrap">
           <div class="composer-inner">
             <div class="composer">
-              <label class="sr-only" for="question-input">質問を入力</label>
-              <textarea id="question-input" rows="1" placeholder="質問を入力…"></textarea>
-              <button id="send-btn" type="submit" class="send-btn" disabled>送信</button>
+              <div class="model-switch model-switch-composer" role="group" aria-label="モデルの切り替え">
+                <button type="button" class="model-switch-btn" data-model="v1" aria-pressed="true">Nano</button>
+                <button type="button" class="model-switch-btn" data-model="v2" aria-pressed="false">Flash</button>
+                <button type="button" class="model-switch-btn" data-model="twin" aria-pressed="false">Twin</button>
+                <button type="button" class="model-switch-btn" data-model="pro" aria-pressed="false">Pro</button>
+                <button type="button" class="model-switch-btn" data-model="max" aria-pressed="false">Max</button>
+                <button type="button" class="model-switch-btn" data-model="ultra" aria-pressed="false">Ultra</button>
+              </div>
+              <div class="composer-row">
+                <label class="sr-only" for="question-input">質問を入力</label>
+                <textarea id="question-input" rows="1" placeholder="Cubeに質問する…"></textarea>
+                <button id="send-btn" type="submit" class="send-btn" disabled>送信</button>
+              </div>
             </div>
           </div>
         </form>
@@ -128,7 +299,7 @@
               <p class="desc">
                 manifest.json / bpe.json / weights-*.bin が置いてある場所を指定します。
                 このURLは選択中のモデル（Cube Nano / Cube Flash）ごとの上書きとして
-                この端末に保存され、次回から自動で読み込みます。ヘッダーでモデルを
+                この端末に保存され、次回から自動で読み込みます。メニューでモデルを
                 切り替えると、そのモデルのURLに切り替わります。
                 Cube Twin / Cube Pro / Cube Max / Cube Ultra はiMacサーバーで動かすため、この上書きは適用されません。
               </p>
@@ -205,7 +376,7 @@
                 このAIの名前はCubeです。
                 GPT方式Transformerの自作LLMを、ブラウザの中と自宅の
                 iMacサーバーで動かしています。
-                モデルは6つあり、ヘッダーで切り替えられます。Cube Nanoは
+                モデルは6つあり、メニューで切り替えられます。Cube Nanoは
                 12層・幅448・語彙6,000の自作BPEで約3,177万パラメータ、
                 Cube Flashは18層・幅512・語彙6,000の自作BPEで約5,995万
                 パラメータ、Cube Twinは18層・幅1024・語彙6,000の自作BPEで
@@ -220,9 +391,9 @@
                 BPEはProの場所から読み込みます）。
                 Cube Maxは21層・幅2048・語彙32,000の自作BPEで
                 約11億8,965万パラメータです（v3モデルの蒸留 r1 と r2 を
-                横並びに結合した1つのモデルを、Pro・Twinと同じグループ
-                単位のint4量子化で書き出したものです。語彙が他の自作
-                モデルと違うので、BPEはMaxの場所から読み込みます）。
+                横並びに結合した1つのモデルを、Pro・Twinと同じグループ単位の
+                int4量子化で書き出したものです。語彙が他の自作モデルと違うので、
+                BPEはMaxの場所から読み込みます）。
                 Cube Ultraは、Qwen2.5-1.5Bに追加学習（LoRA）を統合した
                 モデル（約15億パラメータ）です。Cube Twin・Cube Pro・
                 Cube Max・Cube Ultraは、端末のメモリに収まらないため
@@ -270,6 +441,7 @@
           </div>
         </div>
       </section>
+      </main>
     </div>
     <script src="script.js"></script>
   </body>
