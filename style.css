@@ -371,6 +371,7 @@ a { color: var(--accent); }
   margin-bottom: 8px;
 }
 .badge-notebook { background: #3f7038; color: #ffffff; }
+.badge-memory { background: #5b4a9e; color: #ffffff; }
 .badge-calc { background: #26706b; color: #ffffff; }
 .badge-self { background: #7a4a56; color: #ffffff; }
 .badge-weather { background: #1f6fb2; color: #ffffff; }
@@ -380,6 +381,7 @@ a { color: var(--accent); }
 .badge-unverified { background: #9a6206; color: #ffffff; }
 @media (prefers-color-scheme: dark) {
   .badge-notebook { background: #8fbc7a; color: #1d1a15; }
+  .badge-memory { background: #b3a6e8; color: #1d1a15; }
   .badge-calc { background: #6fbfb8; color: #1d1a15; }
   .badge-self { background: #d59aa7; color: #1d1a15; }
   .badge-weather { background: #7db3dd; color: #1d1a15; }
@@ -485,6 +487,41 @@ a { color: var(--accent); }
   font: inherit; font-size: 12px;
   border-radius: 8px; padding: 4px 8px; cursor: pointer;
 }
+
+/* ---- 記憶 ---- */
+.mem-note { margin: 0; font-size: 14px; line-height: 1.7; }
+.mem-add { margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
+.mem-add input {
+  flex: 1; min-width: 220px;
+  border: 1px solid var(--border);
+  background: var(--bg); color: var(--text);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  font-size: 14px;
+  outline: none;
+}
+.mem-add input:focus { border-color: var(--accent); }
+.mem-add select {
+  border: 1px solid var(--border);
+  background: var(--bg); color: var(--text);
+  border-radius: var(--radius);
+  padding: 10px 8px;
+  font-size: 14px;
+  outline: none;
+}
+.mem-history { margin-top: 24px; }
+.mem-history summary { font-size: 13px; color: var(--dim); cursor: pointer; }
+.mem-edit-box { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.mem-edit-input {
+  flex: 1; min-width: 200px;
+  border: 1px solid var(--border);
+  background: var(--bg); color: var(--text);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 14px;
+  outline: none;
+}
+.mem-edit-input[aria-invalid="true"] { border-color: #c0392b; }
 
 /* ---- 設定 ---- */
 .card {

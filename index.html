@@ -67,6 +67,10 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 3.5h11V20l-2.8-1.9-2.7 1.9-2.7-1.9L6.5 20z"/></svg>
               知識メモ帳<span id="nb-tab-count"></span>
             </button>
+            <button type="button" class="tab-btn" data-tab="memory" aria-pressed="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M12 3.5 20 8v8l-8 4.5L4 16V8z"/><path d="M4 8l8 4.5L20 8"/><path d="M12 12.5v8"/></svg>
+              記憶<span id="mem-tab-count"></span>
+            </button>
             <button type="button" class="tab-btn" data-tab="settings" aria-pressed="false">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 8h9M19 8h1M4 16h3M13 16h7"/><circle cx="16" cy="8" r="2.2"/><circle cx="10" cy="16" r="2.2"/></svg>
               設定
@@ -288,6 +292,44 @@
         </div>
       </section>
 
+      <!-- 記憶 -->
+      <section id="view-memory" class="view" hidden>
+        <div class="page-scroll">
+          <div class="page-inner">
+            <h2>記憶</h2>
+            <p class="lead">
+              Cubeが「あなたのこと」として覚えている内容です。
+              知識メモ帳（検索で確認できた世界の事実）とは別物で、こちらは
+              あなたの好み・決めたこと・身の回りのことを扱います。
+              チャットで「〜を覚えて」と言うか、あなたの発言から自動で
+              取り込むこともあります。モデルの作り話や、出典のない事実は
+              覚えません。GitHub版では、この端末のブラウザの中に保存されます。
+            </p>
+            <form id="mem-add-form" class="mem-add">
+              <input id="mem-add-text" type="text" maxlength="200" placeholder="覚えさせたいこと（例：卓球が好き）" />
+              <select id="mem-add-kind" aria-label="記憶の種類">
+                <option value="user">ユーザー</option>
+                <option value="preference">好み</option>
+                <option value="decision">決めたこと</option>
+                <option value="person">人物</option>
+              </select>
+              <button type="submit" class="primary-btn">覚えさせる</button>
+            </form>
+            <p id="mem-add-note" class="status-line" role="status"></p>
+            <p id="mem-counts" class="nb-counts mono" hidden></p>
+            <p id="mem-empty" class="nb-empty">
+              まだ何も覚えていません。チャットで「卓球が好き」のように
+              話したり、「〜を覚えて」と言うと、ここに残ります。
+            </p>
+            <ul id="mem-list" class="nb-list"></ul>
+            <details id="mem-history-wrap" class="mem-history" hidden>
+              <summary>履歴（上書き済み・忘れたもの）</summary>
+              <ul id="mem-history" class="nb-list"></ul>
+            </details>
+          </div>
+        </div>
+      </section>
+
       <!-- 設定 -->
       <section id="view-settings" class="view" hidden>
         <div class="page-scroll">
@@ -443,6 +485,7 @@
       </section>
       </main>
     </div>
+    <script src="cube_memory.js"></script>
     <script src="script.js"></script>
   </body>
 </html>

@@ -950,6 +950,28 @@ const ULTRA_PARAM_COUNT = 1543714304;
 const ULTRA_SYSTEM_PROMPT =
   "あなたは親切なAIアシスタントです。質問には日本語で分かりやすく答えてください。";
 
+/* Cube 記憶（cube_memory.js）の Ultra 向け注入分。質問ごとに App.ask の
+   入口で CubeMem.systemSuffix(question) の結果に差し替える。記憶が
+   無い・モジュールが読み込まれていない環境では常に空文字で、Ultra の
+   システムプロンプトは従来と完全同一になる。記憶はシステム側にだけ
+   入れ、読解形式の「文：…」（記事本文＝証拠）には決して混ぜない。 */
+let cubeMemorySystemSuffix = "";
+
+/* 記憶の保存先に iMac の cube-server（/memory）を使うかどうか。
+   false の間はこの端末の localStorage だけが保存先（公開版の基本形）。
+   サーバー保存を有効化するときは、memory_endpoint.js を cube-server
+   へ配置し、疎通を確認してから true にする（今回はデプロイしない）。 */
+const MEMORY_SERVER_ENABLED = false;
+
+/* 記憶ビューの表示ラベル（モジュールの KIND_LABEL と同じ文言）。 */
+const MEM_KIND_LABELS = {
+  user: "ユーザー", preference: "好み", decision: "決めたこと",
+  person: "人物", daily: "記録",
+};
+const MEM_SOURCE_LABELS = {
+  explicit: "あなたの明示", verified: "検証済み", conversation: "会話から",
+};
+
 /* Ultra 読み込みの試行の印（sessionStorage）。値は通常版（ONNX）が
    "build"（1回目の試行中）→ "build2"（落ちた後の再試行中）、軽量
    エンジン（GGUF版）が "gguf"（1回目の試行中）→ "gguf2"（落ちた後の
@@ -1090,7 +1112,7 @@ const UltraModel = {
   async generate(prompt) {
     if (!this.generator) throw new Error("Cube Ultra が読み込まれていません");
     const messages = [
-      { role: "system", content: ULTRA_SYSTEM_PROMPT },
+      { role: "system", content: ULTRA_SYSTEM_PROMPT + cubeMemorySystemSuffix },
       { role: "user", content: prompt },
     ];
     const output = await this.generator(messages, {
@@ -1279,7 +1301,7 @@ const UltraGgufModel = {
       reported: before ? !!before.reported : false,
     });
     const chatml =
-      `<|im_start|>system\n${ULTRA_SYSTEM_PROMPT}<|im_end|>\n` +
+      `<|im_start|>system\n${ULTRA_SYSTEM_PROMPT + cubeMemorySystemSuffix}<|im_end|>\n` +
       `<|im_start|>user\n${prompt}<|im_end|>\n` +
       `<|im_start|>assistant\n`;
     let res;
@@ -1398,7 +1420,7 @@ const UltraImacModel = {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             messages: [
-              { role: "system", content: ULTRA_SYSTEM_PROMPT },
+              { role: "system", content: ULTRA_SYSTEM_PROMPT + cubeMemorySystemSuffix },
               { role: "user", content: prompt },
             ],
             temperature: 0,
@@ -9044,6 +9066,7 @@ const BADGES = {
     className: "badge-unverified",
   },
   calc: { label: "検算の答え", className: "badge-calc" },
+  memory: { label: "記憶の答え", className: "badge-memory" },
   self: {
     label: "Cube自身のこと（アプリ固定の情報）",
     className: "badge-self",
@@ -9113,6 +9136,7 @@ const App = {
 
   init() {
     Notebook.load();
+    this.initMemory();
     // 選択中のモデルを復元する（初期値は v1）。ベースURLはモデルごとの
     // 上書きとして読み込む（v1 は従来キー、v2 / Twin / Pro / Max は専用キー）。
     const savedId = store.get(MODEL_ID_KEY);
@@ -9211,8 +9235,11 @@ const App = {
     }
     el("view-chat").hidden = name !== "chat";
     el("view-notebook").hidden = name !== "notebook";
+    const memView = el("view-memory");
+    if (memView) memView.hidden = name !== "memory";
     el("view-settings").hidden = name !== "settings";
     if (name === "notebook") this.renderNotebook();
+    if (name === "memory") this.renderMemory();
     if (name === "settings") this.renderSettings();
   },
 
@@ -9863,6 +9890,339 @@ const App = {
     }
   },
 
+  /* ---- Cube 記憶（cube_memory.js） ---- */
+
+  /* 記憶モジュールの実体（initMemory で設定。無い環境では null）。 */
+  memory: null,
+
+  /* 記憶の初期化。保存先はこの端末の localStorage を基本形とする
+     （公開版では訪問者のブラウザ内にだけ残る。DESIGN.md §3）。
+     MEMORY_SERVER_ENABLED が true のときだけ、iMac の /memory との
+     ハイブリッド保存にする（エンドポイント配置後に有効化すること）。
+     モジュールが読み込まれていない環境（Node テスト等）では何も
+     しない——記憶が無い状態では従来の挙動と一切変わらない。 */
+  initMemory() {
+    this.memory = null;
+    try {
+      if (typeof CubeMemory === "undefined") return;
+      const store = MEMORY_SERVER_ENABLED
+        ? CubeMemory.makeHybridStore(
+            CubeMemory.makeServerStore(CUBE_SERVER_BASE_URL),
+            CubeMemory.makeLocalStore(),
+          )
+        : CubeMemory.makeLocalStore();
+      const mem = CubeMemory.create({ store });
+      this.memory = mem;
+      window.CubeMem = mem;
+      mem
+        .load()
+        .then(() => this.updateMemoryTabCount())
+        .catch(() => { /* 記憶が読めなくても通常利用は妨げない */ });
+      const form = el("mem-add-form");
+      if (form) {
+        form.addEventListener("submit", (e) => {
+          e.preventDefault();
+          void this.addMemoryFromForm();
+        });
+      }
+    } catch {
+      this.memory = null;
+    }
+  },
+
+  /* 質問の入口での記憶処理：明示コマンド（覚えて／忘れて）の解釈と
+     発言からの候補抽出を行い、Ultra 向け注入サフィックスを今回の
+     質問用に差し替える。明示コマンドだった場合は通知だけを出して
+     true を返す（そのターンはそこで完了する）。記憶が無い・失敗
+     した場合は黙って false を返し、通常の回答フローに影響しない。 */
+  async memoryObserve(question) {
+    cubeMemorySystemSuffix = "";
+    const mem = this.memory;
+    if (!mem || !mem.loaded) return false;
+    let result = null;
+    try {
+      result = await mem.observeUserMessage(question);
+    } catch {
+      return false;
+    }
+    try {
+      cubeMemorySystemSuffix = mem.systemSuffix(question) || "";
+    } catch {
+      cubeMemorySystemSuffix = "";
+    }
+    if (result && (result.added.length || result.forgotten.length)) {
+      this.updateMemoryTabCount();
+    }
+    if (result && result.notices && result.notices.length) {
+      for (const notice of result.notices) this.pushMemoryNotice(notice);
+      return true;
+    }
+    return false;
+  },
+
+  /* 記憶の通知（覚えました／忘れました等）を、通常の返答とは別に
+     「記憶の答え」バッジつきの小さな注記として会話へ出す。 */
+  pushMemoryNotice(text) {
+    el("empty-state").hidden = true;
+    const li = document.createElement("li");
+    li.className = "msg-ai msg-memnote";
+    const b = document.createElement("span");
+    b.className = `badge mono ${BADGES.memory.className}`;
+    b.textContent = BADGES.memory.label;
+    li.appendChild(b);
+    const p = document.createElement("p");
+    p.className = "mem-note";
+    p.textContent = text;
+    li.appendChild(p);
+    el("msg-list").appendChild(li);
+    this.scrollChat();
+  },
+
+  /* 自作モデル（Nano/Flash/Twin/Pro/Max）向けの質問装飾：QA 形式に
+     文脈枠が無いため、関連が強い記憶だけを最大2件・短く質問の末尾に
+     添える（モジュール側で強い主題一致のあるものだけに絞られる）。
+     記憶が無い・一致が弱ければ質問はそのまま返る。Twin/Pro/Max は
+     質問文字列がそのままサーバーへ送られるため、この形で届く。 */
+  memoryDecorate(question) {
+    const mem = this.memory;
+    if (!mem || !mem.loaded) return question;
+    try {
+      return mem.decorateQuestion(question, { maxEntries: 2 }) || question;
+    } catch {
+      return question;
+    }
+  },
+
+  /* 直接参照レーン：ユーザー自身についての質問（私の〜は？／覚えて
+     いる？）に、モデルを介さず記憶から即答する。全モデル共通の
+     経路。Cube 自身の固定情報（手順0.5）とは対象が違う（あちらは
+     Cube のこと、こちらはユーザーのこと）ので衝突しない。記憶に
+     該当が無ければ null を返し、通常フローに委ねる。 */
+  memoryDirectAnswer(question) {
+    const mem = this.memory;
+    if (!mem || !mem.loaded) return null;
+    const q = String(question || "");
+    const selfRef = /(私|僕|あたし|自分|俺|おれ)/.test(q);
+    try {
+      // モジュール側の直接参照（自己言及＋主題一致）。
+      const hit = mem.findDirectAnswer(q);
+      if (hit) return `「${hit.text}」と覚えています。`;
+      if (!selfRef && !/(覚えて|おぼえて)/.test(q)) return null;
+      if (selfRef && /好きな(もの|こと|食べ物|食べもの|スポーツ|遊び|曲|本|映画)?/.test(q)) {
+        const prefs = mem.list({ kind: "preference" });
+        if (prefs.length) {
+          return `あなたの好きなものとして、${prefs.map((e) => `「${e.text}」`).join("、")}を覚えています。`;
+        }
+      }
+      if (selfRef && /名前/.test(q)) {
+        const named = mem
+          .list({ kind: "user" })
+          .find((e) => (e.topic && e.topic.includes("名前")) || /名前/.test(e.text));
+        if (named) return `「${named.text}」と覚えています。`;
+      }
+      if (selfRef && /(住んで|住所)/.test(q)) {
+        const home = mem
+          .list({ kind: "user" })
+          .find((e) => e.topic === "住んでいる場所");
+        if (home) return `「${home.text}」と覚えています。`;
+      }
+      if (selfRef && /通って/.test(q)) {
+        const place = mem
+          .list({ kind: "user" })
+          .find((e) => e.topic === "通っている場所");
+        if (place) return `「${place.text}」と覚えています。`;
+      }
+      // 「私のこと覚えてる？」への一般形：現行の記憶を要約して返す。
+      if (/(覚えて|おぼえて)/.test(q)) {
+        const actives = mem.list({}).filter((e) => e.kind !== "daily");
+        if (actives.length) {
+          const shown = actives.slice(0, 3).map((e) => `「${e.text}」`).join("、");
+          return `あなたのこととして、${shown}${actives.length > 3 ? " など" : ""}を覚えています。`;
+        }
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  },
+
+  updateMemoryTabCount() {
+    const span = el("mem-tab-count");
+    if (!span) return;
+    const mem = this.memory;
+    const n = mem && mem.loaded ? mem.list({}).length : 0;
+    span.textContent = n > 0 ? ` (${n})` : "";
+  },
+
+  /* 記憶ビューの「手動で覚えさせる」フォーム。 */
+  async addMemoryFromForm() {
+    const note = el("mem-add-note");
+    const input = el("mem-add-text");
+    const kindSel = el("mem-add-kind");
+    const mem = this.memory;
+    if (!mem) {
+      if (note) note.textContent = "記憶モジュールが読み込まれていません。";
+      return;
+    }
+    const text = input ? input.value.trim() : "";
+    if (!text) return;
+    const r = await mem.addExplicit(text, kindSel ? kindSel.value : undefined);
+    if (note) {
+      note.textContent = r.added
+        ? `覚えました：${r.entry.text}`
+        : r.reason === "looks-secret"
+          ? "秘密情報らしい内容は覚えられません。"
+          : r.reason === "duplicate"
+            ? "それは既に覚えています。"
+            : "覚えられませんでした。";
+    }
+    if (r.added && input) input.value = "";
+    this.updateMemoryTabCount();
+    this.renderMemory();
+  },
+
+  /* ---- 記憶タブ ---- */
+  renderMemory() {
+    const listEl = el("mem-list");
+    if (!listEl) return;
+    const mem = this.memory;
+    const actives = mem && mem.loaded ? mem.list({}) : [];
+    const counts = el("mem-counts");
+    if (counts) {
+      counts.textContent = actives.length > 0 ? `覚えていること ${actives.length}件` : "";
+      counts.hidden = actives.length === 0;
+    }
+    const empty = el("mem-empty");
+    if (empty) empty.hidden = actives.length > 0;
+    this.updateMemoryTabCount();
+    listEl.textContent = "";
+    for (const e of actives) listEl.appendChild(this.memoryItemEl(e, false));
+    const hist = mem && mem.loaded
+      ? [...mem.list({ status: "superseded" }), ...mem.list({ status: "forgotten" })]
+      : [];
+    const wrap = el("mem-history-wrap");
+    const histList = el("mem-history");
+    if (wrap && histList) {
+      wrap.hidden = hist.length === 0;
+      histList.textContent = "";
+      for (const e of hist) histList.appendChild(this.memoryItemEl(e, true));
+    }
+  },
+
+  memoryItemEl(e, isHistory) {
+    const li = document.createElement("li");
+    li.className = "nb-item";
+    const flex = document.createElement("div");
+    flex.className = "nb-flex";
+    const main = document.createElement("div");
+    main.className = "nb-main";
+    const tags = document.createElement("p");
+    tags.className = "nb-tags";
+    const kt = document.createElement("span");
+    kt.className = "tag mono";
+    kt.textContent = MEM_KIND_LABELS[e.kind] || e.kind;
+    tags.appendChild(kt);
+    if (e.topic) {
+      const tt = document.createElement("span");
+      tt.className = "tag mono";
+      tt.textContent = e.topic;
+      tags.appendChild(tt);
+    }
+    if (isHistory) {
+      const st = document.createElement("span");
+      st.className = "tag mono tag-untrained";
+      st.textContent = e.status === "superseded" ? "上書き済み" : "忘れたもの";
+      tags.appendChild(st);
+    }
+    const src = document.createElement("span");
+    src.className = "tag mono";
+    src.textContent = `出所：${MEM_SOURCE_LABELS[e.source && e.source.type] || "会話から"}`;
+    tags.appendChild(src);
+    main.appendChild(tags);
+    const textP = document.createElement("p");
+    textP.className = "nb-answer";
+    textP.textContent = e.text;
+    main.appendChild(textP);
+    const d = document.createElement("p");
+    d.className = "nb-date mono";
+    d.textContent = e.date || "";
+    main.appendChild(d);
+    flex.appendChild(main);
+    const actions = document.createElement("div");
+    actions.className = "nb-actions";
+    if (!isHistory) {
+      const eb = document.createElement("button");
+      eb.type = "button";
+      eb.className = "small-btn";
+      eb.textContent = "編集";
+      eb.setAttribute("aria-label", `「${e.text}」を編集`);
+      eb.addEventListener("click", () => {
+        if (!this.memory) return;
+        textP.hidden = true;
+        eb.disabled = true;
+        const box = document.createElement("div");
+        box.className = "mem-edit-box";
+        const input = document.createElement("input");
+        input.type = "text";
+        input.value = e.text;
+        input.className = "mem-edit-input";
+        box.appendChild(input);
+        const save = document.createElement("button");
+        save.type = "button";
+        save.className = "small-btn";
+        save.textContent = "保存";
+        save.addEventListener("click", () => {
+          void (async () => {
+            const updated = await this.memory.updateText(e.id, input.value);
+            if (!updated) {
+              input.setAttribute("aria-invalid", "true");
+              return;
+            }
+            this.renderMemory();
+          })();
+        });
+        box.appendChild(save);
+        const cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.className = "small-btn";
+        cancel.textContent = "キャンセル";
+        cancel.addEventListener("click", () => this.renderMemory());
+        box.appendChild(cancel);
+        main.appendChild(box);
+      });
+      actions.appendChild(eb);
+      const fb = document.createElement("button");
+      fb.type = "button";
+      fb.className = "small-btn";
+      fb.textContent = "忘れる";
+      fb.setAttribute("aria-label", `「${e.text}」を忘れる`);
+      fb.addEventListener("click", () => {
+        void (async () => {
+          if (!this.memory) return;
+          await this.memory.forget(e.text);
+          this.renderMemory();
+        })();
+      });
+      actions.appendChild(fb);
+    }
+    const db = document.createElement("button");
+    db.type = "button";
+    db.className = "small-btn";
+    db.textContent = "削除";
+    db.setAttribute("aria-label", `「${e.text}」を削除`);
+    db.addEventListener("click", () => {
+      void (async () => {
+        if (!this.memory) return;
+        await this.memory.remove(e.id);
+        this.renderMemory();
+      })();
+    });
+    actions.appendChild(db);
+    flex.appendChild(actions);
+    li.appendChild(flex);
+    return li;
+  },
+
   saveNotebook(entry) {
     // 同語反復の文は知識として固定しない（最後の関門）。
     if (isTautologicalAnswer(entry.answer)) return;
@@ -9882,6 +10242,11 @@ const App = {
     this.pushUser(question);
     el("question-input").value = "";
     this.syncSend();
+    // 記憶：明示コマンド（覚えて／忘れて）の解釈と、発言からの候補
+    // 抽出。明示コマンドだったら通知だけを出してこのターンを終える。
+    // あわせて Ultra 向けの注入サフィックスを今回の質問用に差し替える
+    // （記憶が無い環境では常に空＝従来動作）。
+    if (await this.memoryObserve(question)) return;
     // 「回答可能」は、読み込み済みのモデルIDと選択中のIDが一致する
     // ときだけ真。切り替え先の読み込みに失敗した状態では、前のモデル
     // のエンジンで（新しいモデルの名前で）回答することはない。
@@ -10046,6 +10411,21 @@ const App = {
       return;
     }
 
+    // 1.5) 記憶の直接参照：ユーザー自身についての質問（私の〜は？／
+    // 覚えている？）は、モデルを介さず覚えている内容から即答する。
+    // 全モデル共通の経路で、モデルの読み込み状態にも依存しない。
+    // 記憶は世界の事実の証拠ではないので、索引レーンの検証とは
+    // 混ぜず、「記憶の答え」バッジで出所を明示する。
+    const memAnswer = this.memoryDirectAnswer(question);
+    if (memAnswer) {
+      this.pushAssistant({
+        text: memAnswer,
+        badge: "memory",
+        note: "Cubeが覚えている内容から答えています。",
+      });
+      return;
+    }
+
     // 2) 計算は実際に計算して検算する。
     const calc = evalArithmetic(question);
     if (calc !== null) {
@@ -10138,7 +10518,13 @@ const App = {
         // ごとに振り分ける（端末内／iMacサーバー／Ultra）。生成上限は
         // 各エンジン側が持つ（Nano・Pro・Max: 48 / Flash・Twin: 96 /
         // Ultra: 128）。
-        modelAnswer = await generateForModel(this.modelId, question);
+        // 記憶の注入：Ultra はシステムプロンプト側（入口で差し替え
+        // 済み）。自作モデルは QA 形式に文脈枠が無いため、関連が強い
+        // 記憶だけを質問の末尾に短く添える（無関係なら無変更）。
+        const genQuestion = this.modelId === "ultra"
+          ? question
+          : this.memoryDecorate(question);
+        modelAnswer = await generateForModel(this.modelId, genQuestion);
         if (!modelAnswer) modelIssue = "empty";
       } catch (e) {
         modelAnswer = "";
