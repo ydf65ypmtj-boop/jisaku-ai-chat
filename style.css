@@ -156,6 +156,79 @@ body {
 .tab-btn:hover { background: var(--surface-alt); }
 .tab-btn[aria-pressed="true"] { background: var(--surface); color: var(--text); font-weight: 700; box-shadow: 0 1px 4px rgba(19, 23, 34, 0.10); }
 
+/* チャット履歴リスト（サイドバー） */
+.history-list {
+  list-style: none;
+  margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: 38vh; overflow-y: auto;
+}
+.history-item {
+  display: flex; align-items: stretch; gap: 2px;
+  border-radius: 12px;
+}
+.history-item:hover { background: var(--surface-alt); }
+.history-item.active { background: var(--accent-tint); }
+.history-open {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: baseline; gap: 8px;
+  border: 0; background: transparent;
+  color: var(--text);
+  font: inherit; font-size: 13px;
+  padding: 8px 10px;
+  cursor: pointer; text-align: left;
+}
+.history-title {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.history-item.active .history-title { font-weight: 700; }
+.history-date { font-size: 11px; color: var(--dim); flex: none; }
+.history-del {
+  flex: none;
+  border: 0; background: transparent;
+  color: var(--dim);
+  font: inherit; font-size: 15px; line-height: 1;
+  padding: 0 8px;
+  cursor: pointer; border-radius: 8px;
+}
+.history-del:hover { color: var(--warn); }
+.history-empty { font-size: 12px; color: var(--dim); margin: 2px 12px 0; }
+
+/* アカウント領域（サイドバー下部） */
+.account-area {
+  display: flex; flex-direction: column; gap: 6px;
+  padding-bottom: 8px; margin-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.account-login-btn {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit; font-size: 13px; font-weight: 600;
+  border-radius: 999px;
+  padding: 8px 14px;
+  cursor: pointer;
+  align-self: flex-start;
+}
+.account-login-btn:hover { background: var(--surface-alt); }
+.account-user { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.account-avatar { width: 28px; height: 28px; border-radius: 50%; flex: none; }
+.account-name {
+  flex: 1 1 auto; min-width: 0;
+  font-size: 13px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.account-logout-btn {
+  flex: none;
+  border: 0; background: transparent;
+  color: var(--dim);
+  font: inherit; font-size: 12px;
+  cursor: pointer; padding: 4px 6px;
+}
+.account-logout-btn:hover { color: var(--text); }
+.account-note { font-size: 11px; color: var(--dim); margin: 0; line-height: 1.5; }
+
 /* サイドバー下部：モデル状態 */
 .side-foot {
   margin-top: auto;

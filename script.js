@@ -963,6 +963,19 @@ let cubeMemorySystemSuffix = "";
    へ配置し、疎通を確認してから true にする（今回はデプロイしない）。 */
 const MEMORY_SERVER_ENABLED = false;
 
+/* Cube アカウント（Supabase）の設定。Cube 用の Supabase プロジェクトを
+   作ったあと、Project URL と Publishable key をここへ入れる
+   （SETUP_GUIDE.md の手順参照）。空の間はアカウント機能の全体
+   （Google ログイン・チャット履歴・端末間同期）が無効で、ページの
+   挙動は従来と完全同一になる。
+   ※ ここへ入れてよいのは Publishable key（公開前提のキー）だけ。
+   Secret key は絶対に入れないこと。 */
+const CUBE_ACCOUNT_CONFIG =
+  (typeof window !== "undefined" && window.__CUBE_ACCOUNT_CONFIG__) || {
+    url: "https://glvlbgylnxxkyjvcaeym.supabase.co",
+    publishableKey: "sb_publishable_8VCMVdBvYivEFVNA841N8g_EE7c8H3T",
+  };
+
 /* 記憶ビューの表示ラベル（モジュールの KIND_LABEL と同じ文言）。 */
 const MEM_KIND_LABELS = {
   user: "ユーザー", preference: "好み", decision: "決めたこと",
@@ -1108,11 +1121,14 @@ const UltraModel = {
     }
     await this.generatorPromise;
   },
-  /* アプリがモデルへ渡すプロンプト文字列から、Ultra の答えを生成する */
-  async generate(prompt) {
+  /* アプリがモデルへ渡すプロンプト文字列から、Ultra の答えを生成する。
+     historyMessages（再開した会話の直近ターン）は system の後ろ・
+     今回の user の前に入れる。無い場合は従来と完全同一。 */
+  async generate(prompt, historyMessages) {
     if (!this.generator) throw new Error("Cube Ultra が読み込まれていません");
     const messages = [
       { role: "system", content: ULTRA_SYSTEM_PROMPT + cubeMemorySystemSuffix },
+      ...(Array.isArray(historyMessages) ? historyMessages : []),
       { role: "user", content: prompt },
     ];
     const output = await this.generator(messages, {
@@ -1288,7 +1304,7 @@ const UltraGgufModel = {
   /* アプリがモデルへ渡すプロンプト文字列から、GGUF 版の答えを生成する。
      プロンプトの組み立てと生成条件は通常版と完全同一（上のセクション
      コメント参照）。 */
-  async generate(prompt) {
+  async generate(prompt, historyMessages) {
     if (!this.wllama) throw new Error("Cube Ultra（軽量エンジン）が読み込まれていません");
     // フェーズ記録：生成の開始を残す。生成の途中でタブが落ちたら、
     // 次回に「回答生成の途中で落ちた」と通知できる（answered は維持）。
@@ -1300,8 +1316,15 @@ const UltraGgufModel = {
       answered: answeredBefore,
       reported: before ? !!before.reported : false,
     });
+    const historyChatml = (Array.isArray(historyMessages) ? historyMessages : [])
+      .map(
+        (m) =>
+          `<|im_start|>${m.role === "assistant" ? "assistant" : "user"}\n${m.content}<|im_end|>\n`,
+      )
+      .join("");
     const chatml =
       `<|im_start|>system\n${ULTRA_SYSTEM_PROMPT + cubeMemorySystemSuffix}<|im_end|>\n` +
+      historyChatml +
       `<|im_start|>user\n${prompt}<|im_end|>\n` +
       `<|im_start|>assistant\n`;
     let res;
@@ -1409,7 +1432,7 @@ const UltraImacModel = {
      （OpenAI 互換 /v1/chat/completions）で答えを生成する。メッセージと
      生成条件は他のエンジンと同一。失敗したら接続を切り、素直な文面の
      例外にする（回答フロー側が注記として表示する）。 */
-  async generate(prompt) {
+  async generate(prompt, historyMessages) {
     if (!this.connected) throw new Error("Cube Ultra（iMacサーバー）が接続されていません");
     let res;
     try {
@@ -1421,6 +1444,7 @@ const UltraImacModel = {
           body: JSON.stringify({
             messages: [
               { role: "system", content: ULTRA_SYSTEM_PROMPT + cubeMemorySystemSuffix },
+              ...(Array.isArray(historyMessages) ? historyMessages : []),
               { role: "user", content: prompt },
             ],
             temperature: 0,
@@ -1599,11 +1623,11 @@ async function loadUltraImac(onProgress) {
    エンジンだけになった。通常版（ONNX）・軽量エンジン（GGUF版）の
    振り分けは互換のため残してあるが、どちらも UI からは到達
    できない。回答フロー・バッジ・出典表示はどのエンジンでも同一。 */
-async function generateUltra(prompt) {
-  if (UltraImacModel.ready) return UltraImacModel.generate(prompt);
+async function generateUltra(prompt, historyMessages) {
+  if (UltraImacModel.ready) return UltraImacModel.generate(prompt, historyMessages);
   return UltraGgufModel.ready
-    ? UltraGgufModel.generate(prompt)
-    : UltraModel.generate(prompt);
+    ? UltraGgufModel.generate(prompt, historyMessages)
+    : UltraModel.generate(prompt, historyMessages);
 }
 
 /* Ultra のエンジンをすべて破棄する（他のモデルが選択されたとき）。 */
@@ -1617,8 +1641,8 @@ function disposeUltra() {
    サーバーモデル（Twin / Pro / Max）は iMac サーバーの ServerModel、
    それ以外（Nano / Flash）は端末内の LocalModel。LocalModel.generate
    は同期だが、呼び出し側は常に await するので形をそろえてある。 */
-async function generateForModel(id, question) {
-  if (id === "ultra") return generateUltra(question);
+async function generateForModel(id, question, opts) {
+  if (id === "ultra") return generateUltra(question, opts && opts.historyMessages);
   if (modelDef(id).engine === "server") return ServerModel.generate(id, question);
   return LocalModel.generate(question, modelDef(id).maxNew);
 }
@@ -1750,6 +1774,13 @@ function localDateKey(d) {
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+/* 履歴リストの日付表示（ISO → "11/17"）。解釈できなければ空。 */
+function formatHistoryDate(iso) {
+  const d = new Date(iso || "");
+  if (Number.isNaN(d.getTime())) return "";
+  return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
 /* "2026-11-19" -> "11月19日"（材料の文章用）。 */
@@ -5262,6 +5293,42 @@ function parseWeatherQuery(q) {
   const te = new TextEncoder();
   const td = new TextDecoder("utf-8"); // non-fatal ~= errors="replace"
 
+  /* Search round 2 (2026-11-17): LRU cache helpers. The engine's
+   * caches used to be wiped wholesale once they passed a size cap
+   * (this._blocks.clear() at 257 entries, _idRecs/_leads.clear() at
+   * 8193, _termCache.clear() at 513), and the lane transport wiped its
+   * whole 96MB range cache on overflow. Measurement notes: the
+   * _blocks cap (256 shared ~64KB blocks across titles/redir/tri
+   * directories) and the transport wipe were the refetch multipliers
+   * that actually fired; the record caches' clear-all was a cliff
+   * that rarely fired because primes bypass it, so their LRU caps
+   * are sized as safety valves (see below), not working-set limits.
+   * IO-only change: cached values are identical, ranking untouched. */
+  function cacheGet(map, key) {
+    const v = map.get(key);
+    if (v !== undefined) { map.delete(key); map.set(key, v); }
+    return v;
+  }
+  function cacheSet(map, key, val, cap) {
+    if (map.has(key)) map.delete(key);
+    map.set(key, val);
+    while (map.size > cap) map.delete(map.keys().next().value);
+  }
+  /* Cap sizes (search round 2, revised after measurement): the
+   * prime path caches every gid inside a fetched ids span, and later
+   * primes/searches rely on those span-covered records being present
+   * (restricting the cache to requested gids only measured WORSE:
+   * ids.bin requests x7, bytes x3.9). So the caps are sized to hold
+   * the realistic session working set — up to the full 1.52M-record
+   * ids table — and act purely as LRU safety valves against the old
+   * clear-all cliff, not as working-set limits. */
+  const BLOCKS_CACHE_BYTES = 64 * 1024 * 1024; // ~64KB blocks -> ~1000
+  const IDREC_CACHE_CAP = 1600000;             // tiny fixed-size recs
+  const LEAD_CACHE_CAP = 98304;                // ~1.2KB lead texts
+  const TERM_CACHE_CAP = 1024;
+  const TRI_ENTRY_CACHE_CAP = 32768;
+  const POST_CACHE_IDS_CAP = 3000000;          // parsed posting ids
+
   // ------------------------------------------------------------ helpers
   const cps = (s) => [...s];
   const cpLen = (s) => [...s].length;
@@ -5494,9 +5561,13 @@ function parseWeatherQuery(q) {
       this.claims = null;     // [[gid, scope], ...]
       this.categories = null; // {cat: [gid, ...]}
       this._blocks = new Map();   // file@off -> Uint8Array
+      this._blocksBytes = 0;      // search round 2: byte-capped LRU
       this._leads = new Map();    // gid -> {title, lead}
       this._idRecs = new Map();   // gid -> rec|null
       this._termCache = new Map(); // src|term -> Map(gid -> score)
+      this._triEntries = new Map(); // (t|b)+trigram -> {off,len,df}|null
+      this._postLists = new Map();  // file|off -> {p, n} parsed postings
+      this._postIds = 0;            // total ids held in _postLists
       this.stats = { requests: 0, bytes: 0 };
     }
 
@@ -5512,11 +5583,22 @@ function parseWeatherQuery(q) {
     }
     async _block(file, off, size) {
       const key = file + "@" + off;
-      const hit = this._blocks.get(key);
+      const hit = cacheGet(this._blocks, key);
       if (hit) return hit;
       const buf = await this._range(file, off, off + size - 1);
-      if (this._blocks.size > 256) this._blocks.clear();
+      if (this._blocks.has(key)) {
+        this._blocksBytes -= this._blocks.get(key).length;
+        this._blocks.delete(key);
+      }
       this._blocks.set(key, buf);
+      this._blocksBytes += buf.length;
+      while (this._blocksBytes > BLOCKS_CACHE_BYTES &&
+             this._blocks.size > 1) {
+        const oldest = this._blocks.keys().next().value;
+        if (oldest === key) break;
+        this._blocksBytes -= this._blocks.get(oldest).length;
+        this._blocks.delete(oldest);
+      }
       return buf;
     }
 
@@ -5694,7 +5776,7 @@ function parseWeatherQuery(q) {
 
     // ------------------------------------------------------------ records
     async idRecord(gid) {
-      if (this._idRecs.has(gid)) return this._idRecs.get(gid);
+      if (this._idRecs.has(gid)) return cacheGet(this._idRecs, gid);
       const stride = this.meta.id_stride;
       const buf = await this._range("ids.bin", gid * stride,
                                     gid * stride + stride - 1);
@@ -5707,13 +5789,14 @@ function parseWeatherQuery(q) {
                 bodyOff: Number(dv.getBigUint64(6, true)),
                 bodyLen: dv.getUint32(14, true), bodyId: buf[18] };
       }
-      if (this._idRecs.size > 8192) this._idRecs.clear();
-      this._idRecs.set(gid, rec);
+      cacheSet(this._idRecs, gid, rec, IDREC_CACHE_CAP);
       return rec;
     }
     async leadOf(rec) {
       const gid = rec.id;
-      if (gid !== undefined && this._leads.has(gid)) return this._leads.get(gid);
+      if (gid !== undefined && this._leads.has(gid)) {
+        return cacheGet(this._leads, gid);
+      }
       const buf = await this._range("leads.bin", rec.leadOff,
                                     rec.leadOff + rec.leadLen - 1);
       const text = td.decode(buf);
@@ -5721,8 +5804,7 @@ function parseWeatherQuery(q) {
       const out = { title: nl >= 0 ? text.slice(0, nl) : text,
                     lead: nl >= 0 ? text.slice(nl + 1) : "" };
       if (gid !== undefined) {
-        if (this._leads.size > 8192) this._leads.clear();
-        this._leads.set(gid, out);
+        cacheSet(this._leads, gid, out, LEAD_CACHE_CAP);
       }
       return out;
     }
@@ -5742,7 +5824,8 @@ function parseWeatherQuery(q) {
           prev = missing[i];
         }
         spans.push([s, prev]);
-        await mapLimit(spans, 4, async ([lo, hi]) => {
+        // Search round 2: span fetches 4 -> 16 concurrent ( ditto ).
+        await mapLimit(spans, 16, async ([lo, hi]) => {
           const buf = await this._range("ids.bin", lo * stride,
                                         hi * stride + stride - 1);
           const dv = new DataView(buf.buffer, buf.byteOffset);
@@ -5757,7 +5840,7 @@ function parseWeatherQuery(q) {
                       bodyLen: dv.getUint32(o + 14, true),
                       bodyId: buf[o + 18] };
             }
-            this._idRecs.set(g, rec);
+            cacheSet(this._idRecs, g, rec, IDREC_CACHE_CAP);
           }
         });
       }
@@ -5781,7 +5864,9 @@ function parseWeatherQuery(q) {
         } else { spans.push(cur); cur = [r]; curEnd = r.leadOff + r.leadLen; }
       }
       spans.push(cur);
-      await mapLimit(spans, 6, async (recs) => {
+      // Search round 2: span fetches 6 -> 24 concurrent (the lane
+      // transport semaphore caps total in-flight at 24).
+      await mapLimit(spans, 24, async (recs) => {
         const lo = recs[0].leadOff;
         let hi = 0;
         for (const r of recs) hi = Math.max(hi, r.leadOff + r.leadLen);
@@ -5790,9 +5875,9 @@ function parseWeatherQuery(q) {
           const text = td.decode(buf.subarray(
             r.leadOff - lo, r.leadOff - lo + r.leadLen));
           const nl = text.indexOf("\n");
-          this._leads.set(r.id, {
+          cacheSet(this._leads, r.id, {
             title: nl >= 0 ? text.slice(0, nl) : text,
-            lead: nl >= 0 ? text.slice(nl + 1) : "" });
+            lead: nl >= 0 ? text.slice(nl + 1) : "" }, LEAD_CACHE_CAP);
         }
       });
     }
@@ -5822,6 +5907,17 @@ function parseWeatherQuery(q) {
 
     // ------------------------------------------------------------ FTS pool
     async _trigramEntry(tg, titleOnly) {
+      // Search round 2: memoize the directory lookup itself. The same
+      // trigrams recur across the many terms/searches of one question;
+      // without this, each recurrence re-scans (and, on block-cache
+      // eviction, re-fetches) a ~64KB directory block.
+      const ck = (titleOnly ? "t|" : "b|") + tg;
+      if (this._triEntries.has(ck)) return cacheGet(this._triEntries, ck);
+      const ent = await this._trigramEntryFetch(tg, titleOnly);
+      cacheSet(this._triEntries, ck, ent, TRI_ENTRY_CACHE_CAP);
+      return ent;
+    }
+    async _trigramEntryFetch(tg, titleOnly) {
       const superIdx = titleOnly ? this.titleTriSuper : this.triSuper;
       const dirFile = titleOnly ? "title_tri_dir.bin" : "tri_dir.bin";
       const kb = te.encode(tg);
@@ -5845,19 +5941,58 @@ function parseWeatherQuery(q) {
       return null;
     }
     async _postings(entry, titleOnly) {
+      // Search round 2: cache the parsed id list per postings range.
+      // termScores() intersects the same term once per source, and the
+      // evidence lanes re-run the same terms across searches; without
+      // this, every recurrence re-parses (and, after transport-cache
+      // eviction, re-fetches) up to 1MB of varints. Values are the
+      // exact arrays the uncached path would return.
       const file = titleOnly ? "title_postings.bin" : "postings.bin";
-      const len = Math.min(entry.len, MAX_POSTING_BYTES);
-      const buf = await this._range(file, entry.off, entry.off + len - 1);
-      const ids = [];
-      let p = 0, cur = 0;
-      while (p < buf.length) {
-        let d;
-        [d, p] = readVarint(buf, p);
-        if (p > buf.length || (buf[p - 1] & 0x80)) break; // truncated tail
-        cur += d;
-        ids.push(cur);
+      const key = file + "|" + entry.off;
+      const hit = this._postLists.get(key);
+      if (hit) {
+        this._postLists.delete(key);
+        this._postLists.set(key, hit);
+        return hit.p;
       }
-      return ids;
+      const rec = { p: null, n: -1 };
+      rec.p = (async () => {
+        const len = Math.min(entry.len, MAX_POSTING_BYTES);
+        const buf = await this._range(file, entry.off, entry.off + len - 1);
+        const ids = [];
+        let p = 0, cur = 0;
+        while (p < buf.length) {
+          let d;
+          [d, p] = readVarint(buf, p);
+          if (p > buf.length || (buf[p - 1] & 0x80)) break; // truncated tail
+          cur += d;
+          ids.push(cur);
+        }
+        return ids;
+      })();
+      this._postLists.set(key, rec);
+      rec.p.then(
+        (ids) => {
+          rec.n = ids.length;
+          this._postIds += ids.length;
+          while (this._postIds > POST_CACHE_IDS_CAP) {
+            let evicted = false;
+            for (const [k, e] of this._postLists) {
+              if (e !== rec && e.n >= 0) {
+                this._postLists.delete(k);
+                this._postIds -= e.n;
+                evicted = true;
+                break;
+              }
+            }
+            if (!evicted) break;
+          }
+        },
+        () => {
+          if (this._postLists.get(key) === rec) this._postLists.delete(key);
+        },
+      );
+      return rec.p;
     }
     async _intersect(term, titleOnly) {
       const tris = [...new Set(trigramsOf(term))];
@@ -5881,7 +6016,7 @@ function parseWeatherQuery(q) {
      * Map(gid -> score) over verified docs (see header note). */
     async termScores(src, term) {
       const ck = src + "|" + term;
-      if (this._termCache.has(ck)) return this._termCache.get(ck);
+      if (this._termCache.has(ck)) return cacheGet(this._termCache, ck);
       const out = new Map();
       const all = await this._intersect(term, false);
       const inSrc = all.filter((g) => this.srcOf(g) === src);
@@ -5914,8 +6049,7 @@ function parseWeatherQuery(q) {
           if (sc > 0) out.set(gid, sc);
         });
       }
-      if (this._termCache.size > 512) this._termCache.clear();
-      this._termCache.set(ck, out);
+      cacheSet(this._termCache, ck, out, TERM_CACHE_CAP);
       return out;
     }
     /** search.py's per-source MATCH ... ORDER BY bm25 LIMIT n, as a
@@ -6575,7 +6709,8 @@ function parseWeatherQuery(q) {
  * BROWSER_INDEX_FULL.md.
  *
  * Guarantees for the host app:
- * - bounded concurrency (default 12 in-flight requests),
+ * - bounded concurrency (default 24 in-flight requests; search round 2,
+ *   originally 12),
  * - a timeout on every request (default 20s, AbortController),
  * - an in-session cache for fetched ranges (repeat questions are
  *   fast; byte-capped, wholesale eviction like the engine's own),
@@ -6648,7 +6783,17 @@ function parseWeatherQuery(q) {
   }
 
   function createIndexTransport(indexBase, bodyBase, opts = {}) {
-    const maxConc = opts.concurrency ?? 12;
+    // Search round 2: default concurrency 12 -> 24. Per-question
+    // request counts are dominated by first-touch fetches of distinct
+    // index ranges (measured on the 50-question bench: 64,960 of
+    // 69,606 requests are leads.bin spans), which caching cannot
+    // remove; the parallel bulk (record primes, re-rank reads) is
+    // semaphore-bound, so doubling in-flight requests is the lever
+    // that cuts device wall time. The per-question budget (60k
+    // requests / 150s in ask()) still bounds total load. NOTE: the
+    // gain is a device-side model (offline shards are local disk and
+    // cannot measure HF RTT); reverting is this one constant.
+    const maxConc = opts.concurrency ?? 24;
     const timeoutMs = opts.timeoutMs ?? 20000;
     const cacheCapBytes = opts.cacheBytes ?? 96 * 1024 * 1024;
     const sem = makeSemaphore(maxConc);
@@ -6733,6 +6878,9 @@ function parseWeatherQuery(q) {
       const hit = cache.get(key);
       if (hit) {
         stats.cacheHits += 1;
+        // Search round 2: LRU recency refresh on hit.
+        cache.delete(key);
+        cache.set(key, hit);
         return hit.p;
       }
       const entry = { p: null, bytes: 0 };
@@ -6742,8 +6890,16 @@ function parseWeatherQuery(q) {
         (buf) => {
           entry.bytes = buf.length;
           cacheBytes += buf.length;
+          // Search round 2: evict oldest resolved entries down to 95%
+          // of the cap instead of wiping the whole cache. The old
+          // wipe-on-overflow meant one heavy question (postings alone
+          // can exceed the 96MB cap) destroyed every cached range and
+          // the rest of the question re-fetched blocks, bodies and
+          // leads it had already paid for.
           if (cacheBytes > cacheCapBytes) {
+            const target = Math.floor(cacheCapBytes * 0.95);
             for (const [k, e] of cache) {
+              if (cacheBytes <= target) break;
               if (e !== entry && e.bytes > 0) {
                 cache.delete(k);
                 cacheBytes -= e.bytes;
@@ -9137,6 +9293,7 @@ const App = {
   init() {
     Notebook.load();
     this.initMemory();
+    this.initAccount();
     // 選択中のモデルを復元する（初期値は v1）。ベースURLはモデルごとの
     // 上書きとして読み込む（v1 は従来キー、v2 / Twin / Pro / Max は専用キー）。
     const savedId = store.get(MODEL_ID_KEY);
@@ -9744,6 +9901,7 @@ const App = {
     bubble.appendChild(p);
     li.appendChild(bubble);
     el("msg-list").appendChild(li);
+    this.historyCaptureUser(text);
     this.scrollChat();
   },
 
@@ -9792,6 +9950,7 @@ const App = {
       li.appendChild(n);
     }
     el("msg-list").appendChild(li);
+    this.historyCaptureAssistant(msg);
     this.scrollChat();
   },
 
@@ -9975,6 +10134,7 @@ const App = {
     p.textContent = text;
     li.appendChild(p);
     el("msg-list").appendChild(li);
+    this.historyCaptureNotice(text);
     this.scrollChat();
   },
 
@@ -10228,6 +10388,410 @@ const App = {
     if (isTautologicalAnswer(entry.answer)) return;
     Notebook.add(entry);
     el("nb-tab-count").textContent = ` (${Notebook.items.length})`;
+  },
+
+  /* ---- Cube アカウントとチャット履歴（cube_account.js） ---- */
+
+  /* アカウントマネージャ（initAccount で設定。config 未設定・
+     モジュール未読込の環境では null のままで、アカウント機能と
+     履歴は一切動かない＝従来挙動と完全同一）。 */
+  account: null,
+
+  /* 履歴ストア（ローカル保存＋ログイン時のクラウド同期）。
+     無効な環境では null。 */
+  historyStore: null,
+
+  /* いま開いている会話 {id,title,created_at,updated_at,turns}。
+     まだ何も話していない間は null で、最初の発言で作られる。 */
+  historyCurrent: null,
+
+  /* 履歴から開いた（再開した）会話かどうか。再開した会話では、
+     続きの質問に文脈を引き継ぐ（Ultra は履歴メッセージ列、
+     自作モデルは直近のやり取りの抜粋）。 */
+  historyResumed: false,
+
+  /* 履歴の復元中はキャプチャを止めるための印。 */
+  historyRestoring: false,
+
+  historyRenderSeq: 0,
+
+  /* アカウントと履歴の初期化。CUBE_ACCOUNT_CONFIG が空の間は
+     何もしない（アカウント領域・履歴 UI は hidden のまま）。 */
+  initAccount() {
+    this.account = null;
+    this.historyStore = null;
+    try {
+      if (typeof CubeAccount === "undefined") return;
+      if (!CubeAccount.isConfigured(CUBE_ACCOUNT_CONFIG)) return;
+      const mgr = CubeAccount.createManager({
+        config: CUBE_ACCOUNT_CONFIG,
+        clientFactory:
+          (typeof window !== "undefined" &&
+            window.__CUBE_ACCOUNT_CLIENT_FACTORY__) || undefined,
+      });
+      if (!mgr.enabled) return;
+      this.account = mgr;
+      this.historyStore = CubeAccount.makeCloudHistoryStore(
+        CubeAccount.makeLocalHistoryStore(),
+        mgr,
+      );
+      const loginBtn = el("account-login-btn");
+      if (loginBtn) {
+        loginBtn.addEventListener("click", () => void this.accountSignIn());
+      }
+      const logoutBtn = el("account-logout-btn");
+      if (logoutBtn) {
+        logoutBtn.addEventListener("click", () => void this.accountSignOut());
+      }
+      const newChat = el("new-chat-btn");
+      if (newChat) {
+        newChat.addEventListener("click", (e) => {
+          e.preventDefault();
+          this.newConversation();
+        });
+      }
+      mgr.onChange(() => void this.handleAccountChange());
+      this.renderAccount();
+      void mgr
+        .init()
+        .then(() => this.handleAccountChange())
+        .catch(() => this.renderAccount());
+      void this.renderHistoryList();
+    } catch {
+      this.account = null;
+      this.historyStore = null;
+    }
+  },
+
+  /* サイドバーのアカウント領域を、認証状態に合わせて描く。 */
+  renderAccount() {
+    const area = el("account-area");
+    if (!area) return;
+    const mgr = this.account;
+    if (!mgr || !mgr.enabled) {
+      area.hidden = true;
+      return;
+    }
+    area.hidden = false;
+    const user = mgr.user;
+    const loginBtn = el("account-login-btn");
+    const userBox = el("account-user");
+    const note = el("account-note");
+    if (user) {
+      if (loginBtn) loginBtn.hidden = true;
+      if (userBox) userBox.hidden = false;
+      const nameEl = el("account-name");
+      if (nameEl) nameEl.textContent = user.name || user.email || "ログイン中";
+      const av = el("account-avatar");
+      if (av) {
+        if (user.avatarUrl) {
+          av.src = user.avatarUrl;
+          av.hidden = false;
+        } else {
+          av.hidden = true;
+        }
+      }
+      if (note) note.textContent = "ログイン中：会話履歴はアカウントに同期されます";
+    } else {
+      if (loginBtn) loginBtn.hidden = false;
+      if (userBox) userBox.hidden = true;
+      if (note) note.textContent = "ログインすると会話履歴を他の端末と同期できます";
+    }
+  },
+
+  /* 認証状態が変わったら：アカウント表示を更新し、履歴を
+     クラウドと突き合わせてリストを取り直す。 */
+  async handleAccountChange() {
+    this.renderAccount();
+    await this.renderHistoryList();
+  },
+
+  async accountSignIn() {
+    if (!this.account) return;
+    try {
+      await this.account.signInWithGoogle();
+    } catch {
+      /* 遷移できなかった場合はそのまま（未ログインで使い続ける） */
+    }
+  },
+
+  async accountSignOut() {
+    if (!this.account) return;
+    try {
+      await this.account.signOut();
+    } catch {
+      /* ログアウトの失敗は表示側だけでも未ログインに倒す */
+    }
+    this.renderAccount();
+    await this.renderHistoryList();
+  },
+
+  /* --- 履歴へのキャプチャ（描画フックから呼ばれる） --- */
+
+  historyEnsureCurrent(firstText) {
+    if (!this.historyCurrent) {
+      const now = new Date().toISOString();
+      this.historyCurrent = {
+        id: CubeAccount.newConversationId(),
+        title: CubeAccount.titleFromQuestion(firstText),
+        created_at: now,
+        updated_at: now,
+        turns: [],
+      };
+      this.historyResumed = false;
+    }
+    return this.historyCurrent;
+  },
+
+  historyCaptureUser(text) {
+    if (!this.historyStore || this.historyRestoring) return;
+    try {
+      const conv = this.historyEnsureCurrent(text);
+      conv.turns.push({ role: "user", text: String(text) });
+      conv.updated_at = new Date().toISOString();
+      this.persistCurrentConversation();
+    } catch {
+      /* 履歴の失敗は会話を妨げない */
+    }
+  },
+
+  historyCaptureAssistant(msg) {
+    if (!this.historyStore || this.historyRestoring) return;
+    try {
+      if (!this.historyCurrent) return;
+      const turn = { role: "ai", text: String((msg && msg.text) || "") };
+      for (const k of
+        ["badge", "evidence", "modelSaid", "sourceUrl", "sourceTitle", "note"]) {
+        if (msg && typeof msg[k] === "string" && msg[k]) turn[k] = msg[k];
+      }
+      this.historyCurrent.turns.push(turn);
+      this.historyCurrent.updated_at = new Date().toISOString();
+      this.persistCurrentConversation();
+    } catch {
+      /* 履歴の失敗は会話を妨げない */
+    }
+  },
+
+  /* 記憶の通知（覚えました等）も、表示されたとおりに残す。 */
+  historyCaptureNotice(text) {
+    if (!this.historyStore || this.historyRestoring) return;
+    try {
+      if (!this.historyCurrent) return;
+      this.historyCurrent.turns.push({
+        role: "ai", text: String(text), badge: "memory", memnote: true,
+      });
+      this.historyCurrent.updated_at = new Date().toISOString();
+      this.persistCurrentConversation();
+    } catch {
+      /* 履歴の失敗は会話を妨げない */
+    }
+  },
+
+  persistCurrentConversation() {
+    const conv = this.historyCurrent;
+    if (!conv || !this.historyStore) return;
+    let snapshot;
+    try {
+      snapshot = JSON.parse(JSON.stringify(conv));
+    } catch {
+      return;
+    }
+    void this.historyStore
+      .saveConversation(snapshot)
+      .then(() => this.renderHistoryList())
+      .catch(() => {
+        /* 保存の失敗は会話を妨げない */
+      });
+  },
+
+  /* --- 続きの文脈（履歴から再開した会話だけ） --- */
+
+  /* 現在の質問（最後の user ターン）を除いた、完了したやり取り
+     （user/ai の組）だけを返す。再開した会話でなければ null。 */
+  historyPriorTurns() {
+    if (!this.historyStore || !this.historyResumed || !this.historyCurrent) {
+      return null;
+    }
+    const turns = this.historyCurrent.turns || [];
+    const prior =
+      turns.length && turns[turns.length - 1].role === "user"
+        ? turns.slice(0, -1)
+        : turns.slice();
+    const usable = prior.filter(
+      (t) => t.role === "user" || (t.role === "ai" && !t.memnote),
+    );
+    return usable.length ? usable : null;
+  },
+
+  /* Ultra 用：直近のターンを ChatML のメッセージ列にする。
+     llama-server の文脈長（-c 2048）に収めるため、直近6ターン・
+     1ターン240字・合計900字で古い順に切り捨てる（モデルによる
+     要約はしない：追加生成のコストと、未検証文を文脈に固定する
+     リスクを避ける。設計書 ACCOUNT_DESIGN.md 参照）。 */
+  historyMessagesForUltra() {
+    const prior = this.historyPriorTurns();
+    if (!prior) return null;
+    const picked = [];
+    let used = 0;
+    for (let i = prior.length - 1; i >= 0 && picked.length < 6; i--) {
+      let text = String(prior[i].text || "");
+      if (text.length > 240) text = text.slice(0, 240) + "…";
+      if (picked.length > 0 && used + text.length > 900) break;
+      picked.unshift({
+        role: prior[i].role === "user" ? "user" : "assistant",
+        content: text,
+      });
+      used += text.length;
+    }
+    return picked.length ? picked : null;
+  },
+
+  /* 自作モデル用：直近のやり取りの抜粋を質問の末尾に添える
+     （記憶の装飾と同じ流儀で、QA 形式の中に収める）。再開した
+     会話でない・前のやり取りが無い場合は質問をそのまま返す
+     （バイト単位で同一＝通常質問への回帰なし）。 */
+  historyDecorate(question) {
+    const prior = this.historyPriorTurns();
+    if (!prior) return question;
+    const pairs = [];
+    for (let i = prior.length - 1; i >= 1 && pairs.length < 2; i--) {
+      if (prior[i].role === "ai" && prior[i - 1].role === "user") {
+        pairs.unshift([prior[i - 1], prior[i]]);
+        i--;
+      }
+    }
+    if (!pairs.length) return question;
+    const clip = (s, n) => {
+      const t = String(s || "");
+      return t.length > n ? t.slice(0, n) + "…" : t;
+    };
+    const parts = pairs.map(
+      ([u, a]) => `質問「${clip(u.text, 50)}」に「${clip(a.text, 80)}」と答えた`,
+    );
+    const suffix = `（これまでのやり取り：${parts.join("。")}）`;
+    if (suffix.length > 260) return question;
+    return question + suffix;
+  },
+
+  /* --- 会話の切り替え・新規・削除 --- */
+
+  clearMessages() {
+    const list = el("msg-list");
+    if (!list) return;
+    while (list.children.length) list.removeChild(list.children[0]);
+    list.textContent = "";
+  },
+
+  /* 新規チャット：いまの会話は履歴に残したまま、空の会話にする。
+     生成中は切り替えない（回答の行き先がずれるため）。 */
+  newConversation() {
+    if (!this.historyStore || this.phase !== "idle") return;
+    this.historyCurrent = null;
+    this.historyResumed = false;
+    this.clearMessages();
+    const empty = el("empty-state");
+    if (empty) empty.hidden = false;
+    this.showTab("chat");
+    void this.renderHistoryList();
+  },
+
+  /* 履歴から会話を開く：ターンをそのまま再描画し、その会話の
+     続きとして話せる状態にする（historyResumed を立てる）。
+     生成中は切り替えない。 */
+  async openConversation(id) {
+    if (!this.historyStore || this.phase !== "idle") return;
+    let conv = null;
+    try {
+      conv = await this.historyStore.loadConversation(id);
+    } catch {
+      conv = null;
+    }
+    if (!conv) return;
+    this.historyRestoring = true;
+    try {
+      this.clearMessages();
+      for (const turn of conv.turns || []) {
+        if (turn.role === "user") this.pushUser(turn.text);
+        else if (turn.memnote) this.pushMemoryNotice(turn.text);
+        else this.pushAssistant(turn);
+      }
+    } finally {
+      this.historyRestoring = false;
+    }
+    this.historyCurrent = conv;
+    this.historyResumed = true;
+    const empty = el("empty-state");
+    if (empty) empty.hidden = (conv.turns || []).length > 0;
+    this.showTab("chat");
+    this.scrollChat();
+    void this.renderHistoryList();
+  },
+
+  async deleteConversation(id) {
+    if (!this.historyStore) return;
+    try {
+      await this.historyStore.deleteConversation(id);
+    } catch {
+      /* 削除の失敗は表示側の更新だけ行う */
+    }
+    if (this.historyCurrent && this.historyCurrent.id === id) {
+      this.historyCurrent = null;
+      this.historyResumed = false;
+      this.clearMessages();
+      const empty = el("empty-state");
+      if (empty) empty.hidden = false;
+    }
+    void this.renderHistoryList();
+  },
+
+  /* サイドバーの履歴リストを描く（新しい順・表示中の会話を強調）。 */
+  async renderHistoryList() {
+    const group = el("history-group");
+    const listEl = el("history-list");
+    if (!group || !listEl) return;
+    if (!this.historyStore) {
+      group.hidden = true;
+      return;
+    }
+    group.hidden = false;
+    const seq = ++this.historyRenderSeq;
+    let convs = [];
+    try {
+      convs = await this.historyStore.listConversations();
+    } catch {
+      convs = [];
+    }
+    if (seq !== this.historyRenderSeq) return; // 古い描画は捨てる
+    while (listEl.children.length) listEl.removeChild(listEl.children[0]);
+    const emptyNote = el("history-empty");
+    if (emptyNote) emptyNote.hidden = convs.length > 0;
+    for (const c of convs) {
+      const li = document.createElement("li");
+      li.className =
+        "history-item" +
+        (this.historyCurrent && this.historyCurrent.id === c.id
+          ? " active"
+          : "");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "history-open";
+      const title = document.createElement("span");
+      title.className = "history-title";
+      title.textContent = c.title || "無題の会話";
+      const date = document.createElement("span");
+      date.className = "history-date mono";
+      date.textContent = formatHistoryDate(c.updated_at);
+      btn.append(title, date);
+      btn.addEventListener("click", () => void this.openConversation(c.id));
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "history-del";
+      del.textContent = "×";
+      del.setAttribute("aria-label", "この会話を削除");
+      del.addEventListener("click", () => void this.deleteConversation(c.id));
+      li.append(btn, del);
+      listEl.appendChild(li);
+    }
   },
 
   /* 質問への回答の流れ：
@@ -10521,10 +11085,22 @@ const App = {
         // 記憶の注入：Ultra はシステムプロンプト側（入口で差し替え
         // 済み）。自作モデルは QA 形式に文脈枠が無いため、関連が強い
         // 記憶だけを質問の末尾に短く添える（無関係なら無変更）。
-        const genQuestion = this.modelId === "ultra"
-          ? question
-          : this.memoryDecorate(question);
-        modelAnswer = await generateForModel(this.modelId, genQuestion);
+        // 続きの文脈：履歴から再開した会話のときだけ、直近のやり
+        // 取りを引き継ぐ。Ultra は履歴をメッセージ列として渡し、
+        // 自作モデルは抜粋を質問の末尾に添える。再開していない
+        // 会話ではどちらも付けない（従来とバイト単位で同一）。
+        // 検算（手順2）・読解・ブリーフィングの生成には付けない。
+        let historyMessages = null;
+        let genQuestion;
+        if (this.modelId === "ultra") {
+          genQuestion = question;
+          historyMessages = this.historyMessagesForUltra();
+        } else {
+          genQuestion = this.historyDecorate(this.memoryDecorate(question));
+        }
+        modelAnswer = await generateForModel(this.modelId, genQuestion, {
+          historyMessages,
+        });
         if (!modelAnswer) modelIssue = "empty";
       } catch (e) {
         modelAnswer = "";

@@ -21,7 +21,7 @@
           </span>
         </div>
 
-        <a class="new-chat" href="">
+        <a class="new-chat" id="new-chat-btn" href="">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
           新規チャット
         </a>
@@ -78,8 +78,28 @@
           </nav>
         </div>
 
+        <!-- チャット履歴：アカウント機能が有効なときだけ表示される
+             （config 未設定の間は hidden のまま＝従来表示と同一） -->
+        <div class="side-group" id="history-group" hidden>
+          <p class="side-label">履歴</p>
+          <ul id="history-list" class="history-list"></ul>
+          <p id="history-empty" class="history-empty">まだ履歴がありません</p>
+        </div>
+
         <!-- モデル状態：状態は常に正直に表示する -->
         <div class="side-foot">
+          <!-- アカウント：アカウント機能が有効なときだけ表示される -->
+          <div id="account-area" class="account-area" hidden>
+            <button type="button" id="account-login-btn" class="account-login-btn">
+              Googleでログイン
+            </button>
+            <div id="account-user" class="account-user" hidden>
+              <img id="account-avatar" class="account-avatar" alt="" hidden />
+              <span id="account-name" class="account-name"></span>
+              <button type="button" id="account-logout-btn" class="account-logout-btn">ログアウト</button>
+            </div>
+            <p id="account-note" class="account-note"></p>
+          </div>
           <span id="model-status" class="model-status mono" aria-label="モデル状態">
             <span class="dot" aria-hidden="true"></span>
             <span id="model-status-text">モデル未配置</span>
@@ -486,6 +506,7 @@
       </main>
     </div>
     <script src="cube_memory.js"></script>
+    <script src="cube_account.js"></script>
     <script src="script.js"></script>
   </body>
 </html>
