@@ -9431,6 +9431,40 @@ const App = {
     void this.loadModel(this.baseUrl);
     // 朝のブリーフィング（条件に合うときだけ、裏で静かに試す）。
     void this.maybeShowBriefing();
+    // PC操作パネル（cube_pc.js）。モジュールが無い環境では何もしない。
+    // 成否の文面はサーバー側の判定をそのまま出す（ここでは作らない）。
+    if (typeof CubePc !== "undefined") {
+      try {
+        const pcPanel = CubePc.createPanel({
+          container: el("cube-pc-panel"),
+          baseUrl: CUBE_SERVER_BASE_URL,
+        });
+        pcPanel.mount();
+        const pcOpen = el("cube-pc-open");
+        if (pcOpen) {
+          pcOpen.addEventListener("click", () => {
+            const s = el("cube-pc-panel");
+            if (s) s.hidden = !s.hidden;
+          });
+        }
+      } catch {
+        /* パネルの失敗は本体を妨げない */
+      }
+    }
+    // 電話デモパネル（cube_call_demo.js）。モジュールが無い環境では
+    // 何もしない。シナリオ取得に失敗してもパネル内に出るだけで、
+    // チャット本体には影響しない。音声読み上げフックは任意で、
+    // CubeVoice に一発読み上げ用の口が無いため渡さない（省略可の設計）。
+    if (typeof CubeCallDemo !== "undefined") {
+      try {
+        CubeCallDemo.createPanel(el("call-demo-panel"), {
+          baseUrl: CUBE_SERVER_BASE_URL,
+          voice: null,
+        });
+      } catch {
+        /* パネルの失敗は本体を妨げない */
+      }
+    }
   },
 
   showTab(name) {
@@ -9439,6 +9473,10 @@ const App = {
     }
     el("view-chat").hidden = name !== "chat";
     el("view-notebook").hidden = name !== "notebook";
+    const fcView = el("view-factcheck");
+    if (fcView) fcView.hidden = name !== "factcheck";
+    const labView = el("view-lab");
+    if (labView) labView.hidden = name !== "lab";
     const memView = el("view-memory");
     if (memView) memView.hidden = name !== "memory";
     el("view-settings").hidden = name !== "settings";
@@ -9995,6 +10033,19 @@ const App = {
       n.className = "note";
       n.textContent = msg.note;
       li.appendChild(n);
+    }
+    // 嘘チェック可視化：検証内訳パネルをこのメッセージに付ける
+    // （履歴から復元したメッセージでは保存済みの内訳を使う）。
+    const fcData = msg.factcheck || this._fcBreakdown;
+    if (fcData && typeof CubeFactCheck !== "undefined") {
+      this._fcBreakdown = null;
+      msg.factcheck = fcData;
+      try {
+        const panel = CubeFactCheck.renderPanel(fcData);
+        if (panel) li.appendChild(panel);
+      } catch {
+        /* パネルの失敗は会話を妨げない */
+      }
     }
     el("msg-list").appendChild(li);
     this.historyCaptureAssistant(msg);
@@ -10790,6 +10841,8 @@ const App = {
         ["badge", "evidence", "modelSaid", "sourceUrl", "sourceTitle", "note"]) {
         if (msg && typeof msg[k] === "string" && msg[k]) turn[k] = msg[k];
       }
+      // 嘘チェック可視化：検証内訳（プレーンなJSON）も一緒に残す。
+      if (msg && msg.factcheck) turn.factcheck = msg.factcheck;
       this.historyCurrent.turns.push(turn);
       this.historyCurrent.updated_at = new Date().toISOString();
       this.persistCurrentConversation();
@@ -11044,6 +11097,8 @@ const App = {
     const normalized = normalizeQuestion(question);
     // 今回の検索の失敗理由はここから集める（前の質問の理由を持ち越さない）。
     WikiNet.lastError = "";
+    // 嘘チェック可視化：前ターンの検証内訳を持ち越さない。
+    this._fcBreakdown = null;
 
     // 0) 天気：聞かれた時点の実データで答える。モデル・事実コア・
     // 知識メモ帳をすべて素通りする——天気は変わる情報なので、保存した
@@ -11384,6 +11439,20 @@ const App = {
     const gate = modelAnswer
       ? verifyModelAnswer(modelAnswer, question, { fact, article, results })
       : null;
+    // 嘘チェック可視化：ゲートの判定をそのまま内訳化する（表示専用で、
+    // 判定には一切関与しない）。モジュールが無い環境では何もしない。
+    if (gate && typeof CubeFactCheck !== "undefined") {
+      try {
+        this._fcBreakdown = CubeFactCheck.buildBreakdown({
+          question,
+          gate,
+          fact,
+          results,
+        });
+      } catch {
+        this._fcBreakdown = null;
+      }
+    }
 
     // 4) 事実の道（本命）：対象記事から抜いた種類つき事実で組み立てた答え。
     if (fact) {

@@ -75,6 +75,14 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 8h9M19 8h1M4 16h3M13 16h7"/><circle cx="16" cy="8" r="2.2"/><circle cx="10" cy="16" r="2.2"/></svg>
               設定
             </button>
+            <button type="button" class="tab-btn" data-tab="factcheck" aria-pressed="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M12 3.5 5 6v5.2c0 4.6 3 7.7 7 9.3 4-1.6 7-4.7 7-9.3V6z"/><path d="m9 11.6 2.2 2.2 4-4.2"/></svg>
+              嘘チェック
+            </button>
+            <button type="button" class="tab-btn" data-tab="lab" aria-pressed="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M10 3.5h4M10 3.5v5.2L5.4 17a2.3 2.3 0 0 0 2 3.5h9.2a2.3 2.3 0 0 0 2-3.5L14 8.7V3.5"/><path d="M8 15h8"/></svg>
+              おためし
+            </button>
           </nav>
         </div>
 
@@ -515,10 +523,44 @@
           </div>
         </div>
       </section>
+
+      <!-- 嘘チェック：中身は cube_factcheck.js が #fc-root に組み立てる -->
+      <section id="view-factcheck" class="view" hidden>
+        <div class="page-scroll">
+          <div class="page-inner">
+            <div id="fc-root" class="fc-root"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- おためし：PC操作パネル（cube_pc.js）と電話デモ（cube_call_demo.js） -->
+      <section id="view-lab" class="view" hidden>
+        <div class="page-scroll">
+          <div class="page-inner">
+            <section class="card">
+              <h3>PC操作</h3>
+              <p class="desc">
+                Cube が仮想PCを操作します。いまは試験運用中で、サーバーの
+                準備ができていないときは、その旨がパネルに表示されます。
+              </p>
+              <button id="cube-pc-open" type="button" class="primary-btn">PC操作パネルを開く</button>
+              <section id="cube-pc-panel" hidden></section>
+            </section>
+            <section class="card">
+              <h3>電話デモ</h3>
+              <div id="call-demo-panel"></div>
+            </section>
+          </div>
+        </div>
+      </section>
       </main>
     </div>
     <script src="cube_memory.js"></script>
     <script src="cube_account.js"></script>
+    <script src="cube_pc.js"></script>
+    <script src="cube_call_demo.js"></script>
+    <script src="cube_factcheck.js"></script>
     <script src="script.js"></script>
+    <script src="cube_voice.js"></script>
   </body>
 </html>
