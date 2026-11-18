@@ -976,6 +976,53 @@ const CUBE_ACCOUNT_CONFIG =
     publishableKey: "sb_publishable_8VCMVdBvYivEFVNA841N8g_EE7c8H3T",
   };
 
+/* Cubeポイント（グループ共通ポイント）。残高と台帳は Cube の
+   Supabase（points_balance / points_ledger）にあり、書き込みは
+   RPC（earn_points / spend_points）経由のみ。金額・1日上限・冪等は
+   サーバー側の関数が決め、ページは呼び出しと表示だけを行う。
+   ポイントは付加機能で、失敗してもチャットは一切妨げない。
+   未ログインでは貯まらない（表示も出さない）。 */
+const POINTS_TOPUP_MENU = [
+  { pct: 10, price: 25 },
+  { pct: 50, price: 100 },
+  { pct: 100, price: 180 },
+];
+/* トップアップで得た「メーター追加 %」の保持先（端末内）。
+   時間制メーターの残量そのものはまだページに実装がないため、
+   追加分はここに積み上げてポイント表示のそばに出す。将来の
+   メーター実装はこの値を読んで残量に足す。 */
+const POINTS_BONUS_KEY = "cube-points-meter-bonus-v1";
+
+/* JST（Asia/Tokyo）の日付キー "YYYY-MM-DD"。RPC 側の1日判定
+   （Asia/Tokyo の日付）とそろえるため、端末のタイムゾーンでは
+   なく JST で数える。 */
+function pointsJstDateKey(date) {
+  const d = date || new Date();
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Asia/Tokyo",
+      year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(d);
+    const pick = (t) => (parts.find((p) => p.type === t) || {}).value || "";
+    const y = pick("year"), m = pick("month"), dd = pick("day");
+    if (y && m && dd) return `${y}-${m}-${dd}`;
+  } catch { /* Intl が使えない環境では端末ローカルの日付で代替 */ }
+  return localDateKey(d);
+}
+
+/* ログインボーナスの冪等キー（RPC 側の想定形式と一致）。 */
+function pointsDailyLoginKey(date) {
+  return `daily_login:${pointsJstDateKey(date)}`;
+}
+
+let pointsTopupSeq = 0;
+/* トップアップの冪等キー。購入操作ごとに一意に発行する。 */
+function pointsNewTopupKey() {
+  pointsTopupSeq += 1;
+  return `meter_topup:${Date.now().toString(36)}_${pointsTopupSeq.toString(36)}` +
+    Math.floor(Math.random() * 1296).toString(36);
+}
+
 /* 記憶ビューの表示ラベル（モジュールの KIND_LABEL と同じ文言）。 */
 const MEM_KIND_LABELS = {
   user: "ユーザー", preference: "好み", decision: "決めたこと",
@@ -10397,6 +10444,23 @@ const App = {
      履歴は一切動かない＝従来挙動と完全同一）。 */
   account: null,
 
+  /* Cubeポイントの残高（未ログイン・未取得の間は null）。 */
+  pointsBalance: null,
+
+  /* ポイントで追加したメーター分（%、端末に保持）。 */
+  pointsBonusPct: 0,
+
+  /* ポイント処理（取得・付与・消費）の多重実行ガード。 */
+  pointsBusy: false,
+
+  /* ログインボーナスを試した相手 "userId:JST日付"。
+     同じ相手・同じ日にはページ内で再試行しない（RPC 側も冪等）。 */
+  pointsDailyFor: "",
+
+  /* トップアップの未確定キー（pct → 冪等キー）。結果不明の失敗の
+     あと再試行しても二重に引かれないよう、確定するまで使い回す。 */
+  pointsTopupKeys: {},
+
   /* 履歴ストア（ローカル保存＋ログイン時のクラウド同期）。
      無効な環境では null。 */
   historyStore: null,
@@ -10443,6 +10507,14 @@ const App = {
       if (logoutBtn) {
         logoutBtn.addEventListener("click", () => void this.accountSignOut());
       }
+      for (const item of POINTS_TOPUP_MENU) {
+        const btn = el(`points-topup-${item.pct}`);
+        if (btn) {
+          btn.addEventListener("click",
+            () => void this.pointsTopup(item.pct, item.price));
+        }
+      }
+      this.pointsLoadBonus();
       const newChat = el("new-chat-btn");
       if (newChat) {
         newChat.addEventListener("click", (e) => {
@@ -10497,12 +10569,15 @@ const App = {
       if (userBox) userBox.hidden = true;
       if (note) note.textContent = "ログインすると会話履歴を他の端末と同期できます";
     }
+    this.renderPoints();
   },
 
   /* 認証状態が変わったら：アカウント表示を更新し、履歴を
-     クラウドと突き合わせてリストを取り直す。 */
+     クラウドと突き合わせてリストを取り直す。ポイントも
+     ログイン状態に合わせて取り直す（失敗は静かに握る）。 */
   async handleAccountChange() {
     this.renderAccount();
+    void this.refreshPoints();
     await this.renderHistoryList();
   },
 
@@ -10524,6 +10599,157 @@ const App = {
     }
     this.renderAccount();
     await this.renderHistoryList();
+  },
+
+  /* --- Cubeポイント（付加機能。失敗はすべて静かに握る） --- */
+
+  /* ログイン中だけポイント用バックエンドを返す。 */
+  pointsBackend() {
+    const mgr = this.account;
+    if (!mgr || !mgr.enabled || !mgr.user) return null;
+    try {
+      return typeof mgr.pointsBackend === "function"
+        ? mgr.pointsBackend() : null;
+    } catch {
+      return null;
+    }
+  },
+
+  pointsLoadBonus() {
+    try {
+      const v = Number(localStorage.getItem(POINTS_BONUS_KEY));
+      this.pointsBonusPct =
+        Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+    } catch {
+      this.pointsBonusPct = 0;
+    }
+  },
+
+  pointsSaveBonus() {
+    try {
+      localStorage.setItem(POINTS_BONUS_KEY, String(this.pointsBonusPct));
+    } catch { /* 保存できなくても表示は続ける */ }
+  },
+
+  /* ポイント表示を認証状態と残高に合わせて描く。未ログインでは
+     領域ごと出さない。 */
+  renderPoints() {
+    const area = el("points-area");
+    if (!area) return;
+    const mgr = this.account;
+    if (!mgr || !mgr.enabled || !mgr.user) {
+      area.hidden = true;
+      return;
+    }
+    area.hidden = false;
+    const bal = el("points-balance");
+    if (bal) {
+      bal.textContent =
+        this.pointsBalance === null ? "…" : String(this.pointsBalance);
+    }
+    const bonus = el("points-bonus");
+    if (bonus) {
+      bonus.hidden = !(this.pointsBonusPct > 0);
+      const bp = el("points-bonus-pct");
+      if (bp) bp.textContent = String(this.pointsBonusPct);
+    }
+    for (const item of POINTS_TOPUP_MENU) {
+      const btn = el(`points-topup-${item.pct}`);
+      if (btn) btn.disabled = this.pointsBusy;
+    }
+  },
+
+  showPointsNote(text) {
+    const note = el("points-note");
+    if (note) note.textContent = text || "";
+  },
+
+  /* 残高を取り直し、今日のログインボーナス（1日1回）を付けに
+     行く。RPC は冪等なので多重実行しても二重付与にはならない。
+     付与前後の残高が増えたときだけ「+1 pt」を出す。 */
+  async refreshPoints() {
+    const backend = this.pointsBackend();
+    const mgr = this.account;
+    if (!backend || !mgr || !mgr.user) {
+      this.pointsBalance = null;
+      this.renderPoints();
+      return;
+    }
+    this.renderPoints();
+    if (this.pointsBusy) return;
+    this.pointsBusy = true;
+    try {
+      let balance = null;
+      try {
+        balance = await backend.fetchBalance();
+      } catch { /* 残高が取れなくても付与の試行は続ける */ }
+      const dailyFor = `${mgr.user.id}:${pointsJstDateKey()}`;
+      if (this.pointsDailyFor !== dailyFor) {
+        this.pointsDailyFor = dailyFor;
+        try {
+          const after = await backend.earn(
+            "daily_login", pointsDailyLoginKey(), { source: "cube_web" });
+          if (typeof after === "number") {
+            if (balance !== null && after > balance) {
+              this.showPointsNote("+1 pt（ログインボーナス）");
+            }
+            balance = after;
+          }
+        } catch { /* 付与できなくても残高表示は続ける */ }
+      }
+      if (typeof balance === "number") this.pointsBalance = balance;
+    } catch { /* ポイントの失敗は会話を妨げない */ }
+    this.pointsBusy = false;
+    this.renderPoints();
+  },
+
+  /* ポイントでメーター追加。消費は RPC が成功したときだけ起き、
+     成功したときだけ追加分を反映する。残高不足なら何も変えず
+     「ポイントが足りません」と出す。通信失敗など結果不明のときは
+     冪等キーを保持し、再試行で二重に引かれないようにする。 */
+  async pointsTopup(pct, price) {
+    const backend = this.pointsBackend();
+    if (!backend || this.pointsBusy) return false;
+    const item = POINTS_TOPUP_MENU
+      .find((m) => m.pct === pct && m.price === price);
+    if (!item) return false;
+    this.pointsBusy = true;
+    this.renderPoints();
+    try {
+      let key = this.pointsTopupKeys[pct];
+      if (!key) {
+        key = pointsNewTopupKey();
+        this.pointsTopupKeys[pct] = key;
+      }
+      const after = await backend.spend(
+        "meter_topup", item.price, key,
+        { pct: item.pct, source: "cube_web" });
+      delete this.pointsTopupKeys[pct];
+      if (typeof after === "number") this.pointsBalance = after;
+      this.pointsBonusPct += item.pct;
+      this.pointsSaveBonus();
+      this.showPointsNote(`メーターに +${item.pct}% 追加しました`);
+      this.pointsBusy = false;
+      this.renderPoints();
+      return true;
+    } catch (e) {
+      this.pointsBusy = false;
+      const msg = (e && e.message) || "";
+      if (msg.includes("insufficient_balance")) {
+        /* 確定した残高不足：キーは使い切り、残高だけ取り直す。 */
+        delete this.pointsTopupKeys[pct];
+        this.showPointsNote("ポイントが足りません");
+        try {
+          const b = await backend.fetchBalance();
+          if (typeof b === "number") this.pointsBalance = b;
+        } catch { /* 表示更新の失敗は静かに握る */ }
+      } else {
+        /* 結果不明：キーを保持して二重消費を防ぐ。 */
+        this.showPointsNote("追加できませんでした。通信を確認してもう一度どうぞ");
+      }
+      this.renderPoints();
+      return false;
+    }
   },
 
   /* --- 履歴へのキャプチャ（描画フックから呼ばれる） --- */
@@ -11633,6 +11859,8 @@ if (typeof module !== "undefined" && module.exports) {
     UltraGgufModel, loadUltraGguf,
     UltraImacModel, loadUltraImac, ULTRA_IMAC_BASE_URL, ULTRA_IMAC_UNREACHABLE,
     buildBriefingMaterial, trimBriefingTail, localDateKey, BRIEFING_DATE_KEY,
+    pointsJstDateKey, pointsDailyLoginKey, pointsNewTopupKey,
+    POINTS_TOPUP_MENU, POINTS_BONUS_KEY,
     ServerModel, generateForModel, CUBE_SERVER_BASE_URL, CUBE_SERVER_UNREACHABLE,
     readUltraStage, writeUltraStage,
     ULTRA_REPO, ULTRA_PARAM_COUNT, ULTRA_MAX_NEW_TOKENS,

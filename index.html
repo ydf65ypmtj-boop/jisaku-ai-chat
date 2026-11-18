@@ -98,6 +98,18 @@
               <span id="account-name" class="account-name"></span>
               <button type="button" id="account-logout-btn" class="account-logout-btn">ログアウト</button>
             </div>
+            <!-- Cubeポイント：ログイン中だけ表示される -->
+            <div id="points-area" class="points-area" hidden>
+              <p class="points-balance">Cubeポイント <span id="points-balance">…</span> pt</p>
+              <p id="points-bonus" class="points-bonus" hidden>メーター追加 +<span id="points-bonus-pct">0</span>%</p>
+              <div class="points-topup">
+                <span class="points-topup-label">ポイントでメーター追加</span>
+                <button type="button" id="points-topup-10" class="points-topup-btn">+10%（25pt）</button>
+                <button type="button" id="points-topup-50" class="points-topup-btn">+50%（100pt）</button>
+                <button type="button" id="points-topup-100" class="points-topup-btn">+100%（180pt）</button>
+              </div>
+              <p id="points-note" class="points-note" aria-live="polite"></p>
+            </div>
             <p id="account-note" class="account-note"></p>
           </div>
           <span id="model-status" class="model-status mono" aria-label="モデル状態">

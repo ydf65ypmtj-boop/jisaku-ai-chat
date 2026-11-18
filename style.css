@@ -229,6 +229,25 @@ body {
 .account-logout-btn:hover { color: var(--text); }
 .account-note { font-size: 11px; color: var(--dim); margin: 0; line-height: 1.5; }
 
+/* Cubeポイント（アカウント領域内・ログイン中のみ表示） */
+.points-area { display: flex; flex-direction: column; gap: 4px; }
+.points-balance { font-size: 12px; font-weight: 600; margin: 0; }
+.points-bonus { font-size: 11px; color: var(--dim); margin: 0; }
+.points-topup { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.points-topup-label { font-size: 11px; color: var(--dim); }
+.points-topup-btn {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit; font-size: 11px;
+  border-radius: 999px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.points-topup-btn:hover { background: var(--surface-alt); }
+.points-topup-btn:disabled { opacity: .5; cursor: default; }
+.points-note { font-size: 11px; color: var(--dim); margin: 0; line-height: 1.5; }
+
 /* サイドバー下部：モデル状態 */
 .side-foot {
   margin-top: auto;
