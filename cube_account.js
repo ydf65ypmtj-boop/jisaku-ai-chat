@@ -110,6 +110,7 @@
       async signOut() { /* 無効時は無動作 */ },
       onChange() { return () => {}; },
       backend() { return null; },
+      pointsBackend() { return null; },
     };
   }
 
@@ -200,6 +201,13 @@
       backend() {
         if (!client || !user) return null;
         return makeSupabaseConvBackend(client, user.id);
+      },
+
+      /* ログイン中だけ、Cubeポイント用の Supabase バックエンドを
+         返す（backend() と同じ流儀）。 */
+      pointsBackend() {
+        if (!client || !user) return null;
+        return makeSupabasePointsBackend(client, user.id);
       },
     };
     return api;
@@ -449,6 +457,62 @@
   }
 
   /* ---------------------------------------------------------------- */
+  /* Supabase バックエンド（Cubeポイント）                             */
+  /*                                                                   */
+  /* 残高は points_balance（RLS で自分の行だけ読める）。書き込みは    */
+  /* RPC（earn_points / spend_points）経由のみで、金額・1日上限・     */
+  /* 冪等はサーバー側の関数が決める。ここは呼び出しの形だけを担う。   */
+  /* ポイントは付加機能：失敗しても呼び出し側が握れば会話は無事。     */
+  /* ---------------------------------------------------------------- */
+
+  const POINTS_BALANCE_TABLE = "points_balance";
+
+  function makeSupabasePointsBackend(client, userId) {
+    return {
+      kind: "supabase-points",
+      /* 自分の残高。行がまだ無ければ 0。 */
+      async fetchBalance() {
+        const { data, error } = await client
+          .from(POINTS_BALANCE_TABLE)
+          .select("balance")
+          .eq("user_id", userId)
+          .maybeSingle();
+        if (error) {
+          throw new Error(`points balance fetch failed: ${error.message || error}`);
+        }
+        return data && typeof data.balance === "number" ? data.balance : 0;
+      },
+      /* 付与（RPC）。新しい残高を返す。同じ冪等キーの再送は
+         残高を変えず、現在残高を返す（サーバー側の仕様）。 */
+      async earn(reason, idempotencyKey, metadata) {
+        const { data, error } = await client.rpc("earn_points", {
+          p_reason: reason,
+          p_idempotency_key: idempotencyKey,
+          p_metadata: metadata || {},
+        });
+        if (error) {
+          throw new Error(`earn_points failed: ${error.message || error}`);
+        }
+        return typeof data === "number" ? data : null;
+      },
+      /* 消費（RPC）。新しい残高を返す。残高不足はエラー
+         （メッセージに insufficient_balance を含む）になる。 */
+      async spend(reason, amount, idempotencyKey, metadata) {
+        const { data, error } = await client.rpc("spend_points", {
+          p_reason: reason,
+          p_amount: amount,
+          p_idempotency_key: idempotencyKey,
+          p_metadata: metadata || {},
+        });
+        if (error) {
+          throw new Error(`spend_points failed: ${error.message || error}`);
+        }
+        return typeof data === "number" ? data : null;
+      },
+    };
+  }
+
+  /* ---------------------------------------------------------------- */
   /* クラウド同期ストア（ローカルを土台に、ログイン中だけ同期）        */
   /* ---------------------------------------------------------------- */
 
@@ -542,10 +606,12 @@
     makeLocalHistoryStore,
     makeCloudHistoryStore,
     makeSupabaseConvBackend,
+    makeSupabasePointsBackend,
     newConversationId,
     titleFromQuestion,
     _internal: {
-      CONVERSATIONS_TABLE, HISTORY_LOCAL_KEY, MAX_CONVERSATIONS,
+      CONVERSATIONS_TABLE, POINTS_BALANCE_TABLE,
+      HISTORY_LOCAL_KEY, MAX_CONVERSATIONS,
       normalizeUser, emptyState, sanitizeConversation,
       parseStateBlob, serializeState, mergeConversationStates,
       pruneState,
