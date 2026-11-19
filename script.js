@@ -988,9 +988,9 @@ const POINTS_TOPUP_MENU = [
   { pct: 100, price: 180 },
 ];
 /* トップアップで得た「メーター追加 %」の保持先（端末内）。
-   時間制メーター（cube_meter.js）がこの値を読み、基準単位
-   （600秒）に対する割合として秒に換算して残量へ足す。
-   ポイント側はこの累積 % を所有し、メーター側は読み取り専用。 */
+   時間制メーターの残量そのものはまだページに実装がないため、
+   追加分はここに積み上げてポイント表示のそばに出す。将来の
+   メーター実装はこの値を読んで残量に足す。 */
 const POINTS_BONUS_KEY = "cube-points-meter-bonus-v1";
 
 /* JST（Asia/Tokyo）の日付キー "YYYY-MM-DD"。RPC 側の1日判定
@@ -1021,59 +1021,6 @@ function pointsNewTopupKey() {
   pointsTopupSeq += 1;
   return `meter_topup:${Date.now().toString(36)}_${pointsTopupSeq.toString(36)}` +
     Math.floor(Math.random() * 1296).toString(36);
-}
-
-/* Cube 時間制メーター（cube_meter.js）。サーバー側モデル
-   （Twin / Pro / Max / Ultra）の利用時間を数える。設定の上書きは
-   window.__CUBE_METER_CONFIG__（{plan, plans, congestion,
-   bonusUnitSec}）で渡せる。課金・学生判定は未決のため、既定は
-   全員 free プランで、プラン切替はこの設定でのみ行う。モジュール
-   が読み込まれていない環境ではメーターなし（従来挙動）になる。 */
-const METER_CONFIG_OVERRIDE =
-  (typeof window !== "undefined" && window.__CUBE_METER_CONFIG__) || null;
-
-let cubeMeterInstance = null;
-/* メーターのシングルトン。残量の保存先は端末の localStorage
-   （cube_meter.js 側のキー）。ポイント追加分（%）はポイント側の
-   保存キーからそのまま読む（書き換えない）。 */
-function getCubeMeter() {
-  if (cubeMeterInstance) return cubeMeterInstance;
-  if (typeof CubeMeter === "undefined") return null;
-  try {
-    cubeMeterInstance = CubeMeter.createMeter({
-      storage: {
-        getItem: (k) => {
-          try { return window.localStorage.getItem(k); } catch { return null; }
-        },
-        setItem: (k, v) => {
-          try { window.localStorage.setItem(k, v); } catch { /* 続行 */ }
-        },
-      },
-      config: CubeMeter.resolveConfig(METER_CONFIG_OVERRIDE),
-      onChange: () => {
-        try { App.renderMeter(); } catch { /* 表示前でも計量は続ける */ }
-      },
-    });
-  } catch {
-    cubeMeterInstance = null;
-  }
-  return cubeMeterInstance;
-}
-
-/* このモデルIDがメーター対象（サーバー側）かどうか。Ultra は
-   iMac サーバー固定、Twin / Pro / Max は engine "server"。
-   端末内モデル（Nano / Flash）は対象外。 */
-function meterAppliesTo(id) {
-  return id === "ultra" || modelDef(id).engine === "server";
-}
-
-/* メーター切れの例外。生成経路が残量0を検知したときに投げる。 */
-function meterEmptyError() {
-  const e = new Error(
-    "サーバーモデルの時間メーターが0になりました。Cube Nano / Cube Flash はこの端末で動くため、メーターなしで使えます。");
-  e.name = "MeterEmptyError";
-  e.code = "METER_EMPTY";
-  return e;
 }
 
 /* 記憶ビューの表示ラベル（モジュールの KIND_LABEL と同じ文言）。 */
@@ -1724,20 +1671,7 @@ async function loadUltraImac(onProgress) {
    振り分けは互換のため残してあるが、どちらも UI からは到達
    できない。回答フロー・バッジ・出典表示はどのエンジンでも同一。 */
 async function generateUltra(prompt, historyMessages) {
-  if (UltraImacModel.ready) {
-    /* iMac サーバーでの生成は時間制メーターの対象。残量0なら
-       生成を始めず、専用の例外で穏やかに止める。消費は実時間で
-       数える（失敗してもサーバーが動いた時間は消費する）。
-       端末内エンジン（ONNX / GGUF 版）へ落ちる経路はメーター
-       対象外（端末で動くため）。 */
-    const meter = getCubeMeter();
-    if (meter) {
-      if (!meter.canUse()) throw meterEmptyError();
-      return meter.consumeAround(
-        () => UltraImacModel.generate(prompt, historyMessages));
-    }
-    return UltraImacModel.generate(prompt, historyMessages);
-  }
+  if (UltraImacModel.ready) return UltraImacModel.generate(prompt, historyMessages);
   return UltraGgufModel.ready
     ? UltraGgufModel.generate(prompt, historyMessages)
     : UltraModel.generate(prompt, historyMessages);
@@ -1756,16 +1690,7 @@ function disposeUltra() {
    は同期だが、呼び出し側は常に await するので形をそろえてある。 */
 async function generateForModel(id, question, opts) {
   if (id === "ultra") return generateUltra(question, opts && opts.historyMessages);
-  if (modelDef(id).engine === "server") {
-    /* サーバーモデル（Twin / Pro / Max）は時間制メーターの対象。
-       残量0なら生成を始めず、専用の例外で穏やかに止める。 */
-    const meter = getCubeMeter();
-    if (meter) {
-      if (!meter.canUse()) throw meterEmptyError();
-      return meter.consumeAround(() => ServerModel.generate(id, question));
-    }
-    return ServerModel.generate(id, question);
-  }
+  if (modelDef(id).engine === "server") return ServerModel.generate(id, question);
   return LocalModel.generate(question, modelDef(id).maxNew);
 }
 
@@ -3596,7 +3521,24 @@ function definitionSentenceSource(sentence, results, question) {
           // 窓へのタイトル添えで共起したことになって通るのを防ぐ。
           if (!normalizeJa(ls).includes(ne)) continue;
         }
-        if (windowSupportsAnswer(w, sentence, content)) return r;
+        if (windowSupportsAnswer(w, sentence, content)) {
+          // 主語のすり替え点検：候補文の主題が、この裏づけ文の主題と
+          // 別の対象を指している場合は、その文の主張を候補文の主題の
+          // 話として裏づけない（a6型）。点検は、裏づけ文の主題が記事
+          // タイトル（記事自身の主題）と一致する場合に限る（「相撲は
+          // 日本の国技です」のような答えの値を主語にする文まで巻き
+          // 込まないため）。最上級の質問では勝者の点検
+          // （superlativeWinnerGrounded）が担うため、ここでは除く。
+          const lsSubject = sentenceHeadSubject(ls);
+          if (
+            !qRank &&
+            titleNamesSubject(r.title, lsSubject) &&
+            headSubjectsConflict(sentenceHeadSubject(sentence), lsSubject)
+          ) {
+            continue;
+          }
+          return r;
+        }
       }
     }
   }
@@ -3786,12 +3728,186 @@ function rankWindowSupports(result, sentence, question, qRank) {
   return false;
 }
 
+/**
+ * 文の頭の主題（主語）を取り出す。記事文の流用で主語がすり替わって
+ * いないかを機械的に比べるためのもので、修飾節（「〜に位置する
+ * 田沢湖は」の位置する節）や法人格の前置（株式会社）は落とし、
+ * 主題の名詞句だけを返す。読み取れなければ null（その場合は
+ * 主語の点検をしない＝従来どおりの照合に任せる）。
+ */
+function sentenceHeadSubject(text) {
+  const first = String(text ?? "").split(/[。！？\n]/)[0] ?? "";
+  const s = normalizeJa(first).replace(/^『/, "").trim();
+  const m = /^(.{2,40}?)(?:とは|は)/.exec(s);
+  if (!m) return null;
+  let subj = (m[1].split(/[、,]/).pop() ?? "").trim();
+  const tail =
+    /(?:する|ある|いる|なる)([一-鿿々ァ-ヶーA-Za-z0-9・]{2,})$/.exec(subj);
+  if (tail) subj = tail[1];
+  subj = subj
+    .replace(/^(株式会社|有限会社|合同会社|一般社団法人|一般財団法人)/, "")
+    .replace(/[（(][^（）()]*[）)]$/, "")
+    .replace(/『|』/g, "")
+    .trim();
+  return subj.length >= 2 ? subj : null;
+}
+
+/**
+ * 2つの主題が「別の対象」を指すか。どちらかが読み取れない場合は
+ * 食い違いとは言わない。包含（末尾一致）は同じ対象の表記ゆれ・
+ * 修飾の有無として許す。
+ */
+function headSubjectsConflict(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return false;
+  if (a.endsWith(b) || b.endsWith(a)) return false;
+  return true;
+}
+
+/** その主題が記事タイトル（記事自身の主題）を指しているか。 */
+function titleNamesSubject(title, subj) {
+  if (!title || !subj) return false;
+  if (titleMatchesSubject(title, subj)) return true;
+  const nt = normalizeJa(title);
+  const ns = normalizeJa(subj);
+  if (!nt || !ns) return false;
+  const base = nt.replace(/[（(].*?[）)]/g, "").trim();
+  return base === ns || nt.startsWith(ns) || base.startsWith(ns);
+}
+
+/**
+ * 定義の事実（記事の冒頭文そのもの）との主語すり替え：候補文の
+ * 主題が、記事文の主題と別の対象を指している場合は、その文は
+ * 記事の主張を別対象の話に化けさせているので、事実では裏づけない
+ * （モーリーファンタジーの質問にイオンファンタジーの冒頭文を
+ * 主語だけ差し替えて通した 2026-11-19 実測 a6 の経路）。点検は、
+ * 事実文の主題が記事タイトル（記事自身の主題）と一致する場合に
+ * 限る（記事の主題でない文との食い違いは、従来の照合に任せる）。
+ */
+function definitionSubjectSwapped(sentence, fact) {
+  if (!fact || fact.kind !== "definition") return false;
+  const factSubject = sentenceHeadSubject(fact.value);
+  if (!titleNamesSubject(fact.sourceTitle, factSubject)) return false;
+  return headSubjectsConflict(sentenceHeadSubject(sentence), factSubject);
+}
+
+/* 最上級の属性ごとの、証拠文側の言い方（最長・最高などの最X形を含む）。 */
+const SUPERLATIVE_ATTR_FORMS = [
+  [/人口/, ["人口", "最多", "最少"]],
+  [/面積/, ["面積", "最大", "最小"]],
+  [/長さ|全長|長い|短い/, ["長さ", "全長", "長い", "最長", "最短"]],
+  [/高さ|標高|高い|低い/, ["高さ", "標高", "高い", "最高", "最低"]],
+  [/大きさ|大きい|小さい/, ["大きさ", "大きい", "大きな", "面積", "最大", "最小"]],
+  [/重さ|重量|重い|軽い/, ["重さ", "重量", "重い", "最大", "最小"]],
+  [/速さ|速度|速い|遅い/, ["速さ", "速度", "速い", "最速", "最遅"]],
+  [/深さ|深い|浅い/, ["深さ", "深い", "水深", "最大"]],
+];
+
+/**
+ * 証拠側の1文が、勝者を「その順位の持ち主」として主張しているか。
+ * 勝者の名前が文に出ているだけ（候補の列挙・別対象の文への出現）
+ * では主張とは言わない：勝者が主題・主語として最上級を担う形、
+ * 「のは勝者」「は勝者である」の名指し形、または勝者自身の記事
+ * （タイトル一致）の中の順位文であることを求める。属性の系統と
+ * 向き（大きい側／小さい側）も質問と矛盾しないこと。最X形
+ * （最長・最高など）も順位の印として数える（superlativeRank は
+ * 最X形を見ないため、ここでは印の集合を広げてある）。
+ */
+function sentenceAssertsWinner(ls, winner, question, titleEq) {
+  const w = normalizeJa(winner);
+  const s = normalizeJa(ls);
+  if (!w) return false;
+  if (/ではなく|でなく|誤り|間違い/.test(ls)) return false;
+  const attr = SUPERLATIVE_ATTR_FORMS.find(([re]) => re.test(question));
+  if (attr && !attr[1].some((x) => ls.includes(x))) return false;
+  const qRank = superlativeRank(question);
+  const rankOk =
+    superlativeRank(ls) === qRank ||
+    (qRank === 1 &&
+      /第1位|世界一|日本一|首位|最[長短高低大小速重広狭深浅新古多]/.test(ls));
+  if (!rankOk) return false;
+  const qDir = superlativeDirection(question);
+  const d = superlativeDirection(ls);
+  if (qDir !== 0 && d !== 0 && d !== qDir) return false;
+  if (titleEq) return true;
+  if (!s.includes(w)) return false;
+  const we = escapeRegExp(w);
+  if (s.includes(`${w}が最も`) || s.includes(`${w}が一番`)) return true;
+  if (
+    new RegExp(`${we}が[^、。]{0,10}(?:最|第1位|世界一|日本一)`).test(s)
+  ) {
+    return true;
+  }
+  if (s.includes(`のは${w}`)) return true;
+  if (new RegExp(`は${we}(?:である|です|だ)(?!という)`).test(s)) {
+    return true;
+  }
+  const idx = s.indexOf(`${w}は`);
+  if (idx >= 0) {
+    const clause = s.slice(idx, idx + 60).split(/[、。]/)[0] ?? "";
+    if (
+      /最|一番|第1位|世界一|日本一/.test(clause) &&
+      !/と言われ|という説|という主張|という意見|こともある/.test(clause)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 最上級の質問への答えが名指す勝者が、証拠の中で「勝者として
+ * 主張」されているか。名指しが読み取れない文は対象外（従来の
+ * 照合に任せる）。2026-11-19 実測 c12：根拠ページが「ナイル川は
+ * 世界最長」と明記しているのに「アマゾン川です」が通った——
+ * 勝者の名前が候補として文に出ているだけで裏づけになっていた。
+ */
+function superlativeWinnerGrounded(sentence, question, ctx) {
+  const winner = superlativeClaimWinner(sentence);
+  if (!winner || normalizeJa(winner).length < 2) return true;
+  const sources = [];
+  for (const r of ctx?.results ?? []) {
+    if (r) sources.push(r);
+  }
+  if (ctx?.article) {
+    sources.push({
+      title: ctx.article.title ?? "",
+      text: ctx.article.lead ?? "",
+      snippet: "",
+    });
+  }
+  if (ctx?.fact) {
+    sources.push({
+      title: ctx.fact.sourceTitle ?? "",
+      text: ctx.fact.evidence ?? "",
+      snippet: "",
+    });
+  }
+  for (const r of sources) {
+    const titleEq =
+      titleMatchesSubject(r.title ?? "", winner) ||
+      normalizeJa((r.title ?? "").replace(/[（(][^（）()]*[）)]\s*$/, "")) ===
+        normalizeJa(winner);
+    const texts = [r.text ?? "", r.snippet ?? ""];
+    for (const t of texts) {
+      if (!t) continue;
+      for (const ls of splitSentences(t)) {
+        if (sentenceAssertsWinner(ls, winner, question, titleEq)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 function verifySentence(sentence, question, ctx) {
   const fact = ctx?.fact ?? null;
   if (
     fact &&
     modelAgreesWithFact(sentence, fact) &&
-    !placeAnswerMissesFactValue(sentence, fact, question)
+    !placeAnswerMissesFactValue(sentence, fact, question) &&
+    !definitionSubjectSwapped(sentence, fact)
   ) {
     return {
       source: { title: fact.sourceTitle, url: fact.sourceUrl },
@@ -3815,6 +3931,15 @@ function verifySentence(sentence, question, ctx) {
   if (latinTokens.length > 0) {
     const ls = String(sentence).toLowerCase();
     if (!latinTokens.every((t) => ls.includes(t))) return null;
+  }
+  // 最上級の質問で勝者を名指す文は、証拠がその勝者を「勝者として
+  // 主張」している場合に限る。名前が候補として挙がっているだけ・
+  // 別の勝者を主張する記事に出てくるだけでは裏づけない（c12型）。
+  if (
+    superlativeRank(question) &&
+    !superlativeWinnerGrounded(sentence, question, ctx)
+  ) {
+    return null;
   }
   let results = ctx?.results ?? [];
   if (questionContextTerms(question).length > 0) {
@@ -7696,72 +7821,83 @@ async function searchWikipedia(q) {
   };
   const subject = q.match(/『(.+?)』/)?.[1]?.trim();
   const topic = topicFromQuestion(q);
-  try {
-    if (subject) {
+  // 収集はラウンド単位で並列に行う。各ラウンドは「そのラウンドが
+  // 従来どおり push していた順序のままの記事配列」を返し、push は
+  // ラウンドの定義順に行う。集める対象・件数・push 順序・重複排除は
+  // 直列時代と同一で、変わるのはラウンド同士が重なって走ることだけ
+  // （各取得の失敗時の倒れ方——索引→ウェブ・失敗時は null/[]——も
+  // 従来どおり）。ラウンド内の予期せぬ例外はそのラウンドだけ空に
+  // 倒し、集まった分だけ返す方針を保つ。
+  const rounds = [
+    // 『…』の対象そのものの記事＋曖昧さ回避の派生記事。
+    async () => {
+      if (!subject) return [];
       const page = await wikiFetchExtract(subject);
-      if (page) {
-        // 派生記事を先に：曖昧さ回避ページの1行項目と同点でも本記事が勝つ。
-        for (const cand of disambiguationCandidates(page, subject)) {
-          push(await wikiFetchExtract(cand));
-        }
-        push(page);
-      }
-    }
+      if (!page) return [];
+      // 派生記事を先に：曖昧さ回避ページの1行項目と同点でも本記事が勝つ。
+      // 候補の取得は並列に行い、並びは候補の順序どおりに保つ。
+      const candPages = await Promise.all(
+        disambiguationCandidates(page, subject).map((cand) =>
+          wikiFetchExtract(cand),
+        ),
+      );
+      return [...candPages, page];
+    },
     // 題名そのものの記事は、検索順位に頼らず必ず先頭候補に入れる：
     // 検索の上位に来なかったという理由だけで、本命の記事が証拠から
     // 漏れて正しい答えまで「未確認」になるのを防ぐ。
-    if (topic && (!subject || normalizeJa(topic) !== normalizeJa(subject))) {
+    async () => {
+      if (!topic || (subject && normalizeJa(topic) === normalizeJa(subject)))
+        return [];
       const page = await wikiFetchExtract(topic);
-      if (page) {
-        for (const cand of disambiguationCandidates(page, topic)) {
-          push(await wikiFetchExtract(cand));
-        }
-        push(page);
-      }
-    }
-    if (topic && normalizeJa(topic) !== normalizeJa(q)) {
+      if (!page) return [];
+      const candPages = await Promise.all(
+        disambiguationCandidates(page, topic).map((cand) =>
+          wikiFetchExtract(cand),
+        ),
+      );
+      return [...candPages, page];
+    },
+    // 題名でのトピック検索。
+    async () => {
+      if (!topic || normalizeJa(topic) === normalizeJa(q)) return [];
       const topicTitles = await wikiSearchTitles(topic, 4);
-      const fetchedTopic = await Promise.all(topicTitles.map(wikiFetchExtract));
-      for (const r of fetchedTopic) push(r);
-    }
+      return Promise.all(topicTitles.map(wikiFetchExtract));
+    },
     // タイトル内検索（intitle:）も併せる：題名がタイトルに含まれる記事を
     // 優先的に拾い、本文にたまたま題名が出るだけの記事の混入を減らす。
-    if (topic && !/\s/.test(topic)) {
+    async () => {
+      if (!topic || /\s/.test(topic)) return [];
       const intitleTitles = await wikiSearchTitles(`intitle:${topic}`, 4);
-      const fetchedIntitle = await Promise.all(
-        intitleTitles.map(wikiFetchExtract),
-      );
-      for (const r of fetchedIntitle) push(r);
-    }
+      return Promise.all(intitleTitles.map(wikiFetchExtract));
+    },
     // 種類の語を足した検索と、引用符つきの完全一致検索も併せる。
     // 題名だけでは同名の別対象（化学のイオン等）が上位に来て本命が
     // 埋もれることがある。集めた候補は後のスコアと厳しい照合で
     // ふるいにかけるため、網を広げても裏づけの精度は下がらない。
-    if (topic) {
+    async () => {
+      if (!topic) return [];
       const phrase = kindSearchPhrase(q);
-      if (phrase && !topic.includes(phrase)) {
-        const kindTitles = await wikiSearchTitles(`${topic} ${phrase}`, 4);
-        const fetchedKind = await Promise.all(
-          kindTitles.map(wikiFetchExtract),
-        );
-        for (const r of fetchedKind) push(r);
-      }
-      if (!/\s/.test(topic) && topic.length >= 2) {
-        const quotedTitles = await wikiSearchTitles(`"${topic}"`, 3);
-        const fetchedQuoted = await Promise.all(
-          quotedTitles.map(wikiFetchExtract),
-        );
-        for (const r of fetchedQuoted) push(r);
-      }
-    }
-    const titles = await wikiSearchTitles(q, 4);
-    const fetched = await Promise.all(titles.map(wikiFetchExtract));
-    for (const r of fetched) push(r);
-    if (subject) {
+      if (!phrase || topic.includes(phrase)) return [];
+      const kindTitles = await wikiSearchTitles(`${topic} ${phrase}`, 4);
+      return Promise.all(kindTitles.map(wikiFetchExtract));
+    },
+    async () => {
+      if (!topic || /\s/.test(topic) || topic.length < 2) return [];
+      const quotedTitles = await wikiSearchTitles(`"${topic}"`, 3);
+      return Promise.all(quotedTitles.map(wikiFetchExtract));
+    },
+    // 質問文そのままでの検索。
+    async () => {
+      const titles = await wikiSearchTitles(q, 4);
+      return Promise.all(titles.map(wikiFetchExtract));
+    },
+    // 『…』の対象での検索。
+    async () => {
+      if (!subject) return [];
       const extra = await wikiSearchTitles(subject, 3);
-      const fetchedExtra = await Promise.all(extra.map(wikiFetchExtract));
-      for (const r of fetchedExtra) push(r);
-    }
+      return Promise.all(extra.map(wikiFetchExtract));
+    },
     // 拡張検索（後ろに足すだけ）：最上級の質問は、質問文のままだと
     // 勝者の記事が検索に現れないことが多い（「世界で一番人口が多い
     // 国」ではインドが出ない）。「属性＋範囲＋最大級」の形に言い換えた
@@ -7769,25 +7905,38 @@ async function searchWikipedia(q) {
     // を並べた検索（「人類 月面 着陸」）を併せ、新しく見つかった記事
     // だけを後ろに足す。既存の候補と並びは変えず、照合の厳しさも
     // 変えない（裏づけの判定は従来どおり記事の中身で行う）。
-    const extraQueries = [];
-    if (superlativeRank(q) > 0) {
-      const attr = superlativeAttrWord(q);
-      const scope = /(世界|日本|太陽系|全国)/.exec(q)?.[1];
-      if (attr && scope) {
-        extraQueries.push(`${attr.word} ${scope}${attr.rank}`);
-        const head = superlativeHeadNoun(q);
-        if (head) extraQueries.push(`${head} ${attr.word} ${scope}一`);
+    // 拡張クエリ同士も独立なので並列に取り、並びはクエリ順に保つ。
+    async () => {
+      const extraQueries = [];
+      if (superlativeRank(q) > 0) {
+        const attr = superlativeAttrWord(q);
+        const scope = /(世界|日本|太陽系|全国)/.exec(q)?.[1];
+        if (attr && scope) {
+          extraQueries.push(`${attr.word} ${scope}${attr.rank}`);
+          const head = superlativeHeadNoun(q);
+          if (head) extraQueries.push(`${head} ${attr.word} ${scope}一`);
+        }
       }
-    }
-    const kwTerms = keyTerms(normalizeJa(q))
-      .filter((t) => !/^\d+$/.test(t) && !EXTRA_QUERY_STOP.has(t))
-      .slice(0, 5);
-    if (kwTerms.length >= 2) extraQueries.push(kwTerms.join(" "));
-    for (const eq of extraQueries) {
-      if (normalizeJa(eq) === normalizeJa(q)) continue;
-      const titles = await wikiSearchTitles(eq, 4).catch(() => []);
-      const fetchedEq = await Promise.all(titles.map(wikiFetchExtract));
-      for (const r of fetchedEq) push(r);
+      const kwTerms = keyTerms(normalizeJa(q))
+        .filter((t) => !/^\d+$/.test(t) && !EXTRA_QUERY_STOP.has(t))
+        .slice(0, 5);
+      if (kwTerms.length >= 2) extraQueries.push(kwTerms.join(" "));
+      const perQuery = await Promise.all(
+        extraQueries.map(async (eq) => {
+          if (normalizeJa(eq) === normalizeJa(q)) return [];
+          const titles = await wikiSearchTitles(eq, 4).catch(() => []);
+          return Promise.all(titles.map(wikiFetchExtract));
+        }),
+      );
+      return perQuery.flat();
+    },
+  ];
+  try {
+    const roundResults = await Promise.all(
+      rounds.map((run) => run().catch(() => [])),
+    );
+    for (const pages of roundResults) {
+      for (const r of pages) push(r);
     }
   } catch {
     /* 集まった分だけ返す */
@@ -9520,7 +9669,6 @@ const App = {
     Notebook.load();
     this.initMemory();
     this.initAccount();
-    this.renderMeter();
     // 選択中のモデルを復元する（初期値は v1）。ベースURLはモデルごとの
     // 上書きとして読み込む（v1 は従来キー、v2 / Twin / Pro / Max は専用キー）。
     const savedId = store.get(MODEL_ID_KEY);
@@ -9657,8 +9805,6 @@ const App = {
     if (fcView) fcView.hidden = name !== "factcheck";
     const labView = el("view-lab");
     if (labView) labView.hidden = name !== "lab";
-    const doctorView = el("view-doctor");
-    if (doctorView) doctorView.hidden = name !== "doctor";
     const memView = el("view-memory");
     if (memView) memView.hidden = name !== "memory";
     el("view-settings").hidden = name !== "settings";
@@ -10890,62 +11036,11 @@ const App = {
       const btn = el(`points-topup-${item.pct}`);
       if (btn) btn.disabled = this.pointsBusy;
     }
-    /* ポイント残高・追加分の変化はメーター表示にも反映する。 */
-    this.renderMeter();
   },
 
   showPointsNote(text) {
     const note = el("points-note");
     if (note) note.textContent = text || "";
-  },
-
-  /* 時間制メーターの表示（cube_meter.js）。モジュールが無い環境
-     では出さない。無料枠は端末単位なので、ログイン状態とは
-     無関係に常時表示する。消費のたびに onChange 経由でも
-     呼ばれる。 */
-  renderMeter() {
-    const area = el("meter-area");
-    if (!area) return;
-    const meter = getCubeMeter();
-    if (!meter || typeof CubeMeter === "undefined") {
-      area.hidden = true;
-      return;
-    }
-    const snap = meter.snapshot();
-    area.hidden = false;
-    const rem = el("meter-remaining");
-    if (rem) rem.textContent = CubeMeter.formatDuration(snap.remainingSec);
-    const plan = el("meter-plan");
-    if (plan) {
-      plan.textContent = snap.congestion
-        ? "（混雑時の上限が適用中です）"
-        : !Number.isFinite(snap.baseTotalSec)
-          ? "（無制限プラン）"
-          : "";
-    }
-    const fill = el("meter-bar-fill");
-    if (fill && fill.style) {
-      let pct = 100;
-      if (Number.isFinite(snap.baseTotalSec)) {
-        const total = snap.baseTotalSec + snap.bonusTotalSec;
-        pct = total > 0
-          ? Math.max(0, Math.min(100, (snap.remainingSec / total) * 100))
-          : 0;
-      }
-      fill.style.width = `${pct}%`;
-    }
-    const bonus = el("meter-bonus");
-    if (bonus) {
-      bonus.hidden = !(snap.bonusRemainingSec > 0);
-      const br = el("meter-bonus-remaining");
-      if (br) br.textContent = CubeMeter.formatDuration(snap.bonusRemainingSec);
-    }
-    const note = el("meter-note");
-    if (note) {
-      note.textContent = snap.remainingSec <= 0
-        ? "今日の分は使い切りました。Cube Nano / Cube Flash はメーターなしで使えます。"
-        : "";
-    }
   },
 
   /* 残高を取り直し、今日のログインボーナス（1日1回）を付けに
@@ -11504,44 +11599,22 @@ const App = {
       return;
     }
 
-    // 2) 計算は実際に計算して検算する。
+    // 2) 計算は実際に計算して即答する。表示する答えはローカルの
+    // 決定的な計算（evalArithmetic）の結果だけで作り、モデルの生成文
+    // は混ぜない。モデルによる照合（検算）は表示の前提にせず、表示の
+    // 後で裏に回す（メモ帳レーンの再確認と同じ型）：Cube の答えの数字
+    // が計算結果と食い違う時だけ、従来と同じ modelSaid＋注記を後追い
+    // の返答として出す。裏の生成が失敗しても、表示済みの答え（生成
+    // には依存していない）には影響させない。
     const calc = evalArithmetic(question);
     if (calc !== null) {
-      let modelSaid;
-      let calcModelError = "";
-      if (modelReady) {
-        this.setPhase("thinking");
-        await new Promise((r) => setTimeout(r, 30)); // 「考え中…」を先に描く
-        try {
-          // 検算経路のモデル生成にも、選択中モデルを使う（生成先は
-          // generateForModel がモデルごとに振り分ける）。
-          const modelAns = await generateForModel(this.modelId, question);
-          const modelNums = numbersIn(modelAns);
-          if (
-            modelAns &&
-            modelNums.length > 0 &&
-            !modelNums.some((n) => Number(n) === calc)
-          ) {
-            modelSaid = modelAns;
-          }
-        } catch (e) {
-          // モデルの失敗で検算の答えは止めないが、エラー自体は注記に出す。
-          calcModelError = e instanceof Error ? e.message : String(e);
-        }
-      }
-      // 検算の答えを先に表示する。メモ帳への吸収（種類=計算、事実=計算
-      // 結果）は表示の後——保存が表示を遅らせることはない。
       this.setPhase("idle");
       this.pushAssistant({
         text: `答えは ${calc} です。`,
         badge: "calc",
-        modelSaid,
-        note: modelSaid
-          ? "Cubeの答えと食い違ったため、検算の答えを表示しています。"
-          : calcModelError
-            ? `Cubeの生成でエラーが起きましたが、検算の答えを表示しています。（エラー内容: ${calcModelError}）`
-            : undefined,
       });
+      // メモ帳への吸収（種類=計算、事実=計算結果）は表示の後——保存が
+      // 表示を遅らせることはない。
       this.saveNotebook({
         question,
         answer: `答えは ${calc} です。`,
@@ -11550,25 +11623,31 @@ const App = {
         question_type: "calc",
         fact: String(calc),
       });
-      return;
-    }
-
-    // 2.5) 時間制メーターの関門：サーバー側モデル（Twin / Pro /
-    // Max / Ultra）が選択され、接続済みで、残量が0なら、生成も
-    // 検索照合も始めずに穏やかに止める。端末内モデルへの案内と、
-    // ポイントでの追加（ログイン中のみ可能）を出す。天気・計算・
-    // メモ帳・記憶の即答レーンはメーターと無関係に使えるため、
-    // 関門はそれらの後ろ（＝モデル生成の直前）に置く。
-    if (modelReady && meterAppliesTo(this.modelId)) {
-      const meter = getCubeMeter();
-      if (meter && !meter.canUse()) {
-        this.pushAssistant({
-          text: "サーバーモデルの時間メーターが0になりました。",
-          badge: "unknown",
-          note: "Cube Nano / Cube Flash はこの端末の中で動くため、メーターなしでそのまま使えます。モデルを切り替えてお試しください。ログイン中なら、ポイントでメーター時間を追加することもできます（サイドバーの「ポイントでメーター追加」）。メーターの無料分は日付が変わると戻ります。",
-        });
-        return;
+      if (modelReady) {
+        void (async () => {
+          try {
+            // 検算経路のモデル生成にも、選択中モデルを使う（生成先は
+            // generateForModel がモデルごとに振り分ける）。
+            const modelAns = await generateForModel(this.modelId, question);
+            const modelNums = numbersIn(modelAns);
+            if (
+              modelAns &&
+              modelNums.length > 0 &&
+              !modelNums.some((n) => Number(n) === calc)
+            ) {
+              this.pushAssistant({
+                text: `答えは ${calc} です。`,
+                badge: "calc",
+                modelSaid: modelAns,
+                note: "Cubeの答えと食い違ったため、検算の答えを表示しています。",
+              });
+            }
+          } catch {
+            /* 裏の検算の失敗は内部だけに留める（表示済みの答えは不変） */
+          }
+        })();
       }
+      return;
     }
 
     // 3) モデル生成＋ウェブ検索での照合。確認のリクエストは生成の前に
@@ -12226,7 +12305,6 @@ if (typeof module !== "undefined" && module.exports) {
     buildBriefingMaterial, trimBriefingTail, localDateKey, BRIEFING_DATE_KEY,
     pointsJstDateKey, pointsDailyLoginKey, pointsNewTopupKey,
     POINTS_TOPUP_MENU, POINTS_BONUS_KEY,
-    getCubeMeter, meterAppliesTo, meterEmptyError,
     ServerModel, generateForModel, CUBE_SERVER_BASE_URL, CUBE_SERVER_UNREACHABLE,
     readUltraStage, writeUltraStage,
     ULTRA_REPO, ULTRA_PARAM_COUNT, ULTRA_MAX_NEW_TOKENS,

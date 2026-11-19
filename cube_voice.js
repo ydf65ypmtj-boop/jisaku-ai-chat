@@ -64,9 +64,10 @@
   const DEFAULT_SERVER_BASE = "https://imac.tail9ed76a.ts.net:8443";
   const HEALTH_TIMEOUT_MS = 2500;   // /voice/health の締切
   const SYNTH_TIMEOUT_MS = 20000;   // 1文の合成の締切
-  const REPLY_DEBOUNCE_MS = 500;    // 回答の分割push を束ねる待ち
+  const REPLY_DEBOUNCE_MS = 200;    // 回答の分割push を束ねる待ち（回答は通常1回のpush で届くため、束ねに必要な最小限の待ちに短縮）
   const THINKING_TIMEOUT_MS = 150000; // 回答が来ないままの上限
   const MAX_SPOKEN_SENTENCES = 15;  // 1回答で読み上げる文の上限
+  const PREFETCH_AHEAD = 2;         // TTS先行合成の窓（再生中の文＋先行2文まで。同時合成の競合を避ける）
   const TRUNCATION_NOTICE = "（続きは画面で確認できます）";
   const MIC_RESTART_LIMIT = 5;      // 聞き取りの連続再起動の上限
 
@@ -213,24 +214,41 @@
   /* エンジンの形：
      { kind, prepare(sentence)->Promise<token>,
        play(token, sentence, {onStart})->Promise<void>, cancel() }
-     VOICEVOX 側は prepare が合成（fetch）、play が再生。
+     VOICEVOX 側は prepare が合成（fetch）、play が再生。加えて
+     unlock()（自動再生制限の解除）を持ち、再生要素は1個に固定する。
      ブラウザ側は prepare が即時解決、play が utterance の再生。 */
+
+  /* 無音 WAV（自動再生制限の解除用）。unlock() が永続要素で再生する。 */
+  const SILENT_WAV_URL =
+    "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
 
   function createVoicevoxEngine(env) {
     const e = env || {};
     const fetchFn = e.fetch;
     const base = String(e.serverBaseUrl || DEFAULT_SERVER_BASE).replace(/\/+$/, "");
     const timeoutMs = e.synthTimeoutMs || SYNTH_TIMEOUT_MS;
-    let currentAudio = null;
+    /* 再生要素は1個だけを使い回す（env.audioElement があればそれを
+       共有し、無ければ自分で作る）。iOS Safari では、ユーザー操作で
+       再生を許可されたことのない新しい Audio 要素の play() は
+       NotAllowedError で拒否されるため、文ごとの新規生成では実機で
+       再生できない。入口クリックで unlock() しておいた同じ要素なら、
+       src を差し替えての再生が通る。 */
+    let audioEl = e.audioElement || null;
     let currentUrl = null;
+
+    function ensureAudio() {
+      if (!audioEl) audioEl = new e.Audio();
+      return audioEl;
+    }
 
     function stopCurrent() {
       if (e.lipSync) {
         try { e.lipSync.stopPlayback(); } catch { /* noop */ }
       }
-      if (currentAudio) {
-        try { currentAudio.pause(); } catch { /* noop */ }
-        currentAudio = null;
+      if (audioEl) {
+        audioEl.onended = null;
+        audioEl.onerror = null;
+        try { audioEl.pause(); } catch { /* noop */ }
       }
       if (currentUrl) {
         try { e.URL.revokeObjectURL(currentUrl); } catch { /* noop */ }
@@ -286,13 +304,26 @@
           if (timer) clearTimeout(timer);
         }
       },
+      /* ユーザー操作（入口ボタンのクリック）の文脈で呼び、永続要素で
+         無音を一度再生して自動再生制限の許可を得ておく。以後の文の
+         再生は同じ要素の src 差し替えなので許可が効く。文の再生中は
+         何もしない。 */
+      unlock() {
+        if (currentUrl) return;
+        try {
+          const audio = ensureAudio();
+          audio.src = SILENT_WAV_URL;
+          const p = audio.play();
+          if (p && typeof p.catch === "function") p.catch(() => {});
+        } catch { /* noop */ }
+      },
       play(token) {
         return new Promise((resolve, reject) => {
           stopCurrent();
           const url = e.URL.createObjectURL(token.blob);
           currentUrl = url;
-          const audio = new e.Audio(url);
-          currentAudio = audio;
+          const audio = ensureAudio();
+          audio.src = url;
           audio.onended = () => { stopCurrent(); resolve(); };
           audio.onerror = () => { stopCurrent(); reject(new Error("audio playback failed")); };
           const p = audio.play();
@@ -500,22 +531,38 @@
       _items: [],
       _playing: false,
       _generation: 0,
+      _nextSeq: 0,   // 次に積む文の通し番号
+      _playSeq: 0,   // 再生中（または次に再生する）文の通し番号。先行合成の窓の基準
       setEngine(next) { engine = next; },
       getEngine() { return engine; },
+      /* 先行合成は「再生中＋先行 PREFETCH_AHEAD 文まで」の窓に限る。
+         全文を一斉に合成すると、第1文の合成が後続文と合成エンジン
+         （VOICEVOX）内で競合して再生開始が遅れうるため。窓は再生が
+         進むにつれて前へずらす。 */
+      _startPrepare(item) {
+        if (item._prepareStarted || !item.engine) return;
+        item._prepareStarted = true;
+        item.prepared = item.engine.prepare(item.text).then(
+          (token) => ({ token }),
+          (err) => ({ err }),
+        );
+      },
+      _fillWindow() {
+        for (const item of queue._items) {
+          if (item.seq > queue._playSeq + PREFETCH_AHEAD) break;
+          queue._startPrepare(item);
+        }
+      },
       enqueueSentences(sentences) {
         const gen = queue._generation;
         for (const text of sentences) {
           // エンジンは文ごとに固定する（途中で本線→予備に切り替えても、
           // 既に合成した文のトークンと再生器が食い違わないように）。
-          const item = { text, engine, prepared: null };
-          if (engine) {
-            item.prepared = engine.prepare(text).then(
-              (token) => ({ token }),
-              (err) => ({ err }),
-            );
-          }
+          const item = { text, engine, prepared: null, seq: queue._nextSeq, _prepareStarted: false };
+          queue._nextSeq += 1;
           queue._items.push(item);
         }
+        queue._fillWindow();
         void queue._pump(gen);
         return queue._items.length;
       },
@@ -527,6 +574,9 @@
           while (queue._items.length) {
             if (gen !== queue._generation) break;
             const item = queue._items.shift();
+            queue._playSeq = item.seq;
+            queue._startPrepare(item);
+            queue._fillWindow();
             if (!item.engine) continue;
             queue._currentEngine = item.engine;
             let token = null;
@@ -552,12 +602,16 @@
         } finally {
           queue._playing = false;
           queue._currentEngine = null;
-          if (gen === queue._generation && !queue._items.length) queue.onDrained();
+          if (gen === queue._generation && !queue._items.length) {
+            queue._playSeq = queue._nextSeq; // 窓の基準を次の文へ
+            queue.onDrained();
+          }
         }
       },
       cancel() {
         queue._generation += 1;
         queue._items = [];
+        queue._playSeq = queue._nextSeq; // 窓の基準を次の文へ
         if (queue._currentEngine) queue._currentEngine.cancel();
         if (engine) engine.cancel();
       },
@@ -976,14 +1030,27 @@
         if (charState.lipSync) charState.lipSync.stopPlayback();
       },
     };
-    const makeVoicevox = () => createVoicevoxEngine({
-      fetch: win.fetch.bind(win),
-      URL: win.URL,
-      Audio: win.Audio,
-      serverBaseUrl: serverBase,
-      speaker: voiceState.speaker,
-      lipSync: lipSyncProxy,
-    });
+    /* VOICEVOX エンジンの再生要素は、エンジンを作り直しても同じ
+       1個を使い回す。iOS の自動再生制限の解除は要素単位で効くため、
+       入口クリックで解除する要素と、実際に文を再生する要素を
+       一致させる必要がある。 */
+    let sharedAudioEl = null;
+    let voicevoxEngine = null;
+    const makeVoicevox = () => {
+      if (!sharedAudioEl) {
+        try { sharedAudioEl = new win.Audio(); } catch { sharedAudioEl = null; }
+      }
+      voicevoxEngine = createVoicevoxEngine({
+        fetch: win.fetch.bind(win),
+        URL: win.URL,
+        Audio: win.Audio,
+        audioElement: sharedAudioEl,
+        serverBaseUrl: serverBase,
+        speaker: voiceState.speaker,
+        lipSync: lipSyncProxy,
+      });
+      return voicevoxEngine;
+    };
     const queue = createSpeechQueue({ engine: browserEngine });
     const session = createSession({
       host, recognizer, queue,
@@ -1227,12 +1294,15 @@
       noticeEl.textContent = "";
       ensureCharacter();
       if (charState.lipSync) charState.lipSync.start();
-      // iOS 等の自動再生制限の解除：ユーザー操作のうちに無音を一度再生
+      // iOS 等の自動再生制限の解除：ユーザー操作のうちに、VOICEVOX
+      // エンジンの永続 Audio 要素で無音を一度再生して許可を得る。
+      // 使い捨ての要素で解除しても文の再生に使う要素には効かず、
+      // NotAllowedError になる（実機で確認済みの不具合）。要素は
+      // エンジン側で1個に固定してあるので、ここでその要素を unlock
+      // すれば以後の src 差し替え再生が通る。
       try {
-        const a = new win.Audio(
-          "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=");
-        const p = a.play();
-        if (p && typeof p.catch === "function") p.catch(() => {});
+        const eng = voicevoxEngine || makeVoicevox();
+        if (eng && typeof eng.unlock === "function") eng.unlock();
       } catch { /* noop */ }
       session.start();
       renderEngine();
