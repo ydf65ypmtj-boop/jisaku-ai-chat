@@ -988,9 +988,9 @@ const POINTS_TOPUP_MENU = [
   { pct: 100, price: 180 },
 ];
 /* トップアップで得た「メーター追加 %」の保持先（端末内）。
-   時間制メーターの残量そのものはまだページに実装がないため、
-   追加分はここに積み上げてポイント表示のそばに出す。将来の
-   メーター実装はこの値を読んで残量に足す。 */
+   時間制メーター（cube_meter.js）がこの値を読み、基準単位
+   （600秒）に対する割合として秒に換算して残量へ足す。
+   ポイント側はこの累積 % を所有し、メーター側は読み取り専用。 */
 const POINTS_BONUS_KEY = "cube-points-meter-bonus-v1";
 
 /* JST（Asia/Tokyo）の日付キー "YYYY-MM-DD"。RPC 側の1日判定
@@ -1021,6 +1021,59 @@ function pointsNewTopupKey() {
   pointsTopupSeq += 1;
   return `meter_topup:${Date.now().toString(36)}_${pointsTopupSeq.toString(36)}` +
     Math.floor(Math.random() * 1296).toString(36);
+}
+
+/* Cube 時間制メーター（cube_meter.js）。サーバー側モデル
+   （Twin / Pro / Max / Ultra）の利用時間を数える。設定の上書きは
+   window.__CUBE_METER_CONFIG__（{plan, plans, congestion,
+   bonusUnitSec}）で渡せる。課金・学生判定は未決のため、既定は
+   全員 free プランで、プラン切替はこの設定でのみ行う。モジュール
+   が読み込まれていない環境ではメーターなし（従来挙動）になる。 */
+const METER_CONFIG_OVERRIDE =
+  (typeof window !== "undefined" && window.__CUBE_METER_CONFIG__) || null;
+
+let cubeMeterInstance = null;
+/* メーターのシングルトン。残量の保存先は端末の localStorage
+   （cube_meter.js 側のキー）。ポイント追加分（%）はポイント側の
+   保存キーからそのまま読む（書き換えない）。 */
+function getCubeMeter() {
+  if (cubeMeterInstance) return cubeMeterInstance;
+  if (typeof CubeMeter === "undefined") return null;
+  try {
+    cubeMeterInstance = CubeMeter.createMeter({
+      storage: {
+        getItem: (k) => {
+          try { return window.localStorage.getItem(k); } catch { return null; }
+        },
+        setItem: (k, v) => {
+          try { window.localStorage.setItem(k, v); } catch { /* 続行 */ }
+        },
+      },
+      config: CubeMeter.resolveConfig(METER_CONFIG_OVERRIDE),
+      onChange: () => {
+        try { App.renderMeter(); } catch { /* 表示前でも計量は続ける */ }
+      },
+    });
+  } catch {
+    cubeMeterInstance = null;
+  }
+  return cubeMeterInstance;
+}
+
+/* このモデルIDがメーター対象（サーバー側）かどうか。Ultra は
+   iMac サーバー固定、Twin / Pro / Max は engine "server"。
+   端末内モデル（Nano / Flash）は対象外。 */
+function meterAppliesTo(id) {
+  return id === "ultra" || modelDef(id).engine === "server";
+}
+
+/* メーター切れの例外。生成経路が残量0を検知したときに投げる。 */
+function meterEmptyError() {
+  const e = new Error(
+    "サーバーモデルの時間メーターが0になりました。Cube Nano / Cube Flash はこの端末で動くため、メーターなしで使えます。");
+  e.name = "MeterEmptyError";
+  e.code = "METER_EMPTY";
+  return e;
 }
 
 /* 記憶ビューの表示ラベル（モジュールの KIND_LABEL と同じ文言）。 */
@@ -1671,7 +1724,20 @@ async function loadUltraImac(onProgress) {
    振り分けは互換のため残してあるが、どちらも UI からは到達
    できない。回答フロー・バッジ・出典表示はどのエンジンでも同一。 */
 async function generateUltra(prompt, historyMessages) {
-  if (UltraImacModel.ready) return UltraImacModel.generate(prompt, historyMessages);
+  if (UltraImacModel.ready) {
+    /* iMac サーバーでの生成は時間制メーターの対象。残量0なら
+       生成を始めず、専用の例外で穏やかに止める。消費は実時間で
+       数える（失敗してもサーバーが動いた時間は消費する）。
+       端末内エンジン（ONNX / GGUF 版）へ落ちる経路はメーター
+       対象外（端末で動くため）。 */
+    const meter = getCubeMeter();
+    if (meter) {
+      if (!meter.canUse()) throw meterEmptyError();
+      return meter.consumeAround(
+        () => UltraImacModel.generate(prompt, historyMessages));
+    }
+    return UltraImacModel.generate(prompt, historyMessages);
+  }
   return UltraGgufModel.ready
     ? UltraGgufModel.generate(prompt, historyMessages)
     : UltraModel.generate(prompt, historyMessages);
@@ -1690,7 +1756,16 @@ function disposeUltra() {
    は同期だが、呼び出し側は常に await するので形をそろえてある。 */
 async function generateForModel(id, question, opts) {
   if (id === "ultra") return generateUltra(question, opts && opts.historyMessages);
-  if (modelDef(id).engine === "server") return ServerModel.generate(id, question);
+  if (modelDef(id).engine === "server") {
+    /* サーバーモデル（Twin / Pro / Max）は時間制メーターの対象。
+       残量0なら生成を始めず、専用の例外で穏やかに止める。 */
+    const meter = getCubeMeter();
+    if (meter) {
+      if (!meter.canUse()) throw meterEmptyError();
+      return meter.consumeAround(() => ServerModel.generate(id, question));
+    }
+    return ServerModel.generate(id, question);
+  }
   return LocalModel.generate(question, modelDef(id).maxNew);
 }
 
@@ -2737,6 +2812,189 @@ function cubeSelfAnswer(question) {
   return null;
 }
 
+/* ------------------------------------------------------------------ */
+/* 会話レーン（あいさつ・お礼・別れ・定番の雑談への即答）               */
+/*                                                                    */
+/* あいさつやお礼は事実の主張を含まない会話であり、裏づけの対象では    */
+/* ない。以前は通常の質問と同じ経路（モデル生成＋証拠集め＋文単位の    */
+/* 検証ゲート）に入り、自然な返事の文が「裏づけの無い主張」として      */
+/* 落とされ、「こんにちは」にすら「確認できませんでした」と返ることが  */
+/* あった。そこで、発話全体が定番の会話パターンに一致する場合だけ、    */
+/* 生成も検索も検証もせず、その場で丁寧な返事を返す専用レーンにする。  */
+/*                                                                    */
+/* 境界は保守的に引く：判定は正規化した発話全体への完全一致のみで、    */
+/* 事実の質問らしい語（何・誰・いつ・どこ・なぜ等）を含むものや、      */
+/* あいさつに事実の質問が続く複合文は一切拾わず、従来の経路に倒す。    */
+/* 事実についての原則（裏づけの無い主張は出さない）は緩めない：        */
+/* 緩めるのは「事実でない会話」だけである。返事は知識メモ帳にも        */
+/* 保存しない（Cube自身レーンと同じ扱い）。                            */
+/* ------------------------------------------------------------------ */
+
+/* 会話判定専用の正規化：前後の空白を除き、英字は小文字にし、空白を
+   詰め、末尾の句読点・感嘆符・波線と、末尾の「ね」「よ」を取り除く。 */
+function conversationKey(question) {
+  let t = String(question ?? "").trim().toLowerCase();
+  t = t.replace(/[\s　]+/g, "");
+  t = t.replace(/[！!？?。、・…〜~]+$/u, "");
+  t = t.replace(/(ね|よ)$/u, "");
+  t = t.replace(/[！!？?。、・…〜~]+$/u, "");
+  return t;
+}
+
+/* 事実の質問らしい語。完全一致の判定に対する二重の安全網として、
+   これらを含む発話は会話レーンでは拾わない。 */
+const CONVERSATION_FACT_GUARDS =
+  /何|誰|いつ|どこ|なぜ|どうして|どれ|どの|いくつ|いくら|教えて|とは/;
+
+/* 会話パターン（正規化した発話全体への完全一致）。種類 → 正規表現。 */
+const CONVERSATION_PATTERNS = [
+  ["greeting_morning", /^(おはようございます|おはよう|おはよー|おはよ|グッドモーニング|goodmorning)$/],
+  ["greeting_day", /^(こんにちは|こんにちわ|グッドアフタヌーン|goodafternoon)$/],
+  ["greeting_evening", /^(こんばんは|こんばんわ|グッドイーブニング|goodevening)$/],
+  ["greeting_neutral", /^(やあ|やっほー|やっほ|ハロー|ハーイ|hello|hi|hey|ども|どうも|おっす)$/],
+  ["first_meet", /^(はじめまして|初めまして)$/],
+  ["long_time", /^(お久しぶりです|お久しぶり|久しぶりです|久しぶり|ひさしぶり)$/],
+  ["otsukare", /^(おつかれさまです|おつかれさま|お疲れ様です|お疲れ様|おつかれ|ご苦労様です|ご苦労様|ご苦労さま)$/],
+  ["thanks", /^((ありがとうございます|ありがとうございました|ありがとう|ありがと|どうもありがとうございます|どうもありがとう|サンキュー|thankyou|thanks|感謝します)([。、](助かりました|たすかりました|助かった|たすかった))?|助かりました|たすかりました|助かった|たすかった)$/],
+  ["farewell", /^(さようなら|さよなら|サヨナラ|さよーなら|バイバイ|ばいばい|じゃあね|じゃね|またね|また明日|またあした|また今度|bye|seeyou|グッバイ)$/],
+  ["goodnight", /^(おやすみなさい|おやすみ|グッドナイト|goodnight)$/],
+  ["wellbeing", /^(元気|元気ですか|元気です|お元気ですか|元気にしてる|元気にしてますか|元気にしてます|調子はどう|調子はどうですか|調子どう|最近どう|最近どうですか|お変わりないですか|変わりないですか)$/],
+  ["apology", /^(ごめんなさい|ごめん|すみません|すいません|申し訳ありません|申し訳ないです|申し訳ない)$/],
+  ["ack", /^(わかりました|分かりました|わかった|分かった|了解です|了解しました|了解|なるほどです|なるほど|そうなんだ|そうなんですね|そうですね|オッケー|おっけー|オーケー|ok)$/],
+  ["ai_yes", /^(あなたはaiですか|aiですか|あなたはロボットですか|ロボットですか|あなたはaiなのですか|aiなのですか|あなたはaiなの|aiなの)$/],
+  ["human", /^(あなたは人間ですか|人間ですか|あなたは人間なのですか|人間なのですか|あなたは人間なの|人間なの)$/],
+];
+
+/* 種類ごとの返事（です・ます調）。同じ種類では言い回しを回し、
+   丸写しの固定文に見えないようにする。 */
+const CONVERSATION_REPLIES = {
+  greeting_morning: [
+    "おはようございます！今日もよろしくお願いします。",
+    "おはようございます。何かお手伝いできることはありますか。",
+    "おはようございます！いい一日になりますように。",
+  ],
+  greeting_day: [
+    "こんにちは！何かお手伝いできることはありますか。",
+    "こんにちは。今日もよろしくお願いします。",
+    "こんにちは！気になることがあれば、気軽に聞いてください。",
+  ],
+  greeting_evening: [
+    "こんばんは！今日もおつかれさまです。",
+    "こんばんは。何かお手伝いできることはありますか。",
+    "こんばんは！気になることがあれば、気軽に聞いてください。",
+  ],
+  first_meet: [
+    "はじめまして！私はCubeです。よろしくお願いします。",
+    "はじめまして。私はCubeといいます。よろしくお願いします。",
+  ],
+  long_time: [
+    "お久しぶりです！また話せてうれしいです。",
+    "お久しぶりです。お元気でしたか。",
+  ],
+  otsukare: [
+    "おつかれさまです！ゆっくり休んでください。",
+    "おつかれさまです。今日もがんばりましたね。",
+  ],
+  thanks: [
+    "どういたしまして。お役に立ててうれしいです。",
+    "どういたしまして！またいつでも聞いてください。",
+    "いえいえ、どういたしまして。",
+  ],
+  farewell: [
+    "さようなら。またいつでも話しかけてください。",
+    "さようなら！お元気でいてください。",
+    "またお話しできるのを楽しみにしています。さようなら。",
+  ],
+  goodnight: [
+    "おやすみなさい。ゆっくり休んでください。",
+    "おやすみなさい。また明日もよろしくお願いします。",
+  ],
+  wellbeing: [
+    "元気ですよ。聞いてくれてありがとうございます。あなたも元気ですか。",
+    "おかげさまで元気です。あなたは元気ですか。",
+    "元気です！今日もよろしくお願いします。",
+  ],
+  apology: [
+    "いえいえ、気にしないでください。",
+    "大丈夫ですよ。気にしないでください。",
+  ],
+  ack: [
+    "よかったです。他にも気になることがあれば、気軽に聞いてください。",
+    "はい！また何かあれば声をかけてください。",
+  ],
+  ai_yes: [
+    "はい、私はCubeというAIです。佑眞が作った自作LLMです。",
+    "はい、CubeというAI（自作LLM）です。人間ではありません。",
+  ],
+  human: [
+    "いいえ、私は人間ではなく、CubeというAI（自作LLM）です。",
+  ],
+};
+
+let conversationReplySeq = 0;
+function conversationReply(kind) {
+  const list = CONVERSATION_REPLIES[kind];
+  if (!list || list.length === 0) return null;
+  const text = list[conversationReplySeq % list.length];
+  conversationReplySeq += 1;
+  return text;
+}
+
+function conversationKindOfKey(key) {
+  for (const [kind, re] of CONVERSATION_PATTERNS) {
+    if (re.test(key)) return kind;
+  }
+  return null;
+}
+
+/* 時刻だけから決まるあいさつの種類（中立な呼びかけへの返し用）。 */
+function conversationTimeKind(hour) {
+  if (hour >= 5 && hour < 11) return "greeting_morning";
+  if (hour >= 11 && hour < 17) return "greeting_day";
+  return "greeting_evening";
+}
+
+/**
+ * 発話があいさつ・お礼・別れ・定番の雑談なら、その場の返事を返す。
+ * そうでなければ null（通常の流れに任せる）。now は時刻による
+ * 出し分けのテスト用に差し替え可能（通常は現在時刻）。
+ */
+function conversationAnswer(question, now) {
+  let key = conversationKey(question);
+  if (!key || key.length > 24) return null;
+  // 『…』「…」で対象を名指しする質問は会話ではない。
+  if (/[『「]/.test(key)) return null;
+  // 事実の質問らしい語を含むものは拾わない（安全側に倒す）。
+  if (CONVERSATION_FACT_GUARDS.test(key)) return null;
+  // 呼びかけ（「Cube、…」「…、キューブ」）は判定から外す。
+  key = key.replace(/^(cube|キューブ)(さん)?[、,]/, "");
+  key = key.replace(/[、,](cube|キューブ)(さん)?$/, "");
+  const date = now instanceof Date ? now : new Date();
+  const resolve = (kind) =>
+    conversationReply(
+      kind === "greeting_neutral"
+        ? conversationTimeKind(date.getHours())
+        : kind,
+    );
+  // 先行するあいさつ（「こんにちは、ありがとう」等）：あいさつ部分を
+  // 外して残りを判定する。残りが会話パターンでなければ拾わない
+  // （「こんにちは、富士山の高さは？」は事実の経路に倒す）。
+  const lead = key.match(
+    /^(おはようございます|おはよう|こんにちは|こんばんは|やあ|どうも|ハロー|hello)[、,！!]/,
+  );
+  if (lead) {
+    const rest = key.slice(lead[0].length);
+    if (rest) {
+      const kind = conversationKindOfKey(rest);
+      return kind ? resolve(kind) : null;
+    }
+    // 区切りだけが末尾に残った形（「こんにちは、」等）は単体として判定。
+    key = key.slice(0, key.length - 1);
+  }
+  const kind = conversationKindOfKey(key);
+  return kind ? resolve(kind) : null;
+}
+
 /**
  * 同語反復の文か：「「立方体」は「立方体」という意味です」のように、
  * 説明される語と説明の中身が同じで、意味を何も伝えていない文。
@@ -2765,6 +3023,540 @@ function isTautologicalAnswer(answer) {
   );
   if (meaningForm && same(meaningForm[1], meaningForm[2])) return true;
   return false;
+}
+
+/* ================================================================== */
+/* 場所・話題・買い物レーン（cube-server の /places・/topics・/shop）  */
+/*                                                                    */
+/* 事実質問の証拠レーンとは別に、cube-server の実データ API で答える  */
+/* 3つの担当レーン。どのレーンもモデル生成・検証ゲートを通さず、     */
+/* API が返した値をそのまま構造化して出す（数字は API フィールドの   */
+/* 転記だけ。モデルに言い換えさせない）。発火は保守的に絞る：        */
+/*   話題：定型の聞き方（「今の話題は？」等）に一致したときだけ。    */
+/*   場所：ジャンル語＋場所の手がかり（近さ・地名）があるときだけ。  */
+/*   買い物：購入相談のシグナルが明確なときだけ（事実の価格質問や    */
+/*   商品の知識質問は従来レーンのまま。迷ったら従来レーン）。        */
+/* サーバーに届かない・失敗した場合は何も出さず、呼び出し側の従来    */
+/* 経路に倒れる（フェイルソフト）。結果は変わる情報なので、どの      */
+/* レーンも知識メモ帳には保存しない。                               */
+/* ================================================================== */
+
+const PLACES_TIMEOUT_MS = 20000;
+const TOPICS_TIMEOUT_MS = 15000;
+const SHOP_TIMEOUT_MS = 20000;
+
+/* ISO 日時を「M月D日 H:MM」で返す（解釈できなければ空文字）。 */
+function formatTimestampLabel(iso) {
+  if (typeof iso !== "string" || !iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${d.getHours()}:${mm}`;
+}
+
+/* 距離（メートル）を表示用に整える。 */
+function formatDistanceLabel(m) {
+  if (typeof m !== "number" || !Number.isFinite(m) || m < 0) return "";
+  if (m < 1000) return `約${Math.round(m)}m`;
+  return `約${(m / 1000).toFixed(1)}km`;
+}
+
+/* http(s) の URL だけをリンクとして採用する。 */
+function httpUrlOrEmpty(u) {
+  return typeof u === "string" && /^https?:\/\//i.test(u) ? u : "";
+}
+
+/* ---- 場所レーン（POST /places） ---- */
+
+/* ジャンル語はサーバー側（places_endpoint.js の GENRES）と揃える。
+   ページ側は「場所の質問らしいか」の判定だけに使い、実際の検索
+   キーワードや地名の抽出はサーバーが行う（質問文をそのまま渡す）。 */
+const PLACES_GENRE_WORDS = [
+  "ドラッグストア", "薬局", "調剤", "コンビニ", "公園", "駅", "病院",
+  "クリニック", "医院", "診療所", "歯医者", "歯科", "カフェ", "喫茶店",
+  "コーヒー", "レストラン", "食堂", "飲食店", "ファストフード",
+  "ファーストフード", "郵便局", "銀行", "スーパー", "スーパーマーケット",
+  "ガソリンスタンド", "ガソリン", "駐車場", "パーキング", "ホテル",
+  "旅館", "図書館", "学校", "小学校", "中学校", "高校", "神社", "寺",
+  "寺院", "お寺", "交番", "警察署", "警察", "市役所", "区役所", "町役場",
+  "村役場", "美容室", "美容院", "理容室", "床屋", "パン屋", "ベーカリー",
+  "本屋", "書店", "ホームセンター", "温泉", "銭湯", "映画館", "シネマ",
+  "ジム", "フィットネス", "コインランドリー", "ランドリー", "水族館",
+  "動物園", "博物館", "美術館",
+];
+
+/* 事実の質問らしい語。場所レーンでは拾わないための安全網
+   （本社・歴史などの会社事実、件数を聞く質問、行き方・所要時間）。 */
+const PLACES_FACT_GUARDS =
+  /本社|創業|設立|歴史|とは|の意味|って何|日本一|世界一|日本で一番|世界で一番|いくつ|何軒|何件|何か所|までの時間|所要時間|行き方/;
+
+/**
+ * 場所系の質問かどうか。ジャンル語があり、かつ近さの表現・地名・
+ * 探す言い回しのいずれかがあるときだけ true。事実の質問
+ * （「法隆寺の高さは？」「コーヒーの淹れ方は？」等）は拾わない。
+ */
+function detectPlacesQuery(question) {
+  const q = String(question || "");
+  if (!q) return false;
+  if (PLACES_FACT_GUARDS.test(q)) return false;
+  if (!PLACES_GENRE_WORDS.some((w) => q.includes(w))) return false;
+  if (/近く|近所|周辺|近辺|付近|あたり|最寄|近い/.test(q)) return true;
+  if (/[^\s、。・]{1,20}(駅|市|区|町|村|県|都|府)/.test(q)) return true;
+  if (/(探して|検索して|見つけて|ありますか|ある？|ある\?)/.test(q)) return true;
+  return false;
+}
+
+/**
+ * /places に質問文をそのまま投げ、検証済みの形に整えて返す。
+ * 通信失敗・形が違う場合は null（呼び出し側は従来経路に倒れる）。
+ * サーバーが ok:false（両源とも失敗）を返した場合はそのまま返し、
+ * 呼び出し側が失敗として扱う。ok:true で0件は「本当に無い」。
+ * 端末位置は既存の仕組みが無いため送らない（地名はサーバーが
+ * 質問文から解決する）。
+ */
+async function fetchPlaces(question) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/places`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ q: question, limit: 8 }),
+      },
+      PLACES_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (
+    !res || !res.ok || !data ||
+    typeof data.ok !== "boolean" || !Array.isArray(data.places)
+  ) {
+    return null;
+  }
+  const places = [];
+  for (const p of data.places) {
+    if (!p || typeof p.name !== "string" || !p.name) continue;
+    places.push({
+      name: p.name,
+      address: typeof p.address === "string" ? p.address : "",
+      genre: Array.isArray(p.genre)
+        ? p.genre.filter((s) => typeof s === "string") : [],
+      tel: typeof p.tel === "string" ? p.tel : "",
+      hours: typeof p.hours === "string" ? p.hours : "",
+      distance_m: typeof p.distance_m === "number" ? p.distance_m : null,
+      nearest_station:
+        typeof p.nearest_station === "string" ? p.nearest_station : "",
+      sources: Array.isArray(p.sources)
+        ? p.sources.filter((s) => typeof s === "string") : [],
+      link: Array.isArray(p.links) ? httpUrlOrEmpty(p.links[0]) : "",
+    });
+  }
+  const query = data.query && typeof data.query === "object" ? data.query : {};
+  return {
+    ok: data.ok,
+    places,
+    keyword: typeof query.keyword === "string" ? query.keyword : "",
+    placeLabel: typeof query.place === "string" ? query.place : "",
+    centerLabel:
+      query.center && typeof query.center.label === "string"
+        ? query.center.label : "",
+    attribution: Array.isArray(data.attribution)
+      ? data.attribution.filter((s) => typeof s === "string") : [],
+  };
+}
+
+/* 場所1件を表示用カードにする。 */
+function placeCardOf(p) {
+  return {
+    kind: "place",
+    name: p.name,
+    address: p.address || "",
+    genre: Array.isArray(p.genre) ? p.genre : [],
+    tel: p.tel || "",
+    hours: p.hours || "",
+    distance_m: typeof p.distance_m === "number" ? p.distance_m : null,
+    nearest_station: p.nearest_station || "",
+    sources: Array.isArray(p.sources) ? p.sources : [],
+    link: httpUrlOrEmpty(p.link),
+  };
+}
+
+/* ---- 話題レーン（GET /topics） ---- */
+
+const TOPIC_SOURCE_LABELS = {
+  google_trends: "Googleトレンド",
+  yahoo_news: "Yahoo!ニュース",
+  nhk_news: "NHKニュース",
+  hatena_hot: "はてなブックマーク",
+};
+
+function topicSourceLabel(key) {
+  return TOPIC_SOURCE_LABELS[key] || (typeof key === "string" ? key : "");
+}
+
+/**
+ * 「今の話題・ニュースを教えて」系の定型の聞き方かどうか。
+ * 末尾の句読点を落としてから、文全体への一致で判定する。具体的な
+ * 事実を聞く質問（「今日のニュースで発表された〜の価格は？」等）は
+ * 一致しないので従来経路に倒れる。
+ */
+function detectTopicsQuery(question) {
+  const q = String(question || "").trim()
+    .replace(/[！!？?。、…〜~\s]+$/u, "");
+  if (!q) return false;
+  if (/とは|の意味|って何|なぜ|本当ですか|デマ|嘘/.test(q)) return false;
+  const patterns = [
+    /^(今|今日|最近|昨日|最新)の?(話題|ニュース|トレンド)(は|って|を|が|について)?(何|なに|教えて|見せて|知りたい|ある|ありますか|です|だ)?$/,
+    /^(話題|ニュース|トレンド)(は|って|を|が|について)?(何|なに|教えて|見せて|知りたい|ある|ありますか)?$/,
+    /^(今|今日|最近)?(何|なに)が話題(になって(い)?る|ですか|なの|だ)?$/,
+    /^世間(の|で)(話題|ニュース)(は|を)?(何|なに|教えて)?$/,
+    /^急上昇(ワード|検索|トレンド|キーワード)?(は|を|について)?(何|なに|教えて)?$/,
+    /^はてブ(の)?(人気|話題|ホットエントリー|エントリー)?(は|を)?(何|なに|教えて)?$/,
+  ];
+  return patterns.some((re) => re.test(q));
+}
+
+/**
+ * /topics から今の話題を取り、検証済みの形に整えて返す。
+ * 失敗・形が違う場合は null。stale（古いキャッシュ）のときは
+ * stale:true をそのまま返し、表示側で「少し前の話題」と出す。
+ */
+async function fetchTopics(limit, timeoutMs) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/topics?limit=${limit || 10}`,
+      { method: "GET" },
+      timeoutMs || TOPICS_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || !Array.isArray(data.topics)) return null;
+  const topics = [];
+  for (const t of data.topics) {
+    if (!t || typeof t.title !== "string" || !t.title) continue;
+    topics.push({
+      title: t.title,
+      link: typeof t.link === "string" ? t.link : "",
+      snippet: typeof t.snippet === "string" ? t.snippet : "",
+      published: typeof t.published === "string" ? t.published : "",
+      sources: Array.isArray(t.sources)
+        ? t.sources.filter((s) => typeof s === "string")
+        : (typeof t.source === "string" ? [t.source] : []),
+    });
+  }
+  return {
+    topics,
+    stale: data.stale === true,
+    fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+  };
+}
+
+/* 話題1件を表示用カードにする。出典ラベルは必ず付ける。 */
+function topicCardOf(t) {
+  const labels = (Array.isArray(t.sources) ? t.sources : [])
+    .map(topicSourceLabel)
+    .filter(Boolean);
+  return {
+    kind: "topic",
+    title: t.title,
+    link: httpUrlOrEmpty(t.link),
+    snippet: t.snippet || "",
+    published: t.published || "",
+    sourceLabel: labels.join("・"),
+  };
+}
+
+/* ---- 買い物レーン（POST /shop） ---- */
+
+/* 事実の質問らしい語。買い物レーンでは拾わない（定価・発売当時の
+   価格・相場・知識質問は従来の事実レーンの担当）。 */
+const SHOP_FACT_GUARDS =
+  /定価|希望小売価格|発売日|発売当時|発売価格|発売された|当時の価格|当時の値段|の相場|とは|の意味|って何|の違い|仕組み/;
+
+/* 購入相談のシグナル（設計 §5.1）。これが明確なときだけ発火する。
+   価格条件の指定もシグナルとして扱う（extractShopConditions 側）。 */
+const SHOP_SIGNALS = [
+  /買いたい/, /買おう/, /欲しい/, /ほしい/, /購入したい/,
+  /探して(いる|います|る|ください)?/, /探し中/, /買い替え/, /買い換え/,
+  /プレゼント/, /贈(りたい|り物)/, /おすすめ/,
+  /安い[^。]{0,24}(どれ|は？|は\?|ありますか|ある？|ある\?)/,
+  /安く(買える|買いたい|手に入る)/, /買える/,
+  /人気[^。]{0,24}(どれ|は？|は\?|ありますか)/,
+  /(人気|おすすめ)の[^。]{1,30}(教えて|欲しい|買いたい|探して|見せて|ください)/,
+];
+
+/* キーワードとして意味を成さない語（これだけなら聞き返す）。 */
+const SHOP_EMPTY_KEYWORDS = new Set([
+  "何か", "なにか", "何", "なんか", "もの", "商品", "アイテム", "品物",
+]);
+
+/* 商品ではなく場所・体験を指す語（「人気の観光地は？」等）。
+   これだけがキーワードなら買い物レーンには入らない。 */
+const SHOP_NON_PRODUCT_KEYWORDS = new Set([
+  "観光地", "観光スポット", "観光", "スポット", "名所", "旅行先",
+  "店", "お店", "レストラン", "飲食店", "食堂",
+]);
+
+/**
+ * 質問文から検索条件（価格帯・送料無料・並び）をルールで抽出する。
+ * 数値は質問文に実際にあるものだけを使う。
+ */
+function extractShopConditions(question) {
+  const q = String(question || "");
+  const cond = {
+    price_min: null, price_max: null, free_shipping: false, sort: "score",
+  };
+  const man = (s) => Math.round(parseFloat(s) * 10000);
+  const yen = (s) => parseInt(String(s).replace(/,/g, ""), 10);
+  let m;
+  // 「○円から○円」「○万円から○万円」の範囲指定を先に拾う。
+  if ((m = q.match(/(\d[\d,]*)\s*円\s*から\s*(\d[\d,]*)\s*円/))) {
+    cond.price_min = yen(m[1]);
+    cond.price_max = yen(m[2]);
+  } else if (
+    (m = q.match(/(\d+(?:\.\d+)?)\s*万円?\s*から\s*(\d+(?:\.\d+)?)\s*万円?/))
+  ) {
+    cond.price_min = man(m[1]);
+    cond.price_max = man(m[2]);
+  }
+  if ((m = q.match(/予算\s*(は|が|約|だいたい)?\s*(\d+(?:\.\d+)?)\s*万円/))) {
+    cond.price_max = man(m[2]);
+  } else if ((m = q.match(/予算\s*(は|が|約|だいたい)?\s*(\d[\d,]*)\s*円/))) {
+    cond.price_max = yen(m[2]);
+  }
+  if ((m = q.match(/(\d+(?:\.\d+)?)\s*万円?\s*(以下|以内|まで|くらい|程度|前後)/))) {
+    cond.price_max = man(m[1]);
+  }
+  if ((m = q.match(/(\d+(?:\.\d+)?)\s*万円?\s*(以上|から)/))) {
+    cond.price_min = man(m[1]);
+  }
+  if (cond.price_max === null &&
+      (m = q.match(/(\d[\d,]*)\s*円\s*(以下|以内|まで|くらい|程度|前後)/))) {
+    cond.price_max = yen(m[1]);
+  }
+  if (cond.price_min === null &&
+      (m = q.match(/(\d[\d,]*)\s*円\s*(以上|から)/))) {
+    cond.price_min = yen(m[1]);
+  }
+  if (/送料\s*(無料|込み|が無料)/.test(q)) cond.free_shipping = true;
+  if (/安い順|安いものから|安い方から|価格の安い順|値段の安い順/.test(q)) {
+    cond.sort = "price_asc";
+  } else if (/高い順|高いものから|価格の高い順/.test(q)) {
+    cond.sort = "price_desc";
+  } else if (/人気順|人気の|評価の高い順|評価が高い|レビューの多い順|レビューが多い/.test(q)) {
+    cond.sort = "review_count";
+  }
+  return cond;
+}
+
+/**
+ * 質問文から検索キーワードを取り出す。条件表現と相談の定型句を
+ * 取り除いた残りだけを使うので、キーワードは必ず質問文に実在
+ * する語になる（モデルに商品名を作らせない）。
+ */
+function extractShopKeyword(question) {
+  let t = String(question || "");
+  // 条件表現を取り除く（金額・送料・並び）。金額の直後の「の」
+  // （「5000円の本」）も一緒に取り除く。
+  t = t.replace(/予算\s*(は|が|約|だいたい)?\s*\d[\d,]*(?:\.\d+)?\s*万?円?/g, " ");
+  t = t.replace(/\d[\d,]*(?:\.\d+)?\s*万\s*円?\s*(以下|以内|まで|以上|から|くらい|程度|前後|の)?/g, " ");
+  t = t.replace(/\d[\d,]*\s*円\s*(以下|以内|まで|以上|から|くらい|程度|前後|の)?/g, " ");
+  t = t.replace(/送料\s*(無料|込み|が無料)/g, " ");
+  t = t.replace(/人気順|評価の高い順|レビュー順|新着順|価格順|安い順|高い順|順(で|に)/g, " ");
+  // 相談の定型句を取り除く。
+  t = t.replace(/が欲しい|を買いたい|買いたい|欲しい|ほしい|を購入したい|購入したい/g, " ");
+  t = t.replace(/を探して(いる|います|る)?|探して(いる|います|る)?|探し中/g, " ");
+  t = t.replace(/のおすすめ|おすすめの|おすすめは|おすすめを|おすすめ/g, " ");
+  t = t.replace(/プレゼントに|プレゼント用|プレゼント/g, " ");
+  t = t.replace(/買い替え(たい|る|の)?|買い換え(たい|る)?/g, " ");
+  t = t.replace(/安く買える|安く買いたい|買える|安い|安く|高い|高く/g, " ");
+  t = t.replace(/人気の|人気が(ある|高い)|評価の高い|レビューの多い|よく売れている/g, " ");
+  t = t.replace(/教えて(ください)?|ありますか|ある？|ある\?|はどれ(ですか)?|どれが(いい|良い|おすすめ)|がいい(ですか)?|ください|を探す|を検索/g, " ");
+  t = t.replace(/もっと|だけ(で|にして)|にして|に変えて/g, " ");
+  t = t.replace(/[、。・！？!?「」『』（）()]/g, " ");
+  // 助詞だけの語を落とし、前後の助詞を整える。先頭の助詞は
+  // 漢字・カタカナの語が続くときだけ落とす（「はちみつ」の「は」
+  // のような商品名の一部を削らないため）。末尾も同様に、
+  // 漢字・カタカナの直後の助詞だけを落とす（「すもも」保護）。
+  const PARTICLE_ONLY = /^(の|が|を|は|に|で|と|も|へ|から|まで|や)$/;
+  let kw = t.split(/\s+/)
+    .filter((tok) => tok && !PARTICLE_ONLY.test(tok))
+    .join(" ")
+    .trim();
+  kw = kw.replace(/^(の|が|を|は|に|で|と|も|へ)+(?=[一-龯ァ-ヶ])/, "");
+  kw = kw.replace(/([一-龯ァ-ヶー])(の|が|を|は|に|で|と|も|へ)$/, "$1");
+  if (/^(の|が|を|は|に|で|と|も|へ)+$/.test(kw)) kw = "";
+  return kw;
+}
+
+/**
+ * 質問が買い物相談なら {keyword, conditions} を返す。購入相談だが
+ * キーワードが取れなければ {askBack:true}。買い物相談でなければ
+ * null（従来レーンに任せる）。prev（前回の {keyword, conditions}）
+ * がある場合、「もっと安いの」「送料無料だけにして」等の条件変更
+ * の続きも拾う（買い物レーンが直前に動いた会話に限る）。
+ */
+function parseShopQuery(question, prev) {
+  const q = String(question || "").trim();
+  if (!q) return null;
+  if (SHOP_FACT_GUARDS.test(q)) return null;
+  const cond = extractShopConditions(q);
+  const keyword = extractShopKeyword(q);
+  // 続きの条件変更：前回の商品のまま、条件だけを差し替える。
+  if (prev && prev.keyword && (!keyword || keyword === prev.keyword)) {
+    const changed =
+      /もっと|にして|に変えて|だけ(で|にして)|絞って|緩めて/.test(q) ||
+      cond.price_max !== null || cond.price_min !== null ||
+      /送料/.test(q) || cond.sort !== "score";
+    if (changed) {
+      const merged = { ...(prev.conditions || {}) };
+      if (cond.price_max !== null) merged.price_max = cond.price_max;
+      if (cond.price_min !== null) merged.price_min = cond.price_min;
+      if (/送料\s*(無料|込み)/.test(q)) merged.free_shipping = true;
+      if (/送料は気にしない|送料ありでも/.test(q)) merged.free_shipping = false;
+      if (/もっと安い|もっと安く|安くして|安いのにして/.test(q)) {
+        merged.sort = "price_asc";
+      } else if (/もっと高い|高いのにして/.test(q)) {
+        merged.sort = "price_desc";
+      } else if (cond.sort !== "score") {
+        merged.sort = cond.sort;
+      }
+      return { keyword: prev.keyword, conditions: merged, continuation: true };
+    }
+  }
+  const hasSignal =
+    SHOP_SIGNALS.some((re) => re.test(q)) ||
+    cond.price_max !== null || cond.price_min !== null;
+  if (!hasSignal) return null;
+  if (!keyword || SHOP_EMPTY_KEYWORDS.has(keyword)) {
+    return { askBack: true, conditions: cond };
+  }
+  if (SHOP_NON_PRODUCT_KEYWORDS.has(keyword)) return null;
+  return { keyword, conditions: cond, continuation: false };
+}
+
+/**
+ * /shop に正規化した条件を投げ、検証済みの形に整えて返す。
+ * 失敗・形が違う場合は null（呼び出し側は従来経路に倒れる）。
+ * ゼロ件は total:0・candidates:[] で返る（失敗とは区別する）。
+ */
+async function fetchShop(keyword, conditions) {
+  const cond = conditions || {};
+  const body = {
+    query: keyword,
+    sort: cond.sort || "score",
+    limit: 5,
+  };
+  if (typeof cond.price_min === "number") body.price_min = cond.price_min;
+  if (typeof cond.price_max === "number") body.price_max = cond.price_max;
+  if (cond.free_shipping) body.free_shipping = true;
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/shop`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      SHOP_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (
+    !res || !res.ok || !data || data.ok !== true ||
+    !Array.isArray(data.candidates)
+  ) {
+    return null;
+  }
+  const candidates = [];
+  for (const c of data.candidates) {
+    if (!c || typeof c.name !== "string" || !c.name) continue;
+    candidates.push(shopCardOf(c));
+  }
+  return {
+    total: typeof data.total === "number" ? data.total : candidates.length,
+    candidates,
+    fetchedAt: typeof data.fetched_at === "string" ? data.fetched_at : "",
+    attribution: Array.isArray(data.attribution)
+      ? data.attribution.filter((s) => typeof s === "string") : [],
+    guardExcluded:
+      typeof data.guard_excluded === "number" ? data.guard_excluded : 0,
+  };
+}
+
+/* 商品1件を表示用カードにする。数字は API フィールドの転記だけ。 */
+function shopCardOf(c) {
+  return {
+    kind: "shop",
+    name: c.name,
+    price: typeof c.price === "number" ? c.price : null,
+    tax_included: c.tax_included !== false,
+    url: httpUrlOrEmpty(c.url),
+    image: httpUrlOrEmpty(c.image),
+    in_stock: c.in_stock !== false,
+    shipping_label:
+      typeof c.shipping_label === "string" && c.shipping_label
+        ? c.shipping_label : "",
+    review_rate: typeof c.review_rate === "number" ? c.review_rate : null,
+    review_count: typeof c.review_count === "number" ? c.review_count : 0,
+    shop_name: typeof c.shop_name === "string" ? c.shop_name : "",
+    genre_name: typeof c.genre_name === "string" ? c.genre_name : "",
+    rank_reason: typeof c.rank_reason === "string" ? c.rank_reason : "",
+  };
+}
+
+/* 買い物レーンの導入文。ユーザーが言った条件の再掲だけで作り、
+   候補の数字（価格・評価など）は文章に入れない。 */
+function shopIntroText(keyword, conditions) {
+  const cond = conditions || {};
+  const parts = [];
+  const yenLabel = (n) => `${Number(n).toLocaleString("ja-JP")}円`;
+  if (typeof cond.price_min === "number" &&
+      typeof cond.price_max === "number") {
+    parts.push(`${yenLabel(cond.price_min)}〜${yenLabel(cond.price_max)}`);
+  } else if (typeof cond.price_max === "number") {
+    parts.push(`${yenLabel(cond.price_max)}以下`);
+  } else if (typeof cond.price_min === "number") {
+    parts.push(`${yenLabel(cond.price_min)}以上`);
+  }
+  if (cond.free_shipping) parts.push("送料無料");
+  const sortNote = {
+    price_asc: "価格の安い順",
+    price_desc: "価格の高い順",
+    review_count: "レビュー件数の多い順",
+  }[cond.sort || "score"] || "";
+  let text = parts.length
+    ? `${parts.join("・")}の条件で「${keyword}」を探しました。`
+    : `「${keyword}」を探しました。`;
+  if (sortNote) text += `（${sortNote}に並べています）`;
+  return text;
+}
+
+/* ポイント付与の冪等キー用の条件ハッシュ（FNV-1a）。 */
+function shopConditionsHash(keyword, conditions) {
+  const cond = conditions || {};
+  const s = JSON.stringify({
+    q: keyword || "",
+    min: typeof cond.price_min === "number" ? cond.price_min : null,
+    max: typeof cond.price_max === "number" ? cond.price_max : null,
+    fs: !!cond.free_shipping,
+    sort: cond.sort || "score",
+  });
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
 }
 
 /**
@@ -9494,6 +10286,118 @@ async function fetchArticle(q) {
 }
 
 /* ================================================================== */
+/* 証拠取得のサーバー側レーン（cube-server の /evidence）               */
+/*                                                                    */
+/* 事実質問の証拠集め（対象記事＋照合用検索）は、ページ側の索引        */
+/* レーンが HF への Range 取得を1問あたり約1,000〜15,000回叩くため、  */
+/* ブラウザ文脈では半分以上の質問が完走しなかった（2026-11-18/19 の  */
+/* 実測）。そこで取得そのものを cube-server 側に寄せる：サーバーは    */
+/* ページと同じ取得コード（resolveArticleSource / searchWikipedia）  */
+/* を iMac 上で実行し、証拠一式を1回の往復で返す。検証ゲートの判定    */
+/* は従来どおりページ側に残り、サーバーは証拠テキストを返すだけ。    */
+/* サーバーに届かない・失敗した場合は、従来のページ側レーンに         */
+/* そのまま倒れる（フェイルソフト）。                               */
+/* ================================================================== */
+
+/**
+ * サーバー側レーンに証拠一式を問い合わせる。成功したら
+ * {article, results, error}（ページ側レーンと同じ形）、失敗したら
+ * null を返す。サーバーが「収集は完走したが証拠が無かった」と
+ * 答えた場合は空の束を返し、無駄なページ側レーンは走らせない。
+ * サーバー側で収集自体が失敗した（証拠ゼロ＋エラーあり）場合は
+ * null に倒し、ページ側レーンで取り直す。
+ */
+async function fetchServerEvidence(question) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/evidence`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ q: question }),
+      },
+      EVIDENCE_SERVER_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (
+    !res ||
+    !res.ok ||
+    !data ||
+    data.lane !== "evidence" ||
+    typeof data.ms !== "number"
+  ) {
+    return null;
+  }
+  let article = null;
+  const a = data.article;
+  if (
+    a &&
+    typeof a.title === "string" &&
+    typeof a.url === "string" &&
+    typeof a.lead === "string" &&
+    a.fields &&
+    typeof a.fields === "object"
+  ) {
+    article = { title: a.title, url: a.url, lead: a.lead, fields: a.fields };
+  }
+  const results = [];
+  if (Array.isArray(data.results)) {
+    for (const r of data.results) {
+      if (!r || typeof r.title !== "string" || typeof r.text !== "string") {
+        continue;
+      }
+      results.push({
+        title: r.title,
+        url: typeof r.url === "string" ? r.url : "",
+        snippet: typeof r.snippet === "string" ? r.snippet : "",
+        text: r.text,
+      });
+    }
+  }
+  const error = typeof data.error === "string" ? data.error : "";
+  if (!article && results.length === 0 && error) return null;
+  WikiNet.via = "server";
+  WikiNet.lastError = error;
+  return { article, results, error };
+}
+
+/**
+ * 証拠の入口：まずサーバー側レーンを試し、失敗・タイムアウトの
+ * ときだけ従来のページ側レーン（fetchArticle ＋ searchWikipedia）
+ * を開始する。ask() が使う2つの約束（articlePromise /
+ * searchPromise）を返す。ページ側レーンはサーバーの失敗が確定
+ * するまで開始しない（二重に取得を走らせないため）。
+ */
+function startEvidencePromises(question) {
+  const bundlePromise = fetchServerEvidence(question);
+  let pageArticle = null;
+  let pageSearch = null;
+  const ensurePageLane = () => {
+    if (!pageArticle) {
+      pageArticle = fetchArticle(question).catch(() => null);
+      pageSearch = searchWikipedia(question).catch(() => []);
+    }
+  };
+  const articlePromise = (async () => {
+    const bundle = await bundlePromise;
+    if (bundle) return bundle.article;
+    ensurePageLane();
+    return pageArticle;
+  })();
+  const searchPromise = (async () => {
+    const bundle = await bundlePromise;
+    if (bundle) return bundle.results;
+    ensurePageLane();
+    return pageSearch;
+  })();
+  return { articlePromise, searchPromise };
+}
+
+/* ================================================================== */
 /* 知識メモ帳（この端末のブラウザ内に保存）                             */
 /* ================================================================== */
 
@@ -9585,10 +10489,25 @@ const Notebook = {
      索引レーンの暴走防止だけに使う大きな上限。
    - 待ち予算（EVIDENCE_WAIT_MS）：生成が終わってから証拠の到着を
      待つ上限。生成時間とは独立に数えるため、モデルの速さで
-     証拠のそろい方が変わらない。証拠が早くそろえば即座に進む。 */
+     証拠のそろい方が変わらない。証拠が早くそろえば即座に進む。
+   証拠集めの主経路はサーバー側レーン（cube-server の /evidence、
+   startEvidencePromises 参照）：ページと同じ取得コードを iMac 上で
+   実行し、証拠一式を1回の往復で受け取る。サーバー実測（2026-11-19、
+   索引は iMac ローカルのミラーから取得、PC 測定と同時実行の負荷下）
+   では通常の質問が0.4〜1.4秒、索引リクエスト約1.5万回の重量級
+   （日本で一番深い湖）でも7.4秒で完走したため、待ち予算は
+   旧来の90秒から60秒へ詰める。サーバーが落ちている・届かない
+   ときは従来のページ側レーンに倒れ、その場合の暴走防止は引き続き
+   レーン予算が担う（待ち予算より長く残すのは、生成と並行して
+   証拠集めが先行している分を打ち切らないため）。 */
 const EVIDENCE_LANE_BUDGET_MS = 150000;
 const EVIDENCE_LANE_MAX_REQUESTS = 60000;
-const EVIDENCE_WAIT_MS = 90000;
+const EVIDENCE_WAIT_MS = 60000;
+/* /evidence へのページ側タイムアウト。サーバー側の処理（レーン
+   予算150秒が上限）より短く切り、届かなければページ側レーンへ
+   切り替えるための上限。サーバー実測の最長7.4秒（重量級の質問の
+   コールド実行）に対して約6倍の余裕を持たせた値。 */
+const EVIDENCE_SERVER_TIMEOUT_MS = 45000;
 
 const BADGES = {
   notebook: { label: "知識メモ帳の答え", className: "badge-notebook" },
@@ -9608,6 +10527,18 @@ const BADGES = {
   },
   "weather-om": { label: "天気情報（Open-Meteo）", className: "badge-weather" },
   briefing: { label: "朝のブリーフィング（Cube Ultra）", className: "badge-briefing" },
+  places: {
+    label: "場所の検索結果（Yahoo! JAPAN・OpenStreetMap）",
+    className: "badge-places",
+  },
+  topics: {
+    label: "今の話題（ニュース・トレンドの紹介）",
+    className: "badge-topics",
+  },
+  shop: {
+    label: "買い物候補（Yahoo!ショッピング）",
+    className: "badge-shop",
+  },
   model: {
     label: "Cubeの答え（ネットで確認済み）",
     className: "badge-model",
@@ -9669,6 +10600,7 @@ const App = {
     Notebook.load();
     this.initMemory();
     this.initAccount();
+    this.renderMeter();
     // 選択中のモデルを復元する（初期値は v1）。ベースURLはモデルごとの
     // 上書きとして読み込む（v1 は従来キー、v2 / Twin / Pro / Max は専用キー）。
     const savedId = store.get(MODEL_ID_KEY);
@@ -10334,6 +11266,14 @@ const App = {
     p.className = "answer";
     p.textContent = msg.text;
     li.appendChild(p);
+    // 場所・話題・買い物レーンの構造化カード（API の値の転記だけ）。
+    if (Array.isArray(msg.cards) && msg.cards.length) {
+      try {
+        li.appendChild(this.buildLaneCards(msg.cards));
+      } catch {
+        /* カード描画の失敗は会話を妨げない */
+      }
+    }
     if (msg.evidence) {
       const ev = document.createElement("p");
       ev.className = "evidence";
@@ -10382,9 +11322,200 @@ const App = {
     this.scrollChat();
   },
 
+  /* ---- 場所・話題・買い物レーンのカード描画 ----
+     数字や固有名詞はカードのデータ（API の値）からだけ作る。
+     文章の生成はしない。 */
+
+  buildLaneCards(cards) {
+    const wrap = document.createElement("div");
+    wrap.className = "lane-cards";
+    for (const card of cards) {
+      if (!card || typeof card !== "object") continue;
+      if (card.kind === "place") wrap.appendChild(this.buildPlaceCard(card));
+      else if (card.kind === "topic") {
+        wrap.appendChild(this.buildTopicCard(card));
+      } else if (card.kind === "shop") {
+        wrap.appendChild(this.buildShopCard(card));
+      } else if (card.kind === "suggest") {
+        wrap.appendChild(this.buildSuggestChip(card));
+      }
+    }
+    return wrap;
+  },
+
+  buildPlaceCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    if (card.link) {
+      const a = document.createElement("a");
+      a.href = card.link;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = card.name;
+      title.appendChild(a);
+    } else {
+      title.textContent = card.name;
+    }
+    div.appendChild(title);
+    const meta = [];
+    if (card.address) meta.push(card.address);
+    const dist = formatDistanceLabel(card.distance_m);
+    if (dist) meta.push(dist);
+    if (card.nearest_station) meta.push(`最寄り：${card.nearest_station}`);
+    if (Array.isArray(card.genre) && card.genre.length) {
+      meta.push(card.genre.join("・"));
+    }
+    if (card.hours) meta.push(`営業時間：${card.hours}`);
+    if (card.tel) meta.push(`電話：${card.tel}`);
+    if (meta.length) {
+      const m = document.createElement("p");
+      m.className = "lane-card-meta";
+      m.textContent = meta.join("　");
+      div.appendChild(m);
+    }
+    const srcLabels = (Array.isArray(card.sources) ? card.sources : [])
+      .map((s) => (s === "yahoo" ? "Yahoo! JAPAN"
+        : s === "osm" ? "OpenStreetMap" : s))
+      .filter(Boolean);
+    if (srcLabels.length) {
+      const sp = document.createElement("p");
+      sp.className = "lane-card-meta";
+      sp.textContent = `出典：${srcLabels.join(" / ")}`;
+      div.appendChild(sp);
+    }
+    return div;
+  },
+
+  buildTopicCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    if (card.link) {
+      const a = document.createElement("a");
+      a.href = card.link;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = card.title;
+      title.appendChild(a);
+    } else {
+      title.textContent = card.title;
+    }
+    div.appendChild(title);
+    const meta = [];
+    if (card.sourceLabel) meta.push(card.sourceLabel);
+    const when = formatTimestampLabel(card.published);
+    if (when) meta.push(when);
+    if (meta.length) {
+      const m = document.createElement("p");
+      m.className = "lane-card-meta";
+      m.textContent = meta.join("　");
+      div.appendChild(m);
+    }
+    if (card.snippet && card.snippet !== card.title) {
+      const s = document.createElement("p");
+      s.className = "lane-card-snippet";
+      s.textContent = card.snippet;
+      div.appendChild(s);
+    }
+    return div;
+  },
+
+  buildShopCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    if (card.url) {
+      const a = document.createElement("a");
+      a.href = card.url;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = card.name;
+      title.appendChild(a);
+    } else {
+      title.textContent = card.name;
+    }
+    div.appendChild(title);
+    if (card.image) {
+      const img = document.createElement("img");
+      img.className = "lane-card-img";
+      img.src = card.image;
+      img.alt = card.name;
+      img.loading = "lazy";
+      div.appendChild(img);
+    }
+    if (typeof card.price === "number") {
+      const price = document.createElement("p");
+      price.className = "lane-card-price";
+      price.textContent =
+        `${card.price.toLocaleString("ja-JP")}円` +
+        (card.tax_included ? "（税込）" : "（税別）");
+      div.appendChild(price);
+    }
+    const meta = [];
+    meta.push(card.shipping_label || "送料は商品ページでご確認ください");
+    if (card.in_stock === false) meta.push("在庫なし");
+    if (typeof card.review_rate === "number" && card.review_count > 0) {
+      meta.push(`評価 ${card.review_rate}（${card.review_count}件）`);
+    }
+    if (card.shop_name) meta.push(card.shop_name);
+    if (card.rank_reason) meta.push(card.rank_reason);
+    const m = document.createElement("p");
+    m.className = "lane-card-meta";
+    m.textContent = meta.join("　");
+    div.appendChild(m);
+    return div;
+  },
+
+  /* 条件を緩める提案チップ（ゼロ件のとき）。押すとその質問で
+     もう一度聞く。 */
+  buildSuggestChip(card) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "lane-suggest";
+    btn.textContent = card.label || "";
+    btn.addEventListener("click", () => {
+      void this.ask(card.query);
+    });
+    return btn;
+  },
+
+  /* 買い物レーンの検索が表示まで至ったら、モール横断検索と同じ
+     mall_search 種別で +1pt（1日3pt上限はサーバー側 RPC が種別
+     単位で数えるため、モールサイト分と合算になる）。冪等キーは
+     cube_shop: 前置で発生元を区別する。未ログイン・失敗時は
+     何もしない（ポイントは付加機能）。 */
+  async earnShopPoints(keyword, conditions) {
+    try {
+      const backend = this.pointsBackend();
+      const mgr = this.account;
+      if (!backend || !mgr || !mgr.user) return;
+      const key =
+        `cube_shop:${pointsJstDateKey()}:${shopConditionsHash(keyword, conditions)}`;
+      let before = null;
+      try {
+        before = await backend.fetchBalance();
+      } catch { /* 残高が取れなくても付与の試行は続ける */ }
+      const after = await backend.earn(
+        "mall_search", key, { source: "cube_shop" });
+      if (typeof after === "number") {
+        if (before !== null && after > before) {
+          this.showPointsNote("+1 pt（買い物検索）");
+        }
+        this.pointsBalance = after;
+        this.renderPoints();
+      }
+    } catch {
+      /* ポイントの失敗は会話を妨げない */
+    }
+  },
+
   /* 朝のブリーフィングを会話の一番上に差す（pushAssistant と同じ
      形だが、末尾ではなく先頭に入れる）。 */
-  pushBriefing(text) {
+  pushBriefing(text, briefingTopics) {
     el("empty-state").hidden = true;
     const li = document.createElement("li");
     li.className = "msg-ai";
@@ -10396,6 +11527,30 @@ const App = {
     p.className = "answer";
     p.textContent = text;
     li.appendChild(p);
+    // 今の話題（/topics）：見出しと出典をそのまま並べる「紹介」で、
+    // Ultra の文章とは混ぜない。stale のときは少し前の情報と明示する。
+    if (
+      briefingTopics &&
+      Array.isArray(briefingTopics.cards) &&
+      briefingTopics.cards.length
+    ) {
+      const sec = document.createElement("div");
+      sec.className = "lane-cards";
+      const head = document.createElement("p");
+      head.className = "lane-card-title";
+      head.textContent = briefingTopics.stale
+        ? "今の話題（少し前の時点の情報）"
+        : "今の話題";
+      sec.appendChild(head);
+      for (const card of briefingTopics.cards) {
+        try {
+          sec.appendChild(this.buildTopicCard(card));
+        } catch {
+          /* 1件の描画失敗でブリーフィング全体は落とさない */
+        }
+      }
+      li.appendChild(sec);
+    }
     const list = el("msg-list");
     list.insertBefore(li, list.children[0] || null);
   },
@@ -10470,7 +11625,23 @@ const App = {
         (c) => c && c.className === "msg-user",
       );
       if (chatted) return;
-      this.pushBriefing(text);
+      // 今の話題（/topics）：見出しと出典をそのまま並べる紹介で、
+      // Ultra には言い換えさせない。取れなければ話題なしで出す
+      // （ブリーフィング自体は落とさない）。表示が確定してから
+      // 取りに行くので、会話が始まっていたら取得自体をしない。
+      let briefingTopics = null;
+      try {
+        const t = await fetchTopics(5, 5000);
+        if (t && t.topics.length) {
+          briefingTopics = {
+            stale: t.stale,
+            cards: t.topics.slice(0, 5).map(topicCardOf),
+          };
+        }
+      } catch {
+        briefingTopics = null;
+      }
+      this.pushBriefing(text, briefingTopics);
       store.set(BRIEFING_DATE_KEY, today);
     } catch {
       /* ブリーフィングの失敗は黙って流す */
@@ -11038,11 +12209,62 @@ const App = {
       const btn = el(`points-topup-${item.pct}`);
       if (btn) btn.disabled = this.pointsBusy;
     }
+    /* ポイント残高・追加分の変化はメーター表示にも反映する。 */
+    this.renderMeter();
   },
 
   showPointsNote(text) {
     const note = el("points-note");
     if (note) note.textContent = text || "";
+  },
+
+  /* 時間制メーターの表示（cube_meter.js）。モジュールが無い環境
+     では出さない。無料枠は端末単位なので、ログイン状態とは
+     無関係に常時表示する。消費のたびに onChange 経由でも
+     呼ばれる。 */
+  renderMeter() {
+    const area = el("meter-area");
+    if (!area) return;
+    const meter = getCubeMeter();
+    if (!meter || typeof CubeMeter === "undefined") {
+      area.hidden = true;
+      return;
+    }
+    const snap = meter.snapshot();
+    area.hidden = false;
+    const rem = el("meter-remaining");
+    if (rem) rem.textContent = CubeMeter.formatDuration(snap.remainingSec);
+    const plan = el("meter-plan");
+    if (plan) {
+      plan.textContent = snap.congestion
+        ? "（混雑時の上限が適用中です）"
+        : !Number.isFinite(snap.baseTotalSec)
+          ? "（無制限プラン）"
+          : "";
+    }
+    const fill = el("meter-bar-fill");
+    if (fill && fill.style) {
+      let pct = 100;
+      if (Number.isFinite(snap.baseTotalSec)) {
+        const total = snap.baseTotalSec + snap.bonusTotalSec;
+        pct = total > 0
+          ? Math.max(0, Math.min(100, (snap.remainingSec / total) * 100))
+          : 0;
+      }
+      fill.style.width = `${pct}%`;
+    }
+    const bonus = el("meter-bonus");
+    if (bonus) {
+      bonus.hidden = !(snap.bonusRemainingSec > 0);
+      const br = el("meter-bonus-remaining");
+      if (br) br.textContent = CubeMeter.formatDuration(snap.bonusRemainingSec);
+    }
+    const note = el("meter-note");
+    if (note) {
+      note.textContent = snap.remainingSec <= 0
+        ? "今日の分は使い切りました。Cube Nano / Cube Flash はメーターなしで使えます。"
+        : "";
+    }
   },
 
   /* 残高を取り直し、今日のログインボーナス（1日1回）を付けに
@@ -11173,6 +12395,15 @@ const App = {
       }
       // 嘘チェック可視化：検証内訳（プレーンなJSON）も一緒に残す。
       if (msg && msg.factcheck) turn.factcheck = msg.factcheck;
+      // 場所・話題・買い物レーンのカード（プレーンなJSON）も一緒に
+      // 残し、履歴から復元したときも同じ形で出し直す。
+      if (msg && Array.isArray(msg.cards) && msg.cards.length) {
+        try {
+          turn.cards = JSON.parse(JSON.stringify(msg.cards));
+        } catch {
+          /* カードが残せなくても会話履歴は守る */
+        }
+      }
       this.historyCurrent.turns.push(turn);
       this.historyCurrent.updated_at = new Date().toISOString();
       this.persistCurrentConversation();
@@ -11406,6 +12637,7 @@ const App = {
   /* 質問への回答の流れ：
      0) 天気 → 気象庁の予報＋Open-Meteoの現在の状況（実データ）
      0.5) Cube自身の質問 → 固定情報
+     0.6) 会話レーン → あいさつ・お礼・別れ・定番の雑談への即答
      0.75) 計算レーン → 正確な計算結果（過程つき）
      1) 知識メモ帳 → 即答＋裏で再確認
      2) 計算 → 検算 3) モデル生成 → 対象記事の事実で照合 */
@@ -11512,6 +12744,24 @@ const App = {
         text: selfAnswer,
         badge: "self",
         note: "Cube自身についての質問には、モデルやネット検索ではなく、アプリに固定した正しい情報から答えています。この種別の答えは知識メモ帳に保存しません。",
+      });
+      return;
+    }
+
+    // 0.6) 会話レーン：あいさつ・お礼・別れ・定番の雑談は、事実の
+    // 主張を含まない会話なので、モデル生成・ネット検索・検証ゲート
+    // をすべて素通りして、その場で返事を返す。以前は通常の質問と
+    // 同じ経路に入り、「こんにちは」にすら裏づけ確認の末の
+    // 「確認できませんでした」が返ることがあった。判定は発話全体が
+    // 定番パターンに一致する場合だけに限られ、事実の質問や複合文は
+    // conversationAnswer が拾わない（従来の経路に倒れる）。
+    // 会話の返事は知識メモ帳にも保存しない。
+    const convAnswer = conversationAnswer(question);
+    if (convAnswer) {
+      this.pushAssistant({
+        text: convAnswer,
+        badge: "none",
+        note: "あいさつや雑談への返事です。事実の質問ではないため、ネット検索や裏づけ確認はせず、その場で返事をしています。",
       });
       return;
     }
@@ -11652,6 +12902,151 @@ const App = {
       return;
     }
 
+    // 2.25) 場所・話題・買い物レーン：cube-server の実データ API
+    // （/places・/topics・/shop）で答える。即答レーン（天気・Cube
+    // 自身・会話・計算・メモ帳・記憶）の後、モデル生成の前に置く。
+    // どのレーンもモデル生成・検証ゲートを通さず、API の値を
+    // そのまま構造化して出す。サーバーに届かない・失敗した場合
+    // は何も出さず、従来の手順（2.5 以降）にそのまま倒れる。
+    // 結果は変わる情報なので知識メモ帳には保存しない。
+
+    // 話題：定型の聞き方に一致したときだけ。
+    if (detectTopicsQuery(question)) {
+      this.setPhase("searching");
+      const topicsData = await fetchTopics(10);
+      this.setPhase("idle");
+      if (topicsData) {
+        if (topicsData.topics.length) {
+          this.pushAssistant({
+            text: topicsData.stale
+              ? "今の話題です（少し前の時点の情報です）。各メディアの見出しを紹介します。"
+              : "今の話題を紹介します。各メディアの見出しです。",
+            badge: "topics",
+            cards: topicsData.topics.slice(0, 5).map(topicCardOf),
+            note: "話題の紹介です。事実の確認をした答えではないため、詳しくはリンク先の記事をご覧ください。出典：Googleトレンド・Yahoo!ニュース・NHKニュース・はてなブックマーク。",
+          });
+        } else {
+          this.pushAssistant({
+            text: "今の話題を取得できませんでした。",
+            badge: "topics",
+            note: "時間をおいてもう一度試してください。",
+          });
+        }
+        return;
+      }
+      // 取得失敗時は何も出さず従来経路へ（このまま手順を進める）。
+    }
+
+    // 場所：ジャンル語＋場所の手がかりがあるときだけ。
+    if (detectPlacesQuery(question)) {
+      this.setPhase("searching");
+      const placesData = await fetchPlaces(question);
+      this.setPhase("idle");
+      if (placesData && placesData.ok) {
+        if (placesData.places.length) {
+          const where =
+            placesData.centerLabel || placesData.placeLabel || "";
+          const kw = placesData.keyword || "場所";
+          this.pushAssistant({
+            text: where
+              ? `${where}周辺で「${kw}」を${placesData.places.length}件見つけました。`
+              : `「${kw}」を${placesData.places.length}件見つけました。`,
+            badge: "places",
+            cards: placesData.places.map(placeCardOf),
+            note: `出典：${placesData.attribution.join(" / ") || "Web Services by Yahoo! JAPAN / © OpenStreetMap contributors"}。営業時間は載っていない場所があります。`,
+          });
+        } else {
+          this.pushAssistant({
+            text: "条件に合う場所が見つかりませんでした。",
+            badge: "places",
+            note: "地名や種類を変えて（例：郡山駅近くのコンビニ）もう一度聞いてください。",
+          });
+        }
+        return;
+      }
+      // 失敗（届かない・両源とも失敗）時は何も出さず従来経路へ。
+    }
+
+    // 買い物：購入相談のシグナルが明確なときだけ。
+    const shopQuery = parseShopQuery(question, this._lastShop || null);
+    if (shopQuery) {
+      if (shopQuery.askBack) {
+        this.pushAssistant({
+          text: "何をお探しですか？商品名や種類を教えてください（例：ワイヤレスイヤホン、5,000円以下の時計）。",
+          badge: "none",
+        });
+        return;
+      }
+      this.setPhase("searching");
+      const shopData = await fetchShop(
+        shopQuery.keyword, shopQuery.conditions);
+      this.setPhase("idle");
+      if (shopData) {
+        // 続きの条件変更（「もっと安いの」等）のために覚えておく。
+        this._lastShop = {
+          keyword: shopQuery.keyword,
+          conditions: { ...shopQuery.conditions },
+        };
+        if (shopData.candidates.length) {
+          const noteParts = [];
+          const fetchedLabel = formatTimestampLabel(shopData.fetchedAt);
+          noteParts.push(fetchedLabel
+            ? `価格と在庫は${fetchedLabel}時点のYahoo!ショッピングの情報です。購入はリンク先のモールでどうぞ。`
+            : "価格と在庫はYahoo!ショッピングの情報です。購入はリンク先のモールでどうぞ。");
+          if (shopData.guardExcluded > 0) {
+            noteParts.push(`1〜99円の商品${shopData.guardExcluded}件は候補から外しました。`);
+          }
+          noteParts.push(
+            `出典：${shopData.attribution.join(" / ") || "Web Services by Yahoo! JAPAN"}`);
+          this.pushAssistant({
+            text: shopIntroText(shopQuery.keyword, shopQuery.conditions),
+            badge: "shop",
+            cards: shopData.candidates,
+            note: noteParts.join(""),
+          });
+        } else {
+          const hasConditions =
+            typeof shopQuery.conditions.price_min === "number" ||
+            typeof shopQuery.conditions.price_max === "number" ||
+            !!shopQuery.conditions.free_shipping;
+          this.pushAssistant({
+            text: "条件に合う商品が見つかりませんでした。",
+            badge: "shop",
+            cards: hasConditions
+              ? [{
+                  kind: "suggest",
+                  label: `条件を外して「${shopQuery.keyword}」で探す`,
+                  query: `${shopQuery.keyword}が欲しい`,
+                }]
+              : [],
+            note: "条件を緩める（価格帯を外す・キーワードを短くする）と見つかることがあります。無い商品名は作らず、正直にお伝えしています。",
+          });
+        }
+        // 表示まで至った検索だけポイント付与（失敗・聞き返しは対象外）。
+        void this.earnShopPoints(shopQuery.keyword, shopQuery.conditions);
+        return;
+      }
+      // 失敗時は何も出さず従来経路へ（従来の棄権表示に落ちる）。
+    }
+
+    // 2.5) 時間制メーターの関門：サーバー側モデル（Twin / Pro /
+    // Max / Ultra）が選択され、接続済みで、残量が0なら、生成も
+    // 検索照合も始めずに穏やかに止める。端末内モデルへの案内と、
+    // ポイントでの追加（ログイン中のみ可能）を出す。天気・計算・
+    // メモ帳・記憶の即答レーンはメーターと無関係に使えるため、
+    // 関門はそれらの後ろ（＝モデル生成の直前）に置く。
+    if (modelReady && meterAppliesTo(this.modelId)) {
+      const meter = getCubeMeter();
+      if (meter && !meter.canUse()) {
+        this.pushAssistant({
+          text: "サーバーモデルの時間メーターが0になりました。",
+          badge: "unknown",
+          note: "Cube Nano / Cube Flash はこの端末の中で動くため、メーターなしでそのまま使えます。モデルを切り替えてお試しください。ログイン中なら、ポイントでメーター時間を追加することもできます（サイドバーの「ポイントでメーター追加」）。メーターの無料分は日付が変わると戻ります。",
+        });
+        return;
+      }
+    }
+
     // 3) モデル生成＋ウェブ検索での照合。確認のリクエストは生成の前に
     // 開始する：生成はメインスレッドの重い処理だが、ネットワークは
     // その裏で進むため、Wikipediaの往復がモデルの思考の後ろに
@@ -11664,8 +13059,9 @@ const App = {
       maxMs: EVIDENCE_LANE_BUDGET_MS,
       maxRequests: EVIDENCE_LANE_MAX_REQUESTS,
     });
-    const articlePromise = fetchArticle(question).catch(() => null);
-    const searchPromise = searchWikipedia(question).catch(() => []);
+    // 証拠はまずサーバー側レーン（/evidence）に集めさせ、失敗した
+    // ときだけ従来のページ側レーンに倒れる（startEvidencePromises）。
+    const { articlePromise, searchPromise } = startEvidencePromises(question);
     let articleSettled = false;
     let searchSettled = false;
     let articleValue = null;
@@ -12301,12 +13697,15 @@ if (typeof module !== "undefined" && module.exports) {
     UltraModel, loadUltra, generateUltra, disposeUltra, modelReadyFor,
     assembleUltraPassage, isUltraAbstention, ultraWriteFactAnswer, ULTRA_PASSAGE_CAP,
     fetchWebSearchPages, webSearchAnswer, GSEARCH_TIMEOUT_MS,
+    fetchServerEvidence, startEvidencePromises, EVIDENCE_SERVER_TIMEOUT_MS,
+    EVIDENCE_WAIT_MS,
     normalizeUltraWrittenStyle,
     UltraGgufModel, loadUltraGguf,
     UltraImacModel, loadUltraImac, ULTRA_IMAC_BASE_URL, ULTRA_IMAC_UNREACHABLE,
     buildBriefingMaterial, trimBriefingTail, localDateKey, BRIEFING_DATE_KEY,
     pointsJstDateKey, pointsDailyLoginKey, pointsNewTopupKey,
     POINTS_TOPUP_MENU, POINTS_BONUS_KEY,
+    getCubeMeter, meterAppliesTo, meterEmptyError,
     ServerModel, generateForModel, CUBE_SERVER_BASE_URL, CUBE_SERVER_UNREACHABLE,
     readUltraStage, writeUltraStage,
     ULTRA_REPO, ULTRA_PARAM_COUNT, ULTRA_MAX_NEW_TOKENS,
@@ -12316,7 +13715,12 @@ if (typeof module !== "undefined" && module.exports) {
     canonicalTensorName, expectedTensors, modelAgreesWithFact,
     isCorroborated, findCorroboratingResult,
     answerContentTerms, numbersMatchLoose,
-    cubeSelfAnswer, isTautologicalAnswer,
+    cubeSelfAnswer, isTautologicalAnswer, conversationAnswer,
+    detectPlacesQuery, fetchPlaces, placeCardOf,
+    detectTopicsQuery, fetchTopics, topicCardOf, topicSourceLabel,
+    parseShopQuery, extractShopConditions, extractShopKeyword,
+    fetchShop, shopCardOf, shopIntroText, shopConditionsHash,
+    formatTimestampLabel, formatDistanceLabel,
     factSourceRelatedToEntity,
     verifyModelAnswer, splitForGate, verifySentence,
     factIsContested, entityNotFound, scopeToSubject, subjectOf,

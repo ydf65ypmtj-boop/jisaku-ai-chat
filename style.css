@@ -500,6 +500,24 @@ a { color: var(--accent); }
   .badge-net { background: #8fb0cc; color: #1d1a15; }
   .badge-unverified { background: #d9a84e; color: #1d1a15; }
 }
+.badge-places { background: #2e7d5b; color: #ffffff; }
+.badge-topics { background: #8a5aa0; color: #ffffff; }
+.badge-shop { background: #b23a6d; color: #ffffff; }
+@media (prefers-color-scheme: dark) {
+  .badge-places { background: #7fc7a5; color: #1d1a15; }
+  .badge-topics { background: #c39bd8; color: #1d1a15; }
+  .badge-shop { background: #e58bb1; color: #1d1a15; }
+}
+
+/* 場所・話題・買い物レーンのカード */
+.lane-cards { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.lane-card { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--surface); }
+.lane-card-title { font-size: 15px; font-weight: 700; line-height: 1.6; }
+.lane-card-price { margin-top: 4px; font-size: 16px; font-weight: 700; }
+.lane-card-meta { margin-top: 4px; font-size: 13px; line-height: 1.7; color: var(--dim); }
+.lane-card-snippet { margin-top: 4px; font-size: 13px; line-height: 1.7; }
+.lane-card-img { margin-top: 8px; max-width: 160px; border-radius: 8px; }
+.lane-suggest { align-self: flex-start; border: 1px solid var(--accent); background: transparent; color: var(--accent); border-radius: 999px; padding: 6px 14px; font-size: 13px; cursor: pointer; }
 
 /* ---- 入力欄 ---- */
 .composer-wrap { flex: none; background: transparent; padding-bottom: env(safe-area-inset-bottom); }
