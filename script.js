@@ -988,9 +988,9 @@ const POINTS_TOPUP_MENU = [
   { pct: 100, price: 180 },
 ];
 /* トップアップで得た「メーター追加 %」の保持先（端末内）。
-   時間制メーターの残量そのものはまだページに実装がないため、
-   追加分はここに積み上げてポイント表示のそばに出す。将来の
-   メーター実装はこの値を読んで残量に足す。 */
+   時間制メーター（cube_meter.js）がこの値を読み、基準単位
+   （600秒）に対する割合として秒に換算して残量へ足す。
+   ポイント側はこの累積 % を所有し、メーター側は読み取り専用。 */
 const POINTS_BONUS_KEY = "cube-points-meter-bonus-v1";
 
 /* JST（Asia/Tokyo）の日付キー "YYYY-MM-DD"。RPC 側の1日判定
@@ -1021,6 +1021,59 @@ function pointsNewTopupKey() {
   pointsTopupSeq += 1;
   return `meter_topup:${Date.now().toString(36)}_${pointsTopupSeq.toString(36)}` +
     Math.floor(Math.random() * 1296).toString(36);
+}
+
+/* Cube 時間制メーター（cube_meter.js）。サーバー側モデル
+   （Twin / Pro / Max / Ultra）の利用時間を数える。設定の上書きは
+   window.__CUBE_METER_CONFIG__（{plan, plans, congestion,
+   bonusUnitSec}）で渡せる。課金・学生判定は未決のため、既定は
+   全員 free プランで、プラン切替はこの設定でのみ行う。モジュール
+   が読み込まれていない環境ではメーターなし（従来挙動）になる。 */
+const METER_CONFIG_OVERRIDE =
+  (typeof window !== "undefined" && window.__CUBE_METER_CONFIG__) || null;
+
+let cubeMeterInstance = null;
+/* メーターのシングルトン。残量の保存先は端末の localStorage
+   （cube_meter.js 側のキー）。ポイント追加分（%）はポイント側の
+   保存キーからそのまま読む（書き換えない）。 */
+function getCubeMeter() {
+  if (cubeMeterInstance) return cubeMeterInstance;
+  if (typeof CubeMeter === "undefined") return null;
+  try {
+    cubeMeterInstance = CubeMeter.createMeter({
+      storage: {
+        getItem: (k) => {
+          try { return window.localStorage.getItem(k); } catch { return null; }
+        },
+        setItem: (k, v) => {
+          try { window.localStorage.setItem(k, v); } catch { /* 続行 */ }
+        },
+      },
+      config: CubeMeter.resolveConfig(METER_CONFIG_OVERRIDE),
+      onChange: () => {
+        try { App.renderMeter(); } catch { /* 表示前でも計量は続ける */ }
+      },
+    });
+  } catch {
+    cubeMeterInstance = null;
+  }
+  return cubeMeterInstance;
+}
+
+/* このモデルIDがメーター対象（サーバー側）かどうか。Ultra は
+   iMac サーバー固定、Twin / Pro / Max は engine "server"。
+   端末内モデル（Nano / Flash）は対象外。 */
+function meterAppliesTo(id) {
+  return id === "ultra" || modelDef(id).engine === "server";
+}
+
+/* メーター切れの例外。生成経路が残量0を検知したときに投げる。 */
+function meterEmptyError() {
+  const e = new Error(
+    "サーバーモデルの時間メーターが0になりました。Cube Nano / Cube Flash はこの端末で動くため、メーターなしで使えます。");
+  e.name = "MeterEmptyError";
+  e.code = "METER_EMPTY";
+  return e;
 }
 
 /* 記憶ビューの表示ラベル（モジュールの KIND_LABEL と同じ文言）。 */
@@ -1671,7 +1724,20 @@ async function loadUltraImac(onProgress) {
    振り分けは互換のため残してあるが、どちらも UI からは到達
    できない。回答フロー・バッジ・出典表示はどのエンジンでも同一。 */
 async function generateUltra(prompt, historyMessages) {
-  if (UltraImacModel.ready) return UltraImacModel.generate(prompt, historyMessages);
+  if (UltraImacModel.ready) {
+    /* iMac サーバーでの生成は時間制メーターの対象。残量0なら
+       生成を始めず、専用の例外で穏やかに止める。消費は実時間で
+       数える（失敗してもサーバーが動いた時間は消費する）。
+       端末内エンジン（ONNX / GGUF 版）へ落ちる経路はメーター
+       対象外（端末で動くため）。 */
+    const meter = getCubeMeter();
+    if (meter) {
+      if (!meter.canUse()) throw meterEmptyError();
+      return meter.consumeAround(
+        () => UltraImacModel.generate(prompt, historyMessages));
+    }
+    return UltraImacModel.generate(prompt, historyMessages);
+  }
   return UltraGgufModel.ready
     ? UltraGgufModel.generate(prompt, historyMessages)
     : UltraModel.generate(prompt, historyMessages);
@@ -1690,7 +1756,16 @@ function disposeUltra() {
    は同期だが、呼び出し側は常に await するので形をそろえてある。 */
 async function generateForModel(id, question, opts) {
   if (id === "ultra") return generateUltra(question, opts && opts.historyMessages);
-  if (modelDef(id).engine === "server") return ServerModel.generate(id, question);
+  if (modelDef(id).engine === "server") {
+    /* サーバーモデル（Twin / Pro / Max）は時間制メーターの対象。
+       残量0なら生成を始めず、専用の例外で穏やかに止める。 */
+    const meter = getCubeMeter();
+    if (meter) {
+      if (!meter.canUse()) throw meterEmptyError();
+      return meter.consumeAround(() => ServerModel.generate(id, question));
+    }
+    return ServerModel.generate(id, question);
+  }
   return LocalModel.generate(question, modelDef(id).maxNew);
 }
 
@@ -9445,6 +9520,7 @@ const App = {
     Notebook.load();
     this.initMemory();
     this.initAccount();
+    this.renderMeter();
     // 選択中のモデルを復元する（初期値は v1）。ベースURLはモデルごとの
     // 上書きとして読み込む（v1 は従来キー、v2 / Twin / Pro / Max は専用キー）。
     const savedId = store.get(MODEL_ID_KEY);
@@ -9581,6 +9657,8 @@ const App = {
     if (fcView) fcView.hidden = name !== "factcheck";
     const labView = el("view-lab");
     if (labView) labView.hidden = name !== "lab";
+    const doctorView = el("view-doctor");
+    if (doctorView) doctorView.hidden = name !== "doctor";
     const memView = el("view-memory");
     if (memView) memView.hidden = name !== "memory";
     el("view-settings").hidden = name !== "settings";
@@ -10812,11 +10890,62 @@ const App = {
       const btn = el(`points-topup-${item.pct}`);
       if (btn) btn.disabled = this.pointsBusy;
     }
+    /* ポイント残高・追加分の変化はメーター表示にも反映する。 */
+    this.renderMeter();
   },
 
   showPointsNote(text) {
     const note = el("points-note");
     if (note) note.textContent = text || "";
+  },
+
+  /* 時間制メーターの表示（cube_meter.js）。モジュールが無い環境
+     では出さない。無料枠は端末単位なので、ログイン状態とは
+     無関係に常時表示する。消費のたびに onChange 経由でも
+     呼ばれる。 */
+  renderMeter() {
+    const area = el("meter-area");
+    if (!area) return;
+    const meter = getCubeMeter();
+    if (!meter || typeof CubeMeter === "undefined") {
+      area.hidden = true;
+      return;
+    }
+    const snap = meter.snapshot();
+    area.hidden = false;
+    const rem = el("meter-remaining");
+    if (rem) rem.textContent = CubeMeter.formatDuration(snap.remainingSec);
+    const plan = el("meter-plan");
+    if (plan) {
+      plan.textContent = snap.congestion
+        ? "（混雑時の上限が適用中です）"
+        : !Number.isFinite(snap.baseTotalSec)
+          ? "（無制限プラン）"
+          : "";
+    }
+    const fill = el("meter-bar-fill");
+    if (fill && fill.style) {
+      let pct = 100;
+      if (Number.isFinite(snap.baseTotalSec)) {
+        const total = snap.baseTotalSec + snap.bonusTotalSec;
+        pct = total > 0
+          ? Math.max(0, Math.min(100, (snap.remainingSec / total) * 100))
+          : 0;
+      }
+      fill.style.width = `${pct}%`;
+    }
+    const bonus = el("meter-bonus");
+    if (bonus) {
+      bonus.hidden = !(snap.bonusRemainingSec > 0);
+      const br = el("meter-bonus-remaining");
+      if (br) br.textContent = CubeMeter.formatDuration(snap.bonusRemainingSec);
+    }
+    const note = el("meter-note");
+    if (note) {
+      note.textContent = snap.remainingSec <= 0
+        ? "今日の分は使い切りました。Cube Nano / Cube Flash はメーターなしで使えます。"
+        : "";
+    }
   },
 
   /* 残高を取り直し、今日のログインボーナス（1日1回）を付けに
@@ -11422,6 +11551,24 @@ const App = {
         fact: String(calc),
       });
       return;
+    }
+
+    // 2.5) 時間制メーターの関門：サーバー側モデル（Twin / Pro /
+    // Max / Ultra）が選択され、接続済みで、残量が0なら、生成も
+    // 検索照合も始めずに穏やかに止める。端末内モデルへの案内と、
+    // ポイントでの追加（ログイン中のみ可能）を出す。天気・計算・
+    // メモ帳・記憶の即答レーンはメーターと無関係に使えるため、
+    // 関門はそれらの後ろ（＝モデル生成の直前）に置く。
+    if (modelReady && meterAppliesTo(this.modelId)) {
+      const meter = getCubeMeter();
+      if (meter && !meter.canUse()) {
+        this.pushAssistant({
+          text: "サーバーモデルの時間メーターが0になりました。",
+          badge: "unknown",
+          note: "Cube Nano / Cube Flash はこの端末の中で動くため、メーターなしでそのまま使えます。モデルを切り替えてお試しください。ログイン中なら、ポイントでメーター時間を追加することもできます（サイドバーの「ポイントでメーター追加」）。メーターの無料分は日付が変わると戻ります。",
+        });
+        return;
+      }
     }
 
     // 3) モデル生成＋ウェブ検索での照合。確認のリクエストは生成の前に
@@ -12079,6 +12226,7 @@ if (typeof module !== "undefined" && module.exports) {
     buildBriefingMaterial, trimBriefingTail, localDateKey, BRIEFING_DATE_KEY,
     pointsJstDateKey, pointsDailyLoginKey, pointsNewTopupKey,
     POINTS_TOPUP_MENU, POINTS_BONUS_KEY,
+    getCubeMeter, meterAppliesTo, meterEmptyError,
     ServerModel, generateForModel, CUBE_SERVER_BASE_URL, CUBE_SERVER_UNREACHABLE,
     readUltraStage, writeUltraStage,
     ULTRA_REPO, ULTRA_PARAM_COUNT, ULTRA_MAX_NEW_TOKENS,

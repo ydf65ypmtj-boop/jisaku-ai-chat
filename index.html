@@ -83,6 +83,10 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M10 3.5h4M10 3.5v5.2L5.4 17a2.3 2.3 0 0 0 2 3.5h9.2a2.3 2.3 0 0 0 2-3.5L14 8.7V3.5"/><path d="M8 15h8"/></svg>
               おためし
             </button>
+            <button type="button" class="tab-btn" data-tab="doctor" aria-pressed="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.7-9A5.4 5.4 0 0 1 12 6.6 5.4 5.4 0 0 1 21.7 12c-2.2 4.4-9.7 9-9.7 9z"/><path d="M12 8.5v6M9 11.5h6"/></svg>
+              健康相談
+            </button>
           </nav>
         </div>
 
@@ -96,6 +100,17 @@
 
         <!-- モデル状態：状態は常に正直に表示する -->
         <div class="side-foot">
+          <!-- 時間制メーター：サーバー側モデル（Twin / Pro / Max /
+               Ultra）の今日の残り時間。cube_meter.js が無い環境
+               では hidden のまま（従来表示と同一）。無料枠は端末
+               単位なのでログイン状態とは無関係に表示される -->
+          <div id="meter-area" class="meter-area" hidden>
+            <p class="meter-title">サーバーモデル時間<span id="meter-plan" class="meter-plan"></span></p>
+            <div class="meter-bar" aria-hidden="true"><div id="meter-bar-fill" class="meter-bar-fill"></div></div>
+            <p class="meter-text">今日の残り <span id="meter-remaining">…</span></p>
+            <p id="meter-bonus" class="meter-bonus" hidden>ポイント追加分 残り <span id="meter-bonus-remaining">0秒</span></p>
+            <p id="meter-note" class="meter-note" aria-live="polite"></p>
+          </div>
           <!-- アカウント：アカウント機能が有効なときだけ表示される -->
           <div id="account-area" class="account-area" hidden>
             <button type="button" id="account-login-btn" class="account-login-btn">
@@ -553,14 +568,26 @@
           </div>
         </div>
       </section>
+
+      <!-- 健康相談（試作）：中身は cube_doctor.js が #doctor-root に組み立てる。
+           相談内容はチャット履歴・知識メモ帳とは分離し、保存しない -->
+      <section id="view-doctor" class="view" hidden>
+        <div class="page-scroll">
+          <div class="page-inner">
+            <div id="doctor-root" class="doctor-root-host"></div>
+          </div>
+        </div>
+      </section>
       </main>
     </div>
     <script src="cube_memory.js"></script>
     <script src="cube_account.js"></script>
+    <script src="cube_meter.js"></script>
     <script src="cube_pc.js"></script>
     <script src="cube_call_demo.js"></script>
     <script src="cube_factcheck.js"></script>
     <script src="script.js"></script>
     <script src="cube_voice.js"></script>
+    <script src="cube_doctor.js"></script>
   </body>
 </html>

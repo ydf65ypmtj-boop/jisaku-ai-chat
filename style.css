@@ -248,6 +248,24 @@ body {
 .points-topup-btn:disabled { opacity: .5; cursor: default; }
 .points-note { font-size: 11px; color: var(--dim); margin: 0; line-height: 1.5; }
 
+/* 時間制メーター（サイドバー下部・常時表示） */
+.meter-area { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.meter-title { font-size: 12px; font-weight: 600; margin: 0; }
+.meter-plan { font-size: 11px; font-weight: 400; color: var(--dim); }
+.meter-bar {
+  height: 6px; border-radius: 999px;
+  background: var(--surface-alt); overflow: hidden;
+}
+.meter-bar-fill {
+  height: 100%; width: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, var(--grad-1), var(--grad-2));
+  transition: width .3s ease;
+}
+.meter-text { font-size: 11px; color: var(--dim); margin: 0; }
+.meter-text span { color: var(--text); font-weight: 600; }
+.meter-bonus { font-size: 11px; color: var(--dim); margin: 0; }
+.meter-note { font-size: 11px; color: var(--warn); margin: 0; line-height: 1.5; }
+
 /* サイドバー下部：モデル状態 */
 .side-foot {
   margin-top: auto;
@@ -794,3 +812,51 @@ a { color: var(--accent); }
 .cubepc-result--unverified { background: #fff7e0; border: 1px solid #d9a406; }
 .cubepc-result--failed, .cubepc-result--error { background: #fdeaea; border: 1px solid #d9534f; }
 .cubepc-result--stopped { background: #eeeeee; border: 1px solid #999; }
+
+/* ---- 健康相談（試作・cube_doctor.js） ---- */
+/* 高齢の利用者も想定し、基本の文字は大きめ。doctor-large でさらに拡大。 */
+.doctor-root { max-width: 760px; margin: 0 auto; font-size: 17px; line-height: 1.8; color: var(--text); }
+.doctor-root.doctor-large { font-size: 21px; }
+.doctor-banner {
+  border: 2px solid var(--warn, #d9a406); background: var(--surface);
+  border-radius: var(--radius); padding: 12px 14px; margin-bottom: 12px;
+  font-weight: 700;
+}
+.doctor-controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.doctor-btn {
+  border: 1.5px solid var(--accent); color: var(--accent); background: var(--surface);
+  border-radius: 999px; padding: 8px 16px; font-size: 0.95em; cursor: pointer;
+}
+.doctor-btn[aria-pressed="true"] { background: var(--accent-tint); }
+.doctor-symptoms { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.doctor-symptom-btn {
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  border-radius: 999px; padding: 8px 14px; font-size: 0.95em; cursor: pointer;
+}
+.doctor-symptom-btn:hover { border-color: var(--accent); }
+.doctor-log { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+.doctor-msg {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); padding: 12px 14px; white-space: pre-wrap;
+  word-break: break-word;
+}
+.doctor-msg--user { align-self: flex-end; background: var(--accent-tint); max-width: 85%; }
+.doctor-msg--bot { align-self: flex-start; max-width: 92%; }
+.doctor-msg--emergency { border: 3px solid #d9534f; font-weight: 700; }
+.doctor-msg--triage { border-left: 6px solid var(--accent); }
+.doctor-sources { margin-top: 8px; font-size: 0.85em; color: var(--dim); }
+.doctor-sources a { color: var(--accent); }
+.doctor-memo-wrap { margin-bottom: 12px; }
+.doctor-memo {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); padding: 12px 14px; white-space: pre-wrap;
+  word-break: break-word; font-size: 0.95em; line-height: 1.8;
+}
+.doctor-form { display: flex; gap: 8px; align-items: flex-start; }
+.doctor-input {
+  flex: 1; box-sizing: border-box; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--surface); color: var(--text);
+  padding: 10px 12px; font-size: 1em; line-height: 1.7; resize: vertical;
+}
+.doctor-send { flex-shrink: 0; }
+.doctor-error { color: #d9534f; font-weight: 700; }
