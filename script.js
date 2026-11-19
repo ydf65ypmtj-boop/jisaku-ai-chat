@@ -1704,6 +1704,10 @@ async function generateForModel(id, question, opts) {
 /* の言葉で書かせる。他モデル・確認済み経路・根拠・出典・メモ帳        */
 /* 保存はすべて従来どおり。棄権・失敗・空の生成では、従来どおり        */
 /* 記事から組み立てた事実文をそのまま出す（フェイルソフト）。          */
+/* （2026-11-19 追記：サーバー側の一般Web検索レーン（/gsearch）が
+   実動化したため、索引で答えられない場合の受け皿として、一般Web
+   検索フォールバックを後段（「一般Web検索レーン」節）に組み込んだ。
+   検索結果を読むのは引き続き Ultra のみ。） */
 /* ================================================================== */
 
 /* 読ませる本文の上限（区切りの改行込み）。Muse版ウェブレーンと       */
@@ -1797,6 +1801,106 @@ async function ultraWriteFactAnswer(question, article, fact) {
   } catch {
     return null;
   }
+}
+
+/* ================================================================== */
+/* 一般Web検索レーン：/gsearch の本文を Ultra が読む（2026-11-19）     */
+/*                                                                    */
+/* 索引レーン（Wikipedia）で答えられない質問の受け皿。サーバー側の   */
+/* 一般Web検索（cube-server の /gsearch、SearXNG 等）が集めた本文     */
+/* つきの結果を、索引レーンと同じ読解形式で Ultra に読ませる。       */
+/* 検索結果を読むのは Ultra のみ（自作モデルは読まない）。書けた     */
+/* 答えも、索引レーンと同じ文単位の検証ゲートを通し、裏づけが        */
+/* 取れたものだけを「ネット検索の答え」として出す。検索の失敗・      */
+/* 空・Ultra の棄権・ゲート不通過では何も出さず、呼び出し側の        */
+/* 従来の棄権表示に落とす（フェイルソフト）。出典は、実際に裏づけ    */
+/* が成立したページだけを併記する。知識メモ帳には保存しない          */
+/* （確認済み保存は従来経路のまま）。                                 */
+/* ================================================================== */
+
+/* /gsearch のページ側タイムアウト。サーバー側のハードキャップ        */
+/* （20秒）にネットワークの往復を足した上限。                          */
+const GSEARCH_TIMEOUT_MS = 30000;
+
+/* 1ページから Ultra に読ませる冒頭の長さ。組み立て上限（1,800字）の  */
+/* 中で上位2ページが入る大きさにする。検証ゲートには全文を使う。      */
+const GSEARCH_LEAD_CHARS = 800;
+
+/* サーバー側の一般Web検索に質問を投げ、本文を持つ結果だけを索引      */
+/* レーンの結果と同じ形（{title, url, snippet, text}）で返す。         */
+/* 失敗・混雑（busy）・0件は null。                                    */
+async function fetchWebSearchPages(question) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/gsearch`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ q: question }),
+      },
+      GSEARCH_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || !Array.isArray(data.results)) return null;
+  const pages = [];
+  for (const r of data.results) {
+    if (!r || typeof r.text !== "string" || !r.text) continue;
+    pages.push({
+      title: typeof r.title === "string" ? r.title : "",
+      url: typeof r.url === "string" ? r.url : "",
+      snippet: typeof r.snippet === "string" ? r.snippet : "",
+      text: r.text,
+    });
+  }
+  return pages.length ? pages : null;
+}
+
+/* 一般Web検索の本文を Ultra に読ませて答えを書かせ、検証ゲートを      */
+/* 通った場合だけ表示用の材料（{text, gate, pages, sourceTitle,        */
+/* sourceUrl, evidence}）を返す。通らなければ null。                   */
+async function webSearchAnswer(question) {
+  const pages = await fetchWebSearchPages(question);
+  if (!pages) return null;
+  const leads = pages.map((p) => ({
+    title: p.title,
+    url: p.url,
+    text: p.text.slice(0, GSEARCH_LEAD_CHARS),
+  }));
+  const { passage, sources } = assembleUltraPassage(leads);
+  if (!passage || !sources.length) return null;
+  let written = "";
+  try {
+    written = (
+      (await generateUltra(`文：${passage}
+質問：${question}`)) || ""
+    ).trim();
+  } catch {
+    return null;
+  }
+  if (!written || isUltraAbstention(written)) return null;
+  const styled = normalizeUltraWrittenStyle(written);
+  const gate = verifyModelAnswer(styled, question, {
+    fact: null,
+    article: null,
+    results: pages,
+  });
+  if (gate.status !== "all") return null;
+  const source =
+    gate.source || pages.find((p) => p.url === sources[0].url) || pages[0];
+  const evidence =
+    source.snippet || (source.text ? source.text.slice(0, 200) : "");
+  return {
+    text: styled,
+    gate,
+    pages,
+    sourceTitle: source.title || source.url,
+    sourceUrl: source.url,
+    evidence,
+  };
 }
 
 /* ================================================================== */
@@ -11605,6 +11709,50 @@ const App = {
       return;
     }
 
+    // 5.5) 一般Web検索フォールバック：種類つき事実が取れず、モデルの
+    // 答えも表示できない（裏づけが1つも無い／モデル自身が棄権した）
+    // 場合に限り、Ultra が選択され読み込み済みのときだけ、サーバー
+    // 側の一般Web検索（/gsearch）の本文を Ultra に読ませて答える。
+    // 検索結果を読むのは Ultra のみ。書けた答えも検証ゲートを通った
+    // ものだけを出し、通らなければ従来の棄権表示に落とす。生成の間は
+    // フェーズを「検索中」のままにして、二重の送信を防ぐ。
+    if (
+      this.modelId === "ultra" &&
+      modelReady &&
+      (!gate || gate.status === "none" || gate.status === "abstain")
+    ) {
+      const web = await webSearchAnswer(question).catch(() => null);
+      if (web) {
+        // 嘘チェック可視化：表示する答え（Web経由）の検証内訳に差し替える。
+        if (typeof CubeFactCheck !== "undefined") {
+          try {
+            this._fcBreakdown = CubeFactCheck.buildBreakdown({
+              question,
+              gate: web.gate,
+              fact: null,
+              results: web.pages,
+            });
+          } catch {
+            this._fcBreakdown = null;
+          }
+        }
+        this.setPhase("idle");
+        this.pushAssistant({
+          text: web.text,
+          badge: "net",
+          sourceTitle: web.sourceTitle,
+          sourceUrl: web.sourceUrl,
+          evidence: web.evidence,
+          modelSaid:
+            gate && gate.status === "none" && modelAnswer
+              ? modelAnswer
+              : undefined,
+          note: "Wikipediaの索引では裏づけが取れなかったため、一般のWeb検索で見つけた記事をUltraが読んで答えています。答えは文ごとに記事と照合し、裏づけが取れたものだけを表示しています。",
+        });
+        return;
+      }
+    }
+
     // 5) 種類つき事実が取れなかった場合の表示は、文単位ゲートの結果で
     // 決める。出典は、実際に裏づけが成立した記事そのものだけにする
     // （裏づけてもいない記事を出典に表示することはしない）。
@@ -11924,6 +12072,7 @@ if (typeof module !== "undefined" && module.exports) {
     MODELS, modelDef, validateManifest,
     UltraModel, loadUltra, generateUltra, disposeUltra, modelReadyFor,
     assembleUltraPassage, isUltraAbstention, ultraWriteFactAnswer, ULTRA_PASSAGE_CAP,
+    fetchWebSearchPages, webSearchAnswer, GSEARCH_TIMEOUT_MS,
     normalizeUltraWrittenStyle,
     UltraGgufModel, loadUltraGguf,
     UltraImacModel, loadUltraImac, ULTRA_IMAC_BASE_URL, ULTRA_IMAC_UNREACHABLE,
