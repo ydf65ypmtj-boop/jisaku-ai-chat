@@ -3044,6 +3044,149 @@ function isTautologicalAnswer(answer) {
 const PLACES_TIMEOUT_MS = 20000;
 const TOPICS_TIMEOUT_MS = 15000;
 const SHOP_TIMEOUT_MS = 20000;
+const PC_POST_TIMEOUT_MS = 30000;
+
+/* ---- PC操作レーン（cube-server の /pc/） ----
+   チャットが入口になり、実行は橋渡し（pc_bridge）の先の仮想PCで
+   PC専門モデル v1 が行う。成功の表示は橋渡し側の外部検証が pass
+   のときだけ（computeResult が決める）。ページ側は進行状況と
+   最終結果をそのまま出す。失敗（届かない・体が落ちている等）は
+   成功のふりをせず、その旨を出す。 */
+
+/* 事実・方法の質問らしい語。PCレーンでは拾わないための安全網
+   （「フォルダの作り方は？」のような聞き方を操作依頼にしない）。 */
+const PC_FACT_GUARDS =
+  /とは|の意味|って何|作り方|使い方|やり方|方法を|なぜ|どうやって|歴史|本社/;
+
+/**
+ * PC操作の依頼かどうか。cube_pc.js の classifyPreview（対応
+ * カテゴリの判定）を使い、チャットでは誤発火を避けるため
+ * カテゴリごとに絞る：
+ *   - ブラウザ検索は通常のWeb検索と競合するため、ブラウザ／PC
+ *     への明示がある場合だけ。
+ *   - ページを開くは、開く操作の明示がある場合だけ。
+ *   - メモ帳入力・保存／フォルダ作成／端末実行は、チャット側に
+ *     対応する別レーンが無いため、そのまま発火する。
+ * CubePc が読み込まれていない環境では発火しない。
+ */
+function detectPcQuery(question) {
+  const q = String(question || "");
+  if (!q) return false;
+  if (PC_FACT_GUARDS.test(q)) return false;
+  if (typeof CubePc === "undefined" || !CubePc.classifyPreview) return false;
+  const v = CubePc.classifyPreview(q);
+  if (!v.supported) return false;
+  if (v.category === "browser_search") {
+    return /(ブラウザ|Chrome|クローム|PC|パソコン|仮想PC)/i.test(q);
+  }
+  if (v.category === "open_page") {
+    return /(開いて|開けて|表示して|アクセスして)/.test(q) ||
+      /(ブラウザ|Chrome|クローム|PC|パソコン|仮想PC)/i.test(q);
+  }
+  return true;
+}
+
+/* PC操作の結果メッセージへの注記（ステップ数と検証の状態）。 */
+function pcResultNote(result) {
+  const parts = [];
+  if (result && typeof result.steps === "number" && result.steps > 0) {
+    parts.push(`仮想PCで${result.steps}ステップ実行しました。`);
+  }
+  if (result && result.status === "verified_success") {
+    parts.push("成功の表示は、こちらで実際に確認できた場合だけ出ます。");
+  } else if (result && result.status === "unverified") {
+    parts.push("エージェントの報告だけでは成功にできないため、未確認として表示しています。");
+  }
+  parts.push("画面つきの経過は「おためし」タブのPC操作パネルでも見られます。");
+  return parts.join("");
+}
+
+/**
+ * PC操作を橋渡しへ依頼し、SSE で経過を受けながら完了を待つ。
+ * onProgress({type:"step"|"verification", ...}) を随時呼ぶ。
+ * 戻り値：
+ *   {kind:"finished", result}    橋渡しが決めた最終結果
+ *   {kind:"unsupported", detail} 橋渡しが受け付けなかった（422）
+ *   {kind:"busy", detail}        別のタスクが実行中（409）
+ *   {kind:"unreachable"}         サーバーに届かなかった
+ */
+async function executePcTask(question, onProgress) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/pc/tasks`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: question }),
+      },
+      PC_POST_TIMEOUT_MS,
+    );
+  } catch {
+    return { kind: "unreachable" };
+  }
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 422) {
+    return { kind: "unsupported", detail: data.detail || "その操作はまだできません。" };
+  }
+  if (res.status === 409) {
+    return { kind: "busy", detail: data.detail || "別のタスクを実行中です。" };
+  }
+  if (!res.ok || !data.taskId) return { kind: "unreachable" };
+  const taskId = data.taskId;
+  return await new Promise((resolve) => {
+    let settled = false;
+    let es = null;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      if (es) { try { es.close(); } catch { /* noop */ } }
+      resolve(v);
+    };
+    try {
+      es = new EventSource(`${CUBE_SERVER_BASE_URL}/pc/tasks/${taskId}/events`);
+    } catch {
+      resolve({ kind: "unreachable" });
+      return;
+    }
+    es.addEventListener("step", (ev) => {
+      try {
+        if (onProgress) onProgress({ type: "step", ...JSON.parse(ev.data) });
+      } catch { /* noop */ }
+    });
+    es.addEventListener("verification", (ev) => {
+      try {
+        if (onProgress) onProgress({ type: "verification", ...JSON.parse(ev.data) });
+      } catch { /* noop */ }
+    });
+    es.addEventListener("finished", (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        done({ kind: "finished", result: d.result || null });
+      } catch {
+        done({ kind: "unreachable" });
+      }
+    });
+    es.addEventListener("error", () => {
+      // SSE の一時切断（EventSource が自動再接続する）。サーバー側で
+      // 終了済みなら再接続時の snapshot 経由で finished が届くため
+      // 即座には諦めず、状態を1回確認しに行く。
+      void (async () => {
+        await new Promise((r) => setTimeout(r, 3000));
+        if (settled) return;
+        try {
+          const st = await fetchWithTimeout(
+            `${CUBE_SERVER_BASE_URL}/pc/tasks/${taskId}`,
+            {}, PC_POST_TIMEOUT_MS);
+          const sj = await st.json().catch(() => ({}));
+          if (st.ok && sj.state === "finished" && sj.result) {
+            done({ kind: "finished", result: sj.result });
+          }
+        } catch { /* まだ実行中とみなして待つ */ }
+      })();
+    });
+  });
+}
 
 /* ISO 日時を「M月D日 H:MM」で返す（解釈できなければ空文字）。 */
 function formatTimestampLabel(iso) {
@@ -10637,6 +10780,10 @@ const BADGES = {
     label: "買い物候補（Yahoo!ショッピング）",
     className: "badge-shop",
   },
+  pc: {
+    label: "PC操作の結果（仮想PCで実行）",
+    className: "badge-pc",
+  },
   model: {
     label: "Cubeの答え（ネットで確認済み）",
     className: "badge-model",
@@ -11429,6 +11576,66 @@ const App = {
     el("msg-list").appendChild(li);
     this.historyCaptureAssistant(msg);
     this.scrollChat();
+  },
+
+  /* ---- PC操作レーンの実行と表示 ----
+     進行中は履歴に残らない仮メッセージでステップを見せ、完了後に
+     最終結果を通常の回答として出す（履歴に残るのは結果だけ）。 */
+  async runPcLane(question) {
+    el("empty-state").hidden = true;
+    const li = document.createElement("li");
+    li.className = "msg-ai";
+    const b = document.createElement("span");
+    b.className = `badge mono ${BADGES.pc.className}`;
+    b.textContent = BADGES.pc.label;
+    li.appendChild(b);
+    const p = document.createElement("p");
+    p.className = "answer";
+    p.textContent = "仮想PCを操作しています。少し時間がかかります…";
+    li.appendChild(p);
+    const n = document.createElement("p");
+    n.className = "note";
+    n.textContent = "開始しています…";
+    li.appendChild(n);
+    el("msg-list").appendChild(li);
+    this.scrollChat();
+
+    const outcome = await executePcTask(question, (ev) => {
+      if (ev.type === "step") {
+        const labels = (ev.actions || [])
+          .map((a) => (typeof CubePc !== "undefined" && CubePc.actionLabel)
+            ? CubePc.actionLabel(a.raw || "") : (a.raw || ""))
+          .filter(Boolean);
+        n.textContent = labels.length
+          ? `ステップ${ev.step}：${labels[labels.length - 1]}`
+          : `ステップ${ev.step} を実行中…`;
+        this.scrollChat();
+      } else if (ev.type === "verification" && ev.phase === "done_reject") {
+        n.textContent = "確認：まだ完了していないため差し戻しました";
+        this.scrollChat();
+      }
+    });
+
+    li.remove();
+    if (outcome.kind === "finished" && outcome.result) {
+      this.pushAssistant({
+        text: outcome.result.message || "終わりました。",
+        badge: "pc",
+        note: pcResultNote(outcome.result),
+      });
+    } else if (outcome.kind === "unsupported" || outcome.kind === "busy") {
+      this.pushAssistant({
+        text: outcome.detail,
+        badge: "pc",
+        note: "今できる操作は「おためし」タブのPC操作パネルに例があります。",
+      });
+    } else {
+      this.pushAssistant({
+        text: "PC操作サーバーに接続できませんでした。",
+        badge: "pc",
+        note: "仮想PCやモデルの準備ができていない可能性があります。時間をおいてもう一度試してください。",
+      });
+    }
   },
 
   /* ---- 場所・話題・買い物レーンのカード描画 ----
@@ -13019,6 +13226,14 @@ const App = {
     // は何も出さず、従来の手順（2.5 以降）にそのまま倒れる。
     // 結果は変わる情報なので知識メモ帳には保存しない。
 
+    // PC操作：明確な操作の依頼表現のときだけ（detectPcQuery が
+    // 事実・方法の質問を弾く）。実行は仮想PCの専門モデルが行い、
+    // 結果（検証の成否を含む）は橋渡しが決めた文面をそのまま出す。
+    if (detectPcQuery(question)) {
+      await this.runPcLane(question);
+      return;
+    }
+
     // 話題：定型の聞き方に一致したときだけ。
     if (detectTopicsQuery(question)) {
       this.setPhase("searching");
@@ -13829,6 +14044,7 @@ if (typeof module !== "undefined" && module.exports) {
     detectTopicsQuery, fetchTopics, topicCardOf, topicSourceLabel,
     parseShopQuery, extractShopConditions, extractShopKeyword,
     fetchShop, shopCardOf, shopIntroText, shopConditionsHash,
+    detectPcQuery, executePcTask, pcResultNote,
     formatTimestampLabel, formatDistanceLabel,
     factSourceRelatedToEntity,
     verifyModelAnswer, splitForGate, verifySentence,

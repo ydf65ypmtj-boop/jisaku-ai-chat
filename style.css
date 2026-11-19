@@ -510,10 +510,12 @@ a { color: var(--accent); }
 .badge-places { background: #2e7d5b; color: #ffffff; }
 .badge-topics { background: #8a5aa0; color: #ffffff; }
 .badge-shop { background: #b23a6d; color: #ffffff; }
+.badge-pc { background: #3a6ea5; color: #ffffff; }
 @media (prefers-color-scheme: dark) {
   .badge-places { background: #7fc7a5; color: #1d1a15; }
   .badge-topics { background: #c39bd8; color: #1d1a15; }
   .badge-shop { background: #e58bb1; color: #1d1a15; }
+  .badge-pc { background: #8fb8dd; color: #1d1a15; }
 }
 
 /* 場所・話題・買い物レーンのカード */
