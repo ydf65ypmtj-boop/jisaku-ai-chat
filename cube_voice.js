@@ -35,6 +35,14 @@
  * - 状態遷移：idle → listening → thinking → speaking → listening …
  *   エラーは error、終了は ended。遷移はすべて session の単一の
  *   経路を通るので、モックでそのまま検証できる。
+ * - 2Dキャラの口パク：音声会話画面にキャラ（C案）を表示し、
+ *   VOICEVOX 本線の再生に合わせて口を動かす。タイミングは
+ *   サーバーの /voice/schedule（合成に使う audio_query から作る
+ *   モーラタイミング）が文ごとに返し、再生中は
+ *   audio.currentTime を追って母音の口に切り替える。待機中は
+ *   閉じ口＋瞬きループ。方式は 2026-11-18 の口パク試作の踏襲。
+ *   キャラやタイミングが用意できない環境では玉（オーブ）の
+ *   表示のまま会話を続ける（フェイルソフト）。
  *
  * 使い方（ブラウザ）：
  *   <script src="cube_voice.js"></script>   （script.js の後）
@@ -217,6 +225,9 @@
     let currentUrl = null;
 
     function stopCurrent() {
+      if (e.lipSync) {
+        try { e.lipSync.stopPlayback(); } catch { /* noop */ }
+      }
       if (currentAudio) {
         try { currentAudio.pause(); } catch { /* noop */ }
         currentAudio = null;
@@ -227,9 +238,37 @@
       }
     }
 
+    /* 口パク用のモーラタイミングを /voice/schedule から取る。
+       取れなくても読み上げは続ける（口は動かないだけ）ため、
+       失敗はすべて null に倒す。 */
+    async function fetchSchedule(sentence) {
+      const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+      try {
+        const res = await fetchFn(`${base}/voice/schedule`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: sentence, speaker: e.speaker ?? null }),
+          signal: ctrl ? ctrl.signal : undefined,
+        });
+        if (!res || !res.ok) return null;
+        const j = await res.json().catch(() => null);
+        if (!j || !Array.isArray(j.schedule)) return null;
+        const segs = j.schedule.filter((s) => s &&
+          typeof s.start === "number" && typeof s.end === "number" &&
+          typeof s.vowel === "string");
+        return segs.length ? segs : null;
+      } catch {
+        return null;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
     return {
       kind: "voicevox",
       async prepare(sentence) {
+        const schedP = fetchSchedule(sentence); // 失敗しても null（投げない）
         const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
         const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
         try {
@@ -241,7 +280,8 @@
           });
           if (!res || !res.ok) throw new Error(`voice http ${res && res.status}`);
           const blob = await res.blob();
-          return { blob };
+          const schedule = await schedP;
+          return { blob, schedule };
         } finally {
           if (timer) clearTimeout(timer);
         }
@@ -258,6 +298,11 @@
           const p = audio.play();
           if (p && typeof p.catch === "function") {
             p.catch((err) => { stopCurrent(); reject(err); });
+          }
+          if (token && token.schedule && e.lipSync) {
+            try {
+              e.lipSync.play(token.schedule, () => audio.currentTime);
+            } catch { /* 口パクが無くても再生は続ける */ }
           }
         });
       },
@@ -295,6 +340,127 @@
         if (synth) { try { synth.cancel(); } catch { /* noop */ } }
         currentUtter = null;
       },
+    };
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* 2Dキャラの口パク（音素タイミング駆動）                            */
+  /* ---------------------------------------------------------------- */
+
+  const LIP_VOWELS = ["a", "i", "u", "e", "o"];
+
+  /* 母音 → フレームキー。母音以外（"none"・促音・撥音など）は
+     閉じ口 "base"。 */
+  function frameKeyForVowel(vowel) {
+    return LIP_VOWELS.includes(vowel) ? vowel : "base";
+  }
+
+  /* スケジュール [{start, end, vowel}] の時刻 t（秒）の母音。
+     区間外は "none"（閉じ口）。試作と同じ線形走査。 */
+  function vowelAtTime(schedule, t) {
+    if (!Array.isArray(schedule)) return "none";
+    for (const seg of schedule) {
+      if (seg && t >= seg.start && t < seg.end) return seg.vowel;
+    }
+    return "none";
+  }
+
+  /* 口パク制御。描画は deps.show(frameKey) に委ね、タイマ・rAF・
+     乱数は注入する（Node のモックで検証できる形）。試作の方式：
+       - 瞬きは 2.5〜5 秒のランダム間隔で約150ms、口より優先表示
+       - 再生中は rAF で clock（audio.currentTime）を追い、
+         その時刻の母音の口に切り替える
+       - 停止・終了では閉じ口に戻る */
+  function createLipSync(deps) {
+    const d = deps || {};
+    const show = typeof d.show === "function" ? d.show : noop;
+    const setT = d.setTimeout || setTimeout;
+    const clearT = d.clearTimeout || clearTimeout;
+    const raf = d.requestAnimationFrame ||
+      (typeof requestAnimationFrame !== "undefined" ? requestAnimationFrame : null);
+    const caf = d.cancelAnimationFrame ||
+      (typeof cancelAnimationFrame !== "undefined" ? cancelAnimationFrame : null);
+    const random = d.random || Math.random;
+
+    let mouth = "base";      // 今の口形（フレームキー）
+    let blinking = false;
+    let shownKey = null;     // 最後に show したキー
+    let running = false;     // 瞬きループが回っているか
+    let blinkWaitTimer = null;
+    let blinkEndTimer = null;
+    let playRaf = null;
+    let playClock = null;    // () => 秒。null を返したら再生終了扱い
+    let playSchedule = null;
+
+    function render() {
+      const key = blinking ? "blink" : mouth;
+      if (key === shownKey) return;
+      shownKey = key;
+      show(key);
+    }
+    function setMouth(vowel) {
+      const next = frameKeyForVowel(vowel);
+      if (next !== mouth) mouth = next;
+      render();
+    }
+    function scheduleBlink() {
+      if (!running) return;
+      blinkWaitTimer = setT(() => {
+        blinkWaitTimer = null;
+        if (!running) return;
+        blinking = true;
+        render();
+        blinkEndTimer = setT(() => {
+          blinkEndTimer = null;
+          blinking = false;
+          render();
+          scheduleBlink();
+        }, 150);
+      }, 2500 + random() * 2500);
+    }
+    function tick() {
+      if (!playClock) { playRaf = null; return; }
+      const t = playClock();
+      if (t === null || t === undefined || Number.isNaN(t)) {
+        stopPlayback();
+        return;
+      }
+      setMouth(vowelAtTime(playSchedule, t));
+      playRaf = raf ? raf(tick) : null;
+    }
+    function stopPlayback() {
+      if (playRaf !== null && caf) caf(playRaf);
+      playRaf = null;
+      playClock = null;
+      playSchedule = null;
+      if (mouth !== "base") mouth = "base";
+      render();
+    }
+    return {
+      start() {
+        if (running) return;
+        running = true;
+        render();
+        scheduleBlink();
+      },
+      stop() {
+        running = false;
+        if (blinkWaitTimer) { clearT(blinkWaitTimer); blinkWaitTimer = null; }
+        if (blinkEndTimer) { clearT(blinkEndTimer); blinkEndTimer = null; }
+        blinking = false;
+        stopPlayback();
+        render();
+      },
+      play(schedule, clock) {
+        stopPlayback();
+        if (!Array.isArray(schedule) || !schedule.length ||
+            typeof clock !== "function" || !raf) return;
+        playSchedule = schedule;
+        playClock = clock;
+        playRaf = raf(tick);
+      },
+      stopPlayback,
+      get shownKey() { return shownKey; },
     };
   }
 
@@ -718,13 +884,22 @@
 .cv-orb { width: 148px; height: 148px; border-radius: 50%;
   background: radial-gradient(circle at 35% 30%, var(--grad-2), var(--grad-1));
   box-shadow: 0 12px 40px rgba(27, 80, 200, 0.35); }
+.cv-char { position: relative; width: min(66vw, 288px); aspect-ratio: 1 / 1; flex: none; }
+.cv-char[hidden] { display: none; }
+.cv-char img { position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; border-radius: 28px; opacity: 0;
+  box-shadow: 0 12px 40px rgba(27, 80, 200, 0.25); }
+.cv-char img.on { opacity: 1; }
 .cv-overlay[data-state="listening"] .cv-orb { animation: cv-pulse 2.2s ease-in-out infinite; }
 .cv-overlay[data-state="speaking"] .cv-orb { animation: cv-talk 0.9s ease-in-out infinite; }
 .cv-overlay[data-state="thinking"] .cv-orb { animation: cv-pulse 1.1s ease-in-out infinite; opacity: 0.75; }
 .cv-overlay[data-state="error"] .cv-orb { background: var(--warn); animation: none; }
+.cv-overlay[data-state="listening"] .cv-char { animation: cv-pulse 2.2s ease-in-out infinite; }
+.cv-overlay[data-state="speaking"] .cv-char { animation: cv-talk 0.9s ease-in-out infinite; }
+.cv-overlay[data-state="thinking"] .cv-char { animation: cv-pulse 1.1s ease-in-out infinite; }
 @keyframes cv-pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.06); } }
 @keyframes cv-talk { 0%,100% { transform: scale(1); } 50% { transform: scale(1.13); } }
-@media (prefers-reduced-motion: reduce) { .cv-orb { animation: none !important; } }
+@media (prefers-reduced-motion: reduce) { .cv-orb, .cv-char { animation: none !important; } }
 .cv-status { font-size: 15px; color: var(--dim); min-height: 22px; margin: 4px 0 8px; }
 .cv-subtitles { width: 100%; max-width: 560px; min-height: 120px; }
 .cv-sub-user { color: var(--dim); font-size: 15px; margin: 0 0 6px; }
@@ -788,12 +963,26 @@
       lang,
     });
     const voiceState = { speaker: null, voicevoxReady: false };
+    /* 2Dキャラ（口パク）の状態。フレームは遅延読み込みし、
+       用意できるまでは玉（オーブ）表示のままにする。エンジンへは
+       代理オブジェクトを渡し、キャラが組み上がってからでも
+       口パクが効くようにする。 */
+    const charState = { lipSync: null, loading: false, ready: false };
+    const lipSyncProxy = {
+      play(schedule, clock) {
+        if (charState.lipSync) charState.lipSync.play(schedule, clock);
+      },
+      stopPlayback() {
+        if (charState.lipSync) charState.lipSync.stopPlayback();
+      },
+    };
     const makeVoicevox = () => createVoicevoxEngine({
       fetch: win.fetch.bind(win),
       URL: win.URL,
       Audio: win.Audio,
       serverBaseUrl: serverBase,
       speaker: voiceState.speaker,
+      lipSync: lipSyncProxy,
     });
     const queue = createSpeechQueue({ engine: browserEngine });
     const session = createSession({
@@ -829,7 +1018,18 @@
         <span class="cv-title">Cube 音声会話</span>
         <span class="cv-engine mono"></span>
       </div>
-      <div class="cv-orb-wrap"><div class="cv-orb" role="img" aria-label="Cube"></div></div>
+      <div class="cv-orb-wrap">
+        <div class="cv-orb" role="img" aria-label="Cube"></div>
+        <div class="cv-char" hidden aria-hidden="true">
+          <img data-frame="base" alt="" />
+          <img data-frame="a" alt="" />
+          <img data-frame="i" alt="" />
+          <img data-frame="u" alt="" />
+          <img data-frame="e" alt="" />
+          <img data-frame="o" alt="" />
+          <img data-frame="blink" alt="" />
+        </div>
+      </div>
       <p class="cv-status" aria-live="polite"></p>
       <div class="cv-subtitles">
         <p class="cv-sub-user"></p>
@@ -850,6 +1050,12 @@
     doc.body.appendChild(overlay);
 
     const q = (sel) => overlay.querySelector(sel);
+    const orbEl = q(".cv-orb");
+    const charEl = q(".cv-char");
+    const charImgs = {};
+    charEl.querySelectorAll("img[data-frame]").forEach((img) => {
+      charImgs[img.dataset.frame] = img;
+    });
     const statusEl = q(".cv-status");
     const subUser = q(".cv-sub-user");
     const subAi = q(".cv-sub-ai");
@@ -861,6 +1067,69 @@
     const engineEl = q(".cv-engine");
     const textForm = q(".cv-textform");
     const textInput = q(".cv-textinput");
+
+    /* キャラのフレーム（cube_character_frames.js）を遅延読み込み
+       して口パクを組み立てる。失敗したら玉表示のまま（会話は
+       続けられる）。 */
+    function ensureCharacter() {
+      if (charState.ready || charState.loading) return;
+      charState.loading = true;
+      const build = () => {
+        const frames = win.CubeCharFrames || null;
+        if (!frames) { charState.loading = false; return; }
+        let pending = 0;
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          if (!charImgs.base || !charImgs.base.dataset.ok) {
+            charState.loading = false; // 土台が読めなければ玉のまま
+            return;
+          }
+          charState.lipSync = createLipSync({
+            show(key) {
+              const target = (charImgs[key] && charImgs[key].dataset.ok) ? key : "base";
+              for (const k of Object.keys(charImgs)) {
+                charImgs[k].classList.toggle("on", k === target);
+              }
+            },
+            requestAnimationFrame: win.requestAnimationFrame
+              ? win.requestAnimationFrame.bind(win) : null,
+            cancelAnimationFrame: win.cancelAnimationFrame
+              ? win.cancelAnimationFrame.bind(win) : null,
+          });
+          charEl.hidden = false;
+          orbEl.style.display = "none";
+          charState.ready = true;
+          charState.loading = false;
+          if (!overlay.hidden) charState.lipSync.start();
+        };
+        for (const key of Object.keys(charImgs)) {
+          const src = frames[key];
+          if (!src) continue;
+          pending += 1;
+          const img = charImgs[key];
+          const settle = (ok) => {
+            if (ok) {
+              img.dataset.ok = "1";
+              if (img.decode) img.decode().catch(() => {});
+            }
+            if (--pending === 0) finish();
+          };
+          img.onload = () => settle(true);
+          img.onerror = () => settle(false);
+          img.src = src;
+        }
+        if (pending === 0) { charState.loading = false; return; }
+        setTimeout(finish, 4000); // 読み込みが固まった場合の保険
+      };
+      if (win.CubeCharFrames) { build(); return; }
+      const script = doc.createElement("script");
+      script.src = e.charFramesUrl || "cube_character_frames.js";
+      script.onload = build;
+      script.onerror = () => { charState.loading = false; };
+      doc.head.appendChild(script);
+    }
 
     function renderEngine() {
       engineEl.textContent = session.engineKind === "voicevox" ? "声：VOICEVOX Nemo" : "声：ブラウザ内蔵";
@@ -903,6 +1172,7 @@
     });
     endBtn.addEventListener("click", () => {
       session.end();
+      if (charState.lipSync) charState.lipSync.stop();
       overlay.hidden = true;
     });
     automicBox.addEventListener("change", () => session.setAutoMic(automicBox.checked));
@@ -955,6 +1225,8 @@
     entry.addEventListener("click", () => {
       overlay.hidden = false;
       noticeEl.textContent = "";
+      ensureCharacter();
+      if (charState.lipSync) charState.lipSync.start();
       // iOS 等の自動再生制限の解除：ユーザー操作のうちに無音を一度再生
       try {
         const a = new win.Audio(
@@ -997,6 +1269,9 @@
     createBrowserHost,
     probeVoicevox,
     mountBrowserUi,
+    createLipSync,
+    vowelAtTime,
+    frameKeyForVowel,
     splitSentences,
     sanitizeForSpeech,
     _internal: {
