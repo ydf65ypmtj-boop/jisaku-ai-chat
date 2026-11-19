@@ -9805,6 +9805,8 @@ const App = {
     if (fcView) fcView.hidden = name !== "factcheck";
     const labView = el("view-lab");
     if (labView) labView.hidden = name !== "lab";
+    const doctorView = el("view-doctor");
+    if (doctorView) doctorView.hidden = name !== "doctor";
     const memView = el("view-memory");
     if (memView) memView.hidden = name !== "memory";
     el("view-settings").hidden = name !== "settings";
