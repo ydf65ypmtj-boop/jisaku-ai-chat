@@ -457,13 +457,20 @@ body {
 .msg-ai .answer { font-size: 16px; line-height: 1.9; }
 .msg-ai .evidence { margin-top: 8px; font-size: 13px; line-height: 1.7; color: var(--dim); }
 .msg-ai .model-said {
-  margin-top: 8px;
   background: var(--surface-alt);
   border-radius: 12px;
   padding: 8px 12px;
   font-size: 13px; line-height: 1.7; color: var(--dim);
   white-space: pre-wrap;
 }
+.msg-ai .model-said-fold { margin-top: 8px; }
+.msg-ai .model-said-fold summary {
+  font-size: 12px;
+  color: var(--dim);
+  cursor: pointer;
+  width: fit-content;
+}
+.msg-ai .model-said-fold .model-said { margin-top: 6px; }
 .msg-ai .source { margin-top: 8px; font-size: 13px; }
 .msg-ai .note { margin-top: 6px; font-size: 13px; line-height: 1.7; color: var(--dim); }
 a { color: var(--accent); }

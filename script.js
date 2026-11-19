@@ -3082,28 +3082,86 @@ const PLACES_GENRE_WORDS = [
   "村役場", "美容室", "美容院", "理容室", "床屋", "パン屋", "ベーカリー",
   "本屋", "書店", "ホームセンター", "温泉", "銭湯", "映画館", "シネマ",
   "ジム", "フィットネス", "コインランドリー", "ランドリー", "水族館",
-  "動物園", "博物館", "美術館",
+  "動物園", "博物館", "美術館", "ゲームセンター", "ゲーセン",
+  // 飲食の細分
+  "ラーメン", "らーめん", "ラーメン屋", "ラーメン店", "寿司", "すし",
+  "寿司屋", "回転寿司", "焼肉", "焼き肉", "居酒屋", "うどん", "そば",
+  "蕎麦", "ピザ", "ハンバーガー", "バーガー", "定食", "定食屋",
+  "スイーツ", "デザート", "ケーキ", "ケーキ屋", "たこ焼き", "たこやき",
+  // 遊び・レジャー
+  "カラオケ", "ボウリング", "ボーリング", "バッティングセンター",
+  "バッティング", "プール", "スイミング", "ゴルフ練習場", "ゴルフ",
+  "スケート", "アイススケート", "スケートリンク", "ダーツ",
+  "ビリヤード", "釣り堀", "釣堀", "テーマパーク", "遊園地",
+  // 買い物の細分
+  "100円ショップ", "100均", "百円ショップ", "100円均一", "家電量販店",
+  "家電店", "電気屋", "家電", "スポーツ用品", "スポーツショップ",
+  "スポーツ店", "アウトドア用品", "アウトドア", "キャンプ用品",
+  "ペットショップ", "ペット用品", "花屋", "フラワーショップ", "眼鏡",
+  "メガネ", "めがね", "眼鏡店", "コンタクトレンズ", "コンタクト",
+  "携帯ショップ", "携帯電話", "スマホショップ", "ドコモショップ",
+  "auショップ", "ソフトバンクショップ", "ゲームショップ", "ゲーム店",
+  "CDショップ", "レコード店", "レコードショップ", "レコード",
+  "楽器店", "楽器屋", "楽器", "文房具", "文房具店", "文具店", "文具",
+  "雑貨", "雑貨屋", "雑貨店", "洋服", "洋服店", "服屋", "衣料品",
+  "アパレル", "靴", "靴屋", "靴店", "シューズ",
+  // 医療の細分
+  "内科", "外科", "眼科", "耳鼻咽喉科", "耳鼻科", "皮膚科", "小児科",
+  "整形外科", "整骨院", "接骨院",
+  // 公共・交通・生活
+  "ATM", "現金自動", "コインロッカー", "ロッカー", "トイレ",
+  "お手洗い", "公衆トイレ", "バス停", "タクシー", "タクシー乗り場",
+  "レンタカー", "クリーニング", "クリーニング店", "写真館",
+  "写真スタジオ", "フォトスタジオ", "証明写真", "証明写真機",
+  "コピー", "印刷", "プリント", "レンタルビデオ", "ビデオレンタル",
+  "レンタルショップ", "学習塾", "進学塾", "予備校", "塾", "保育園",
+  "保育所", "幼稚園",
 ];
 
 /* 事実の質問らしい語。場所レーンでは拾わないための安全網
-   （本社・歴史などの会社事実、件数を聞く質問、行き方・所要時間）。 */
+   （本社・歴史などの会社事実、件数を聞く質問、行き方・所要時間、
+   人口・面積・天気などの地名にくっつく属性の質問）。 */
 const PLACES_FACT_GUARDS =
-  /本社|創業|設立|歴史|とは|の意味|って何|日本一|世界一|日本で一番|世界で一番|いくつ|何軒|何件|何か所|までの時間|所要時間|行き方/;
+  /本社|創業|設立|歴史|とは|の意味|って何|日本一|世界一|日本で一番|世界で一番|いくつ|何軒|何件|何か所|までの時間|所要時間|行き方|人口|面積|標高|高さ|天気|気温|市長|知事|特産|名物|有名|誰|いつ|なぜ|何県|何市|何線/;
+
+/* 場所探しの言い回し（「は？」「教えて」「ありますか」等）。 */
+const PLACES_LOOKUP_FORMS =
+  /(は？|は\?|を教えて|教えて|ありますか|ある？|ある\?|探して|検索して|見つけて|どこですか|どこに|一覧)/;
 
 /**
  * 場所系の質問かどうか。ジャンル語があり、かつ近さの表現・地名・
  * 探す言い回しのいずれかがあるときだけ true。事実の質問
  * （「法隆寺の高さは？」「コーヒーの淹れ方は？」等）は拾わない。
+ * ジャンル辞書に無いカテゴリでも、「地名＋カテゴリ語＋言い回し」
+ * の形なら場所探しとみなしてサーバーに委ねる（2026-11-19 実機
+ * 報告：「郡山市のゲームセンターは？」が発火しなかった）。
  */
 function detectPlacesQuery(question) {
   const q = String(question || "");
   if (!q) return false;
   if (PLACES_FACT_GUARDS.test(q)) return false;
-  if (!PLACES_GENRE_WORDS.some((w) => q.includes(w))) return false;
-  if (/近く|近所|周辺|近辺|付近|あたり|最寄|近い/.test(q)) return true;
-  if (/[^\s、。・]{1,20}(駅|市|区|町|村|県|都|府)/.test(q)) return true;
-  if (/(探して|検索して|見つけて|ありますか|ある？|ある\?)/.test(q)) return true;
-  return false;
+  if (PLACES_GENRE_WORDS.some((w) => q.includes(w))) {
+    if (/近く|近所|周辺|近辺|付近|あたり|最寄|近い/.test(q)) return true;
+    if (/[^\s、。・]{1,20}(駅|市|区|町|村|県|都|府)/.test(q)) return true;
+    if (/(探して|検索して|見つけて|ありますか|ある？|ある\?)/.test(q)) return true;
+    return false;
+  }
+  return detectPlacesByShape(q);
+}
+
+/* 辞書に無いカテゴリの形判定：「地名アンカー（〜駅・市・区・町・
+   村・県・都・府）＋カテゴリ語らしい残り＋場所探しの言い回し」が
+   そろったときだけ true。地名と言い回しを除いた残りが2文字未満
+   ならカテゴリ語が無い（「郡山市はどこですか？」等）ので拾わない。 */
+function detectPlacesByShape(q) {
+  const anchor = q.match(/[^\s、。・]{1,20}(駅|市|区|町|村|県|都|府)/);
+  if (!anchor) return false;
+  if (!PLACES_LOOKUP_FORMS.test(q)) return false;
+  const rest = q
+    .replace(anchor[0], " ")
+    .replace(/(は？|は\?|を教えて|教えて|ありますか|ある？|ある\?|探して|検索して|見つけて|どこですか|どこに|どこ|一覧|ですか|です|ます|ください)/g, " ")
+    .replace(/[のではをにがはもへとや、。・！？!?「」『』\s]/g, "");
+  return rest.length >= 2;
 }
 
 /**
@@ -3355,6 +3413,37 @@ function extractShopConditions(question) {
   return cond;
 }
 
+/* キーワードに残る口語の接続表現（文の途中・末尾の残渣）。
+   定型句（買いたい・欲しい等）を消した後に「んだけど」だけが
+   残ると、そのまま検索語になって無関係な商品が返る（実例：
+   「ミニPCを買いたいんだけどおすすめある？」→「ミニPC んだけど」）。
+   商品名の一部になり得ない接続表現だけを対象にし、平仮名の
+   商品名（はちみつ・すもも・たから等）は削らない。 */
+const SHOP_RESIDUE_ONLY =
+  /^(んだけど|んですが|んですけど|んだけれど|だけど|けれど|けど|ので|って|とか|のに|んだ|んです)$/;
+const SHOP_RESIDUE_PREFIX =
+  /^(んだけど|んですが|んですけど|んだけれど|だけど|けれど|けど|ので)+/;
+const SHOP_RESIDUE_SUFFIX =
+  /(んだけど|んですが|んですけど|んだけれど|だけど|けれど|けど|ので)$/;
+/* から・って・とか は、漢字・カタカナ・英数字の直後のときだけ
+   落とす（「たから」のような平仮名の語を守るため）。 */
+const SHOP_RESIDUE_SUFFIX_GUARDED =
+  /([一-龯ァ-ヶーA-Za-z0-9])(から|って|とか|のに)$/;
+
+/* キーワードの1語から接続表現の残渣を取り除く。 */
+function cleanShopKeywordToken(tok) {
+  let t = String(tok || "");
+  if (!t || SHOP_RESIDUE_ONLY.test(t)) return "";
+  t = t.replace(SHOP_RESIDUE_PREFIX, "");
+  let prev = null;
+  while (t && t !== prev) {
+    prev = t;
+    t = t.replace(SHOP_RESIDUE_SUFFIX, "");
+    t = t.replace(SHOP_RESIDUE_SUFFIX_GUARDED, "$1");
+  }
+  return t;
+}
+
 /**
  * 質問文から検索キーワードを取り出す。条件表現と相談の定型句を
  * 取り除いた残りだけを使うので、キーワードは必ず質問文に実在
@@ -3386,6 +3475,7 @@ function extractShopKeyword(question) {
   // 漢字・カタカナの直後の助詞だけを落とす（「すもも」保護）。
   const PARTICLE_ONLY = /^(の|が|を|は|に|で|と|も|へ|から|まで|や)$/;
   let kw = t.split(/\s+/)
+    .map(cleanShopKeywordToken)
     .filter((tok) => tok && !PARTICLE_ONLY.test(tok))
     .join(" ")
     .trim();
@@ -3493,6 +3583,16 @@ async function fetchShop(keyword, conditions) {
   };
 }
 
+/* 送料ラベルの表示整形。Yahoo が送料名として返す「設定なし」は
+   利用者には不具合に見えるため、カード化の段階で「無し」扱いに
+   して、表示側の既定文（「送料は商品ページでご確認ください」）に
+   落とす。サーバーが返した値そのものは変えない。 */
+function shopShippingLabelOf(v) {
+  if (typeof v !== "string") return "";
+  const s = v.trim();
+  return s === "設定なし" ? "" : s;
+}
+
 /* 商品1件を表示用カードにする。数字は API フィールドの転記だけ。 */
 function shopCardOf(c) {
   return {
@@ -3503,9 +3603,7 @@ function shopCardOf(c) {
     url: httpUrlOrEmpty(c.url),
     image: httpUrlOrEmpty(c.image),
     in_stock: c.in_stock !== false,
-    shipping_label:
-      typeof c.shipping_label === "string" && c.shipping_label
-        ? c.shipping_label : "",
+    shipping_label: shopShippingLabelOf(c.shipping_label),
     review_rate: typeof c.review_rate === "number" ? c.review_rate : null,
     review_count: typeof c.review_count === "number" ? c.review_count : 0,
     shop_name: typeof c.shop_name === "string" ? c.shop_name : "",
@@ -11281,10 +11379,21 @@ const App = {
       li.appendChild(ev);
     }
     if (msg.modelSaid) {
+      // 検証で採用されなかったモデルの下書きは、透明性のために
+      // 残すが、回答ブロックの本文と並べて出すと「答えの一部」に
+      // 見えて利用者が混乱する（実例：Web検索の答えの下に、全面
+      // 却下された無関係な下書きがそのまま出た）。折りたたみに
+      // 畳み、開いた人だけが見られるようにする。
+      const det = document.createElement("details");
+      det.className = "model-said-fold";
+      const sum = document.createElement("summary");
+      sum.textContent = "検証で採用されなかったCubeの下書き";
+      det.appendChild(sum);
       const ms = document.createElement("p");
       ms.className = "model-said";
-      ms.textContent = `Cubeはこう答えた：${msg.modelSaid}`;
-      li.appendChild(ms);
+      ms.textContent = msg.modelSaid;
+      det.appendChild(ms);
+      li.appendChild(det);
     }
     if (msg.sourceUrl) {
       const sp = document.createElement("p");
