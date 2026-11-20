@@ -3086,6 +3086,19 @@ function detectPcQuery(question) {
   return true;
 }
 
+/* ログインの実行依頼かどうか。ログインはチャットからは実行せず、
+   PC操作パネルの専用フォーム（金庫方式）へ誘導する。チャットに
+   パスワードを書かせないための入口で、事実・方法の質問
+   （「ログインの方法は？」等）は PC_FACT_GUARDS で弾いて
+   通常の回答経路に残す。 */
+function detectLoginRequest(question) {
+  const q = String(question || "");
+  if (!q) return false;
+  if (PC_FACT_GUARDS.test(q)) return false;
+  return /(ログイン|サインイン)(して|したい|する|し直し)/.test(q) ||
+    /(に|へ)(ログイン|サインイン)/.test(q);
+}
+
 /* PC操作の結果メッセージへの注記（ステップ数と検証の状態）。 */
 function pcResultNote(result) {
   const parts = [];
@@ -15048,6 +15061,22 @@ const App = {
       return;
     }
 
+    // ログイン：チャットからは実行しない（パスワードをチャットに
+    // 書かせない）。PC操作パネルの専用フォーム（金庫方式）へ
+    // 誘導して、このレーンで完結させる。
+    if (detectLoginRequest(question)) {
+      this.pushAssistant({
+        text: "ログインはチャットからは実行しません。パスワードを" +
+          "チャットに書くのもやめてください。「おためし」タブの" +
+          "PC操作パネルにあるログインフォームに、サイトのURL・ID・" +
+          "パスワードを入力して実行してください。パスワードはAIに" +
+          "見せず、実行側が直接入力する金庫方式です。",
+        badge: "pc",
+        note: "認証情報はモデルの文脈にもログにも残りません。",
+      });
+      return;
+    }
+
     // PC操作：明確な操作の依頼表現のときだけ（detectPcQuery が
     // 事実・方法の質問を弾く）。実行は仮想PCの専門モデルが行い、
     // 結果（検証の成否を含む）は橋渡しが決めた文面をそのまま出す。
@@ -15920,7 +15949,7 @@ if (typeof module !== "undefined" && module.exports) {
     detectTopicsQuery, fetchTopics, topicCardOf, topicSourceLabel,
     parseShopQuery, extractShopConditions, extractShopKeyword,
     fetchShop, shopCardOf, shopIntroText, shopConditionsHash,
-    detectPcQuery, executePcTask, pcResultNote,
+    detectPcQuery, executePcTask, pcResultNote, detectLoginRequest,
     extractYoutubeVideoId, fetchYoutubeCaptions, youtubeSummary,
     youtubeSummaryCap, ytLangLabel, YT_TIMEOUT_MS,
     extractZipcode, parseAddressQuery, fetchAddress, zipcodeAnswerText,

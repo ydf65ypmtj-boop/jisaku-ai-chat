@@ -24,6 +24,13 @@
  *   「実行する／やめる」ボタンを出し、応答は input 経由で返す。
  *   確定は confirm_resolved イベントが正本で、応答が無ければ
  *   実行側は実行せずに終わる（安全側）。
+ * - ログイン（金庫方式、2026-11-20 追加）：専用フォーム（URL／
+ *   ID／パスワード欄、パスワードは password 型）に本人が入力し、
+ *   「ログインを実行」を押す行為そのものを承認として
+ *   POST /pc/login で開始する。パスワードは送信直後に欄から
+ *   消し、チャットやタスク文には一切書かせない。実行はモデル
+ *   ではなく実行側ドライバが直接行い、成否はログイン後の
+ *   ページ状態の外部確認で決まる。
  *
  * 使い方（ブラウザ）：
  *   <script src="cube_pc.js"></script>
@@ -36,7 +43,9 @@
  */
 (function (global) {
 
-  /* 対応カテゴリ（サーバー pc_bridge.js の SUPPORTED と同期させる） */
+  /* 対応カテゴリ（サーバー pc_bridge.js の SUPPORTED と同期させる）。
+     login はタスク文では実行できない（金庫方式の専用フォーム
+     からのみ）ため formOnly とし、チップはフォームへの案内に使う。 */
   const CATEGORIES = [
     { id: "open_page", label: "ページを開く", example: "example.org を開いて" },
     { id: "browser_search", label: "ブラウザで検索", example: "『富士山の高さ』を検索して" },
@@ -46,6 +55,7 @@
     { id: "terminal", label: "端末でコマンド実行", example: "端末で echo OK123 を実行して" },
     { id: "file_delete", label: "ファイルを削除（実行前に確認）", example: "『memo.txt』を削除して" },
     { id: "form_send", label: "フォームを送信（実行前に確認）", example: "example.com のフォームに『よろしくお願いします』と入力して送信して" },
+    { id: "login", label: "ログイン（金庫方式）", example: "", formOnly: true },
   ];
 
   /* 実画面の大きさ（体の Xvfb は 1280x800 固定） */
@@ -115,7 +125,7 @@
     const t = (task || "").trim();
     if (!t) return { supported: false, reason: "empty", detail: "" };
     if (/パスワード|暗証|ログイン|サインイン|認証コード/.test(t)) {
-      return { supported: false, reason: "password", detail: "パスワード入力やログインが要る操作は、今は受け付けていません。" };
+      return { supported: false, reason: "password", detail: "パスワードやログインは、文章からは受け付けません。下のログインフォーム（金庫方式）から実行してください。チャットにパスワードを書かないでください。" };
     }
     if (/インストール|アンインストール/.test(t)) {
       return { supported: false, reason: "destructive", detail: "インストールのような操作は、今は受け付けていません。" };
@@ -202,12 +212,16 @@
         "Cube が仮想PCを操作します。成功の表示は、エージェントの自己申告ではなく、こちらで実際に確認できた場合だけ出ます。");
       root.appendChild(els.notice);
 
-      // 例文チップ
+      // 例文チップ（login は専用フォームへの案内チップ）
       const chips = el("div", "cubepc-chips");
       for (const c of CATEGORIES) {
-        const chip = el("button", "cubepc-chip", c.example);
+        const chip = el("button", "cubepc-chip", c.formOnly ? c.label : c.example);
         chip.setAttribute("type", "button");
         chip.addEventListener("click", () => {
+          if (c.formOnly) {
+            if (els.loginUrl) els.loginUrl.focus();
+            return;
+          }
           els.input.value = c.example;
           refreshPreview();
         });
@@ -234,6 +248,41 @@
 
       els.preview = el("p", "cubepc-preview", "");
       root.appendChild(els.preview);
+
+      // ログインフォーム（金庫方式）：本人がここに入力して
+      // 「ログインを実行」を押す行為そのものが実行の承認になる。
+      // パスワードは password 型の欄で受け、送信直後に欄から消す。
+      // チャットやタスク文にパスワードを書く経路は作らない。
+      const loginBox = el("div", "cubepc-vault");
+      const loginTitle = el("p", "cubepc-vault-title", "ログイン（金庫方式）");
+      loginBox.appendChild(loginTitle);
+      const loginNote = el("p", "cubepc-vault-note",
+        "パスワードはAIに見せず、実行側が直接入力します。" +
+        "チャットにパスワードを書かないでください。" +
+        "「ログインを実行」を押すと、そのままログインを実行します。");
+      loginBox.appendChild(loginNote);
+      const loginFields = el("div", "cubepc-vault-fields");
+      els.loginUrl = el("input", "cubepc-vault-input");
+      els.loginUrl.setAttribute("type", "text");
+      els.loginUrl.setAttribute("placeholder", "サイトのURL（https://…）");
+      els.loginUrl.setAttribute("autocomplete", "url");
+      els.loginUser = el("input", "cubepc-vault-input");
+      els.loginUser.setAttribute("type", "text");
+      els.loginUser.setAttribute("placeholder", "ID・メールアドレス");
+      els.loginUser.setAttribute("autocomplete", "username");
+      els.loginPass = el("input", "cubepc-vault-input");
+      els.loginPass.setAttribute("type", "password");
+      els.loginPass.setAttribute("placeholder", "パスワード");
+      els.loginPass.setAttribute("autocomplete", "current-password");
+      els.loginRun = el("button", "cubepc-vault-run", "ログインを実行");
+      els.loginRun.setAttribute("type", "button");
+      els.loginRun.addEventListener("click", () => submitLogin());
+      loginFields.appendChild(els.loginUrl);
+      loginFields.appendChild(els.loginUser);
+      loginFields.appendChild(els.loginPass);
+      loginFields.appendChild(els.loginRun);
+      loginBox.appendChild(loginFields);
+      root.appendChild(loginBox);
 
       els.state = el("p", "cubepc-state", "まだ実行していません");
       root.appendChild(els.state);
@@ -330,7 +379,85 @@
       state.els.run.disabled = running;
       state.els.stop.disabled = !running;
       state.els.input.disabled = running;
+      if (state.els.loginRun) {
+        state.els.loginRun.disabled = running;
+        state.els.loginUrl.disabled = running;
+        state.els.loginUser.disabled = running;
+        state.els.loginPass.disabled = running;
+      }
       updateControlUi();
+    }
+
+    /* 前回分の表示を片付けて、新しい実行の開始状態にする。 */
+    function resetRunUi() {
+      state.els.log.textContent = "";
+      state.els.result.hidden = true;
+      state.els.confirmBox.hidden = true;
+      state.confirm = null;
+      state.confirmBusy = false;
+      state.controlMode = "ai";
+      state.controlBusy = false;
+    }
+
+    /*
+     * ログイン（金庫方式）の開始。フォームの値を POST /pc/login
+     * へ送る。パスワード欄は送信を開始した直後に空にする（結果を
+     * 待たない）。開始できたら通常タスクと同じ SSE 表示に繋ぐ。
+     */
+    async function submitLogin() {
+      if (state.running) return;
+      const els = state.els;
+      const url = els.loginUrl.value.trim();
+      const userId = els.loginUser.value;
+      const password = els.loginPass.value;
+      if (!url || !userId || !password) {
+        showResult("unsupported", "URL・ID・パスワードを全部入力してください。");
+        return;
+      }
+      resetRunUi();
+      setRunning(true);
+      els.state.textContent = "ログインを開始しています…";
+      let respPromise;
+      try {
+        respPromise = fetchImpl(`${baseUrl}/pc/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url, userId, password }),
+        });
+      } catch (e) {
+        els.loginPass.value = "";
+        setRunning(false);
+        showResult("error", "サーバーに接続できませんでした。");
+        return;
+      }
+      // パスワードは送信を開始したら直ちに欄から消す。
+      els.loginPass.value = "";
+      let resp;
+      try {
+        resp = await respPromise;
+      } catch (e) {
+        setRunning(false);
+        showResult("error", "サーバーに接続できませんでした。");
+        return;
+      }
+      const data = await resp.json().catch(() => ({}));
+      if (resp.status === 400 || resp.status === 422) {
+        setRunning(false);
+        showResult("unsupported", data.detail || "入力を確認してください。");
+        return;
+      }
+      if (resp.status === 409) {
+        setRunning(false);
+        showResult("error", data.detail || "別のタスクを実行中です。");
+        return;
+      }
+      if (!resp.ok || !data.taskId) {
+        setRunning(false);
+        showResult("error", "ログインを開始できませんでした。");
+        return;
+      }
+      state.taskId = data.taskId;
+      openEvents(data.taskId);
     }
 
     /* ---- ライブ操作（乗っ取り） ---- */
@@ -479,13 +606,7 @@
         return;
       }
       // 前回分を片付ける
-      state.els.log.textContent = "";
-      state.els.result.hidden = true;
-      state.els.confirmBox.hidden = true;
-      state.confirm = null;
-      state.confirmBusy = false;
-      state.controlMode = "ai";
-      state.controlBusy = false;
+      resetRunUi();
       setRunning(true);
       state.els.state.textContent = "開始しています…";
       let resp;
@@ -594,7 +715,7 @@
       }
     }
 
-    const panel = { mount, submit, stop, destroy, _state: state };
+    const panel = { mount, submit, submitLogin, stop, destroy, _state: state };
     return panel;
   }
 
