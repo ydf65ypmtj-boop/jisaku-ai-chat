@@ -19,6 +19,11 @@
  *   直接操作でき、操作中は画面タップがクリックとして送られる。
  *   操作モードの正本はサーバーの control イベントで、手入力は
  *   mode:"user" の間だけ橋渡しが通す（AI と競合させない）。
+ * - 実行前確認（2026-11-20 追加）：削除・送信は実行側が直前で
+ *   止まり、confirm イベントで確認を求める。パネルは要約と
+ *   「実行する／やめる」ボタンを出し、応答は input 経由で返す。
+ *   確定は confirm_resolved イベントが正本で、応答が無ければ
+ *   実行側は実行せずに終わる（安全側）。
  *
  * 使い方（ブラウザ）：
  *   <script src="cube_pc.js"></script>
@@ -39,6 +44,8 @@
     { id: "editor_input", label: "メモ帳に入力", example: "メモ帳に『今日は良い天気です』と入力して" },
     { id: "folder_create", label: "フォルダ作成", example: "『shiryo-2026』フォルダを作って" },
     { id: "terminal", label: "端末でコマンド実行", example: "端末で echo OK123 を実行して" },
+    { id: "file_delete", label: "ファイルを削除（実行前に確認）", example: "『memo.txt』を削除して" },
+    { id: "form_send", label: "フォームを送信（実行前に確認）", example: "example.com のフォームに『よろしくお願いします』と入力して送信して" },
   ];
 
   /* 実画面の大きさ（体の Xvfb は 1280x800 固定） */
@@ -83,9 +90,26 @@
     ["→", "Right"], ["Space", "space"],
   ];
 
+  /* 削除対象のファイル名（サーバー extractDeleteTarget の軽量ミラー） */
+  function deleteNamePreview(t) {
+    const safe = (n) => /^[A-Za-z0-9_.\-]+$/.test(n) && n !== "." && n !== ".." && !n.includes("..");
+    const full = t.match(/\/home\/user\/([A-Za-z0-9_.\-]+)/);
+    if (full) {
+      const rest = t.slice(t.indexOf(full[0]) + full[0].length);
+      if (rest.startsWith("/")) return null;
+      return safe(full[1]) ? full[1] : null;
+    }
+    const q = t.match(/[『「]([^』」]+)[』」]/);
+    if (q && safe(q[1])) return q[1];
+    const bare = t.match(/([A-Za-z0-9_.\-]+\.(?:txt|md))/);
+    return bare && safe(bare[1]) ? bare[1] : null;
+  }
+
   /*
    * 入力時の先行判定（サーバーの classifyTask の軽量ミラー）。
    * あくまで即時フィードバック用で、最終判定はサーバーが行う。
+   * 削除・送信は実行前確認つきで対応（2026-11-20）。対象や宛先が
+   * 特定できないときは、サーバーと同じく聞き返しの文面を出す。
    */
   function classifyPreview(task) {
     const t = (task || "").trim();
@@ -93,8 +117,23 @@
     if (/パスワード|暗証|ログイン|サインイン|認証コード/.test(t)) {
       return { supported: false, reason: "password", detail: "パスワード入力やログインが要る操作は、今は受け付けていません。" };
     }
-    if (/削除|消して|送信して|送って|インストール|アンインストール/.test(t)) {
-      return { supported: false, reason: "destructive", detail: "削除・送信・インストールのような操作は、今は受け付けていません。" };
+    if (/インストール|アンインストール/.test(t)) {
+      return { supported: false, reason: "destructive", detail: "インストールのような操作は、今は受け付けていません。" };
+    }
+    if (/削除|消して|消す/.test(t)) {
+      if (/フォルダ/.test(t)) {
+        return { supported: false, reason: "destructive", detail: "フォルダの削除は受け付けていません。削除できるのは仮想PCの /home/user にあるファイルだけです。" };
+      }
+      if (!deleteNamePreview(t)) {
+        return { supported: false, reason: "need_detail", detail: "削除するファイル名を指定してください（例：『memo.txt』を削除して）。実行の前に確認画面が出ます。" };
+      }
+      return { supported: true, category: "file_delete" };
+    }
+    if (/送信|投稿|送って/.test(t)) {
+      if (!/(https?:\/\/|localhost|[a-zA-Z0-9\-]+\.(?:com|net|org|jp|io|dev|co\.jp|ne\.jp))/.test(t)) {
+        return { supported: false, reason: "need_detail", detail: "送信先のページ（URL）を指定してください。送信ボタンを押す前に確認画面が出ます。" };
+      }
+      return { supported: true, category: "form_send" };
     }
     if (/フォルダ/.test(t) && /(作|作成|つく)/.test(t)) return { supported: true, category: "folder_create" };
     if (/echo\s+\S+/.test(t)) return { supported: true, category: "terminal" };
@@ -144,6 +183,8 @@
       // ライブ操作：操作モードはサーバーの control イベントが正本。
       // "ai"（AI操作中）／"user"（ユーザー操作中・AI停止）。
       controlMode: "ai", controlBusy: false,
+      // 実行前確認（削除・送信）：サーバーの confirm イベントが正本。
+      confirm: null, confirmBusy: false,
     };
 
     function el(tag, className, text) {
@@ -227,6 +268,24 @@
         keys.appendChild(b);
       }
       root.appendChild(keys);
+
+      // 実行前確認（削除・送信）の確認ボックス
+      const confirmBox = el("div", "cubepc-confirm");
+      confirmBox.hidden = true;
+      els.confirmBox = confirmBox;
+      els.confirmText = el("p", "cubepc-confirm-text", "");
+      confirmBox.appendChild(els.confirmText);
+      const confirmBtns = el("div", "cubepc-confirm-btns");
+      els.confirmOk = el("button", "cubepc-confirm-ok", "実行する");
+      els.confirmOk.setAttribute("type", "button");
+      els.confirmOk.addEventListener("click", () => answerConfirm("approve"));
+      els.confirmCancel = el("button", "cubepc-confirm-cancel", "やめる");
+      els.confirmCancel.setAttribute("type", "button");
+      els.confirmCancel.addEventListener("click", () => answerConfirm("deny"));
+      confirmBtns.appendChild(els.confirmOk);
+      confirmBtns.appendChild(els.confirmCancel);
+      confirmBox.appendChild(confirmBtns);
+      root.appendChild(confirmBox);
 
       const typeRow = el("div", "cubepc-type-row");
       typeRow.hidden = true;
@@ -349,6 +408,63 @@
       updateControlUi();
     }
 
+    /* ---- 実行前確認（削除・送信のゲート） ---- */
+
+    function onConfirmEvent(d) {
+      if (!d || !d.confirmId) return;
+      state.confirm = d;
+      state.confirmBusy = false;
+      const els = state.els;
+      els.confirmText.textContent =
+        (d.summary || "この操作を実行しますか？") +
+        (d.detail ? `（${d.detail}）` : "");
+      els.confirmOk.disabled = false;
+      els.confirmCancel.disabled = false;
+      els.confirmBox.hidden = false;
+      els.state.textContent = "確認待ちです。内容を見て「実行する」か「やめる」を選んでください。";
+    }
+
+    function onConfirmResolved(d) {
+      state.confirm = null;
+      state.confirmBusy = false;
+      state.els.confirmBox.hidden = true;
+      const decision = d && d.decision;
+      logLine(decision === "approve"
+        ? "確認：実行します"
+        : decision === "deny"
+          ? "確認：キャンセルしました（実行しません）"
+          : decision === "timeout"
+            ? "確認：返事がなかったため実行しませんでした"
+            : "確認：終了しました");
+    }
+
+    async function answerConfirm(decision) {
+      if (!state.taskId || !state.confirm || state.confirmBusy) return;
+      state.confirmBusy = true;
+      state.els.confirmOk.disabled = true;
+      state.els.confirmCancel.disabled = true;
+      try {
+        const r = await postInput(baseUrl, state.taskId, {
+          type: "confirm",
+          confirmId: state.confirm.confirmId,
+          decision,
+        }, fetchImpl);
+        if (!r.ok) {
+          state.confirmBusy = false;
+          state.els.confirmOk.disabled = false;
+          state.els.confirmCancel.disabled = false;
+          state.els.confirmText.textContent =
+            (r.data && r.data.detail) || "確認の応答を受け付けられませんでした。";
+        }
+        // 成功時は実行側の confirm_resolved イベントでボックスを閉じる
+      } catch (e) {
+        state.confirmBusy = false;
+        state.els.confirmOk.disabled = false;
+        state.els.confirmCancel.disabled = false;
+        state.els.confirmText.textContent = "サーバーに接続できませんでした。";
+      }
+    }
+
     function logLine(text) {
       const li = el("li", "cubepc-logline", text);
       state.els.log.appendChild(li);
@@ -365,6 +481,9 @@
       // 前回分を片付ける
       state.els.log.textContent = "";
       state.els.result.hidden = true;
+      state.els.confirmBox.hidden = true;
+      state.confirm = null;
+      state.confirmBusy = false;
       state.controlMode = "ai";
       state.controlBusy = false;
       setRunning(true);
@@ -420,6 +539,12 @@
       es.addEventListener("control", (ev) => {
         onControlEvent(JSON.parse(ev.data));
       });
+      es.addEventListener("confirm", (ev) => {
+        onConfirmEvent(JSON.parse(ev.data));
+      });
+      es.addEventListener("confirm_resolved", (ev) => {
+        onConfirmResolved(JSON.parse(ev.data));
+      });
       es.addEventListener("verification", (ev) => {
         const d = JSON.parse(ev.data);
         if (d.phase === "done_reject") {
@@ -440,6 +565,9 @@
     function finish(result) {
       setRunning(false);
       if (state.es) { try { state.es.close(); } catch (_) {} state.es = null; }
+      state.confirm = null;
+      state.confirmBusy = false;
+      state.els.confirmBox.hidden = true;
       state.els.state.textContent = "終了しました";
       showResult(result.status, result.message || "");
     }
@@ -472,7 +600,7 @@
 
   const api = {
     createPanel, classifyPreview, actionLabel, CATEGORIES,
-    toScreenCoords, postInput, SCREEN_W, SCREEN_H,
+    toScreenCoords, postInput, deleteNamePreview, SCREEN_W, SCREEN_H,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   global.CubePc = api;

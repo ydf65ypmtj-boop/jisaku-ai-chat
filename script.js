@@ -3103,9 +3103,10 @@ function pcResultNote(result) {
 
 /**
  * PC操作を橋渡しへ依頼し、SSE で経過を受けながら完了を待つ。
- * onProgress({type:"started"|"step"|"screenshot"|"control"|"verification", ...})
+ * onProgress({type:"started"|"step"|"screenshot"|"control"|"verification"|"confirm"|"confirm_resolved", ...})
  * を随時呼ぶ。screenshot はライブ画面（step:"live"）を含む画面更新、
- * control は操作モード（AI／ユーザー乗っ取り）の確定通知。
+ * control は操作モード（AI／ユーザー乗っ取り）の確定通知、
+ * confirm は削除・送信の実行前確認の保留通知（confirm_resolved が確定）。
  * 戻り値：
  *   {kind:"finished", result}    橋渡しが決めた最終結果
  *   {kind:"unsupported", detail} 橋渡しが受け付けなかった（422）
@@ -3167,6 +3168,16 @@ async function executePcTask(question, onProgress) {
     es.addEventListener("control", (ev) => {
       try {
         if (onProgress) onProgress({ type: "control", ...JSON.parse(ev.data) });
+      } catch { /* noop */ }
+    });
+    es.addEventListener("confirm", (ev) => {
+      try {
+        if (onProgress) onProgress({ type: "confirm", ...JSON.parse(ev.data) });
+      } catch { /* noop */ }
+    });
+    es.addEventListener("confirm_resolved", (ev) => {
+      try {
+        if (onProgress) onProgress({ type: "confirm_resolved", ...JSON.parse(ev.data) });
       } catch { /* noop */ }
     });
     es.addEventListener("verification", (ev) => {
@@ -11862,6 +11873,61 @@ const App = {
     li.appendChild(keyRow);
     li.appendChild(typeRow);
 
+    /* ---- 実行前確認（削除・送信のゲート） ----
+       実行側が削除・送信の直前で止まると confirm イベントが届く。
+       要約と「実行する／やめる」ボタンを出し、応答は input 経由
+       （乗っ取りと同じ経路）で返す。確定は confirm_resolved
+       イベントが正本。応答しなければ実行側は実行せずに終わる。 */
+    const confirmBox = document.createElement("div");
+    confirmBox.className = "pc-confirm";
+    confirmBox.hidden = true;
+    const confirmText = document.createElement("p");
+    confirmText.className = "pc-confirm-text";
+    confirmBox.appendChild(confirmText);
+    const confirmBtns = document.createElement("div");
+    confirmBtns.className = "pc-confirm-btns";
+    const confirmOkBtn = document.createElement("button");
+    confirmOkBtn.type = "button";
+    confirmOkBtn.className = "pc-live-btn pc-confirm-ok";
+    confirmOkBtn.textContent = "実行する";
+    const confirmCancelBtn = document.createElement("button");
+    confirmCancelBtn.type = "button";
+    confirmCancelBtn.className = "pc-live-btn";
+    confirmCancelBtn.textContent = "やめる";
+    confirmBtns.appendChild(confirmOkBtn);
+    confirmBtns.appendChild(confirmCancelBtn);
+    confirmBox.appendChild(confirmBtns);
+    li.appendChild(confirmBox);
+    const confirmState = { confirmId: null, busy: false };
+    const answerConfirm = async (decision) => {
+      if (!live.taskId || !confirmState.confirmId || confirmState.busy) return;
+      if (typeof CubePc === "undefined" ||
+          typeof CubePc.postInput !== "function") return;
+      confirmState.busy = true;
+      confirmOkBtn.disabled = true;
+      confirmCancelBtn.disabled = true;
+      try {
+        const r = await CubePc.postInput(
+          CUBE_SERVER_BASE_URL, live.taskId,
+          { type: "confirm", confirmId: confirmState.confirmId, decision });
+        if (!r.ok) {
+          confirmState.busy = false;
+          confirmOkBtn.disabled = false;
+          confirmCancelBtn.disabled = false;
+          confirmText.textContent =
+            (r.data && r.data.detail) || "確認の応答を受け付けられませんでした。";
+        }
+        // 成功時は confirm_resolved イベントでボックスを閉じる
+      } catch {
+        confirmState.busy = false;
+        confirmOkBtn.disabled = false;
+        confirmCancelBtn.disabled = false;
+        confirmText.textContent = "サーバーに接続できませんでした。";
+      }
+    };
+    confirmOkBtn.addEventListener("click", () => { void answerConfirm("approve"); });
+    confirmCancelBtn.addEventListener("click", () => { void answerConfirm("deny"); });
+
     const updateLiveUi = () => {
       takeoverBtn.hidden = live.mode === "user";
       releaseBtn.hidden = live.mode !== "user";
@@ -11959,6 +12025,29 @@ const App = {
         }
       } else if (ev.type === "verification" && ev.phase === "done_reject") {
         n.textContent = "確認：まだ完了していないため差し戻しました";
+        this.scrollChat();
+      } else if (ev.type === "confirm") {
+        confirmState.confirmId = ev.confirmId;
+        confirmState.busy = false;
+        confirmOkBtn.disabled = false;
+        confirmCancelBtn.disabled = false;
+        confirmText.textContent =
+          (ev.summary || "この操作を実行しますか？") +
+          (ev.detail ? `（${ev.detail}）` : "");
+        confirmBox.hidden = false;
+        n.textContent = "確認待ちです。内容を見て「実行する」か「やめる」を選んでください。";
+        this.scrollChat();
+      } else if (ev.type === "confirm_resolved") {
+        confirmState.confirmId = null;
+        confirmState.busy = false;
+        confirmBox.hidden = true;
+        n.textContent = ev.decision === "approve"
+          ? "確認しました。実行します…"
+          : ev.decision === "deny"
+            ? "キャンセルしました（実行しません）"
+            : ev.decision === "timeout"
+              ? "確認の返事がなかったため、実行しませんでした"
+              : "確認が終了しました";
         this.scrollChat();
       }
     });
