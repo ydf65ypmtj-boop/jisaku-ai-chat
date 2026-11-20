@@ -3941,6 +3941,333 @@ function shopConditionsHash(keyword, conditions) {
   return (h >>> 0).toString(36);
 }
 
+/* ================================================================== */
+/* 住所レーン（cube-server の /addr、2026-11-20 本人決定）             */
+/*                                                                    */
+/* 住所・郵便番号・位置そのものを聞く質問に、サーバー側（/addr）が   */
+/* 公開 API（zipcloud / 国土地理院）で引いた実データだけで答える     */
+/* 専用レーン。モデル生成・検証ゲートは通さず、API の値をそのまま    */
+/* 構造化して出す。引けなかった住所・座標を推測で作ることはしない。  */
+/* 郵便番号の形式は決定的なので YouTube レーンと同じ段で先に確定     */
+/* させ、キーワード形は場所レーンの直前で拾う（近くの店探しは        */
+/* 場所レーンの担当で、住所そのものとは切り分ける）。                */
+/* 結果は変わりうる情報なので知識メモ帳には保存しない。              */
+/* ================================================================== */
+
+const ADDR_TIMEOUT_MS = 20000;
+
+/* 郵便番号の抽出用に、全角数字と全角ハイフンを半角にそろえる。 */
+function zipNormText(s) {
+  return String(s || "")
+    .replace(/[０-９]/g, (c) =>
+      String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    .replace(/－/g, "-");
+}
+
+/**
+ * 質問文から郵便番号（7桁の数字列）を取り出す。当たる形：
+ *   - 〒963-8001 / 〒9638001（〒つき）
+ *   - 963-8001（長い番号列や電話番号の一部でないもの）
+ *   - 9638001（単独、または「郵便番号」と一緒に出てきた場合だけ）
+ * どれにも当たらなければ null。金額・年号・電話番号は拾わない。
+ */
+function extractZipcode(question) {
+  const q = zipNormText(question);
+  if (!q) return null;
+  let m = q.match(/〒\s*(\d{3})-(\d{4})/);
+  if (m) return m[1] + m[2];
+  m = q.match(/〒\s*(\d{7})(?!\d)/);
+  if (m) return m[1];
+  m = q.match(/(^|[^\d-])(\d{3})-(\d{4})(?![\d-])/);
+  if (m) {
+    const after = q.charAt(m.index + m[0].length);
+    if (after !== "円" && after !== "年") return m[2] + m[3];
+  }
+  m = q.match(/(^|[^\d])(\d{7})(?!\d)/);
+  if (m) {
+    const bare = q.replace(/[\s、。・！？!?「」『』]/g, "");
+    if (bare === m[2] || q.includes("郵便番号")) return m[2];
+  }
+  return null;
+}
+
+/* 住所キーワードの対象（地名・施設名）を整える。 */
+function cleanAddressTarget(s) {
+  const t = String(s || "")
+    .trim()
+    .replace(/^[「『]/, "")
+    .replace(/[」』]$/, "")
+    .replace(/(は|が|って|の)$/, "")
+    .trim();
+  return t;
+}
+
+/* 対象がジャンル語そのものだけ（「病院はどこにある？」等）なら
+   場所探しの言い方なので、住所レーンでは拾わない。 */
+function isGenreOnlyTarget(t) {
+  if (!t) return true;
+  return PLACES_GENRE_WORDS.some((w) => t === w);
+}
+
+/**
+ * 住所キーワード形の質問かどうか。住所・郵便番号・座標そのものを
+ * 聞いているときだけ {target, wantsZip} を返し、それ以外は null。
+ * 郵便番号の数字が含まれる質問はパターンA（extractZipcode）の
+ * 担当なのでここでは扱わない。「近くの〜」は場所レーン優先、
+ * 行き方・ルートと、作り方・意味などの事実質問は対象外。
+ */
+function parseAddressQuery(question) {
+  const q = String(question || "");
+  if (!q) return null;
+  if (extractZipcode(q)) return null;
+  if (/近く|近所|周辺|近辺|付近/.test(q)) return null;
+  if (/行き方|どうやって行く|ルート|経路/.test(q)) return null;
+  if (/作り方|書き方|意味|とは/.test(q)) return null;
+  const finish = (raw, wantsZip) => {
+    const t = cleanAddressTarget(raw);
+    if (!t || t.length > 40) return null;
+    if (/[、。？！?!]/.test(t)) return null;
+    if (/^(それ|これ|あれ|ここ|そこ|何|なに)/.test(t)) return null;
+    return { target: t, wantsZip: !!wantsZip };
+  };
+  let m = q.match(/^(.+?)の郵便番号(?:は|を|って|が)?/);
+  if (m) return finish(m[1], true);
+  m = q.match(/^(.+?)の住所(?:は|を|って|が)?/);
+  if (m) return finish(m[1], false);
+  m = q.match(/^(.+?)の(?:座標|緯度・経度|緯度経度)(?:は|を|って|が)?/);
+  if (m) return finish(m[1], false);
+  m = q.match(/^(.+?)の場所はどこ/);
+  if (m) {
+    const r = finish(m[1], false);
+    return r && !isGenreOnlyTarget(r.target) ? r : null;
+  }
+  m = q.match(/^(.+?)(?:は|って)どこにある/);
+  if (m) {
+    const r = finish(m[1], false);
+    return r && !isGenreOnlyTarget(r.target) ? r : null;
+  }
+  return null;
+}
+
+/**
+ * /addr に {zipcode} または {query} を投げ、検証済みの形に整えて
+ * 返す。サーバーが ok:false（not_found / upstream）を返した場合は
+ * そのまま返し、呼び出し側が正直な文面で完結させる。通信失敗・
+ * 形が違う場合は null（呼び出し側の判断で、従来経路に倒すか
+ * 接続エラーを出す）。
+ */
+async function fetchAddress(body) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/addr`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      ADDR_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      kind: typeof data.kind === "string" ? data.kind : "",
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  const raw = Array.isArray(data.results) ? data.results : [];
+  if (data.kind === "zipcode") {
+    const results = [];
+    for (const r of raw) {
+      if (!r || typeof r.address !== "string" || !r.address) continue;
+      results.push({
+        prefecture: typeof r.prefecture === "string" ? r.prefecture : "",
+        city: typeof r.city === "string" ? r.city : "",
+        town: typeof r.town === "string" ? r.town : "",
+        address: r.address,
+      });
+    }
+    if (!results.length) return null;
+    return {
+      ok: true,
+      kind: "zipcode",
+      zipcode: typeof data.zipcode === "string" ? data.zipcode : "",
+      results,
+      source: typeof data.source === "string" ? data.source : "zipcloud",
+    };
+  }
+  if (data.kind === "geocode") {
+    const results = [];
+    for (const r of raw) {
+      if (!r || typeof r.lat !== "number" || typeof r.lng !== "number") {
+        continue;
+      }
+      results.push({
+        title: typeof r.title === "string" ? r.title : "",
+        lat: r.lat,
+        lng: r.lng,
+      });
+    }
+    if (!results.length) return null;
+    return {
+      ok: true,
+      kind: "geocode",
+      results,
+      source: typeof data.source === "string" ? data.source : "国土地理院",
+    };
+  }
+  return null;
+}
+
+/* 郵便番号→住所の答え文。町名が無い番号は、ある範囲までだけを
+   言い、補完しない。 */
+function zipcodeAnswerText(data) {
+  const list = data.results.map((r) => r.address);
+  if (list.length === 1) {
+    return `〒${data.zipcode} の住所は ${list[0]} です。`;
+  }
+  return `〒${data.zipcode} の住所は次のとおりです。\n` +
+    list.map((a) => `・${a}`).join("\n");
+}
+
+/* 地名→座標の答え文。複数候補は同名の別地点と取り違えないよう
+   title（住所表記）を必ず併記する。 */
+function geocodeAnswerText(data) {
+  const list = data.results;
+  if (list.length === 1) {
+    const r = list[0];
+    return `「${r.title}」の位置は、緯度 ${r.lat} / 経度 ${r.lng} です。`;
+  }
+  return "候補が複数見つかりました。\n" + list.map((r) =>
+    `・${r.title}（緯度 ${r.lat} / 経度 ${r.lng}）`).join("\n");
+}
+
+/* 地図リンク（キー不要の Google Maps 検索URL、座標クエリ）。 */
+function addressMapsUrl(lat, lng) {
+  return `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`;
+}
+
+/* 位置1件を表示用カードにする（タイトルが地図へのリンク）。 */
+function addressCardOf(r) {
+  return {
+    kind: "address",
+    title: r.title,
+    lat: r.lat,
+    lng: r.lng,
+    link: addressMapsUrl(r.lat, r.lng),
+  };
+}
+
+/* ================================================================== */
+/* Wikipedia出典レーン（cube-server の /wiki、2026-11-20 本人決定）   */
+/*                                                                    */
+/* 「〜とは？」型の定義質問に、Wikipedia の記事の冒頭を出典つきで    */
+/* そのまま提示する。記事の文章が答えそのものなので、出典は本物      */
+/* になる（裏づけてもいない記事を出典に付けることはしない）。        */
+/* 全文検索のヒット（matched:"search"）は、完全に一致する記事が      */
+/* 無かったことを明示して一段弱い表示にする。記事が取れない場合は    */
+/* Wikipedia には触れず、従来の手順（モデル＋検証ゲート）にそのまま  */
+/* 倒れる——/wiki は出典の付加装置であり、回答の必須経路にはしない。  */
+/* 知識メモ帳には保存しない（記事の文章は Cube の答えではない）。     */
+/* ================================================================== */
+
+const WIKI_TIMEOUT_MS = 20000;
+
+/* チャットの答えに出す記事冒頭の上限（文字数）。全文は出典リンク
+   先で読めるため、ここでは冒頭だけを引用する。 */
+const WIKI_PREVIEW_CHARS = 400;
+
+/**
+ * 「〜とは？」型の定義質問から対象を取り出す。対象が取れなければ
+ * null（Wikipedia レーンは発火せず、従来の手順に任せる）。
+ * 「〜とは限らない」のような定義でない言い回しは拾わない。
+ */
+function parseWikiDefinitionQuery(question) {
+  const q = String(question || "").trim();
+  if (!q || q.length > 60) return null;
+  if (/https?:\/\//.test(q)) return null;
+  const m =
+    q.match(/^(.+?)とはどういう(?:意味|もの|こと)(?:ですか|なのですか|でしょうか|？|\?|。)*$/) ||
+    q.match(/^(.+?)とは(?:何|なに|なん)(?:ですか|なのですか|でしょうか|なの|？|\?|。)*$/) ||
+    q.match(/^(.+?)とは(?:ですか|なのですか|でしょうか|？|\?|。)+$/) ||
+    q.match(/^(.+?)って(?:何|なに|なん)(?:ですか|なのですか|なの|？|\?|。)*$/);
+  if (!m) return null;
+  const subject = String(m[1] || "")
+    .trim()
+    .replace(/^[「『]/, "")
+    .replace(/[」』]$/, "")
+    .replace(/(は|が|の|って)$/, "")
+    .trim();
+  if (!subject || subject.length > 30) return null;
+  if (/[、。？！?!]/.test(subject)) return null;
+  if (/^(それ|これ|あれ|何|なに|なん|どう|なぜ|いつ|どこ|だれ|誰|ここ|そこ)/.test(subject)) {
+    return null;
+  }
+  return subject;
+}
+
+/**
+ * /wiki に対象を投げ、検証済みの形に整えて返す。サーバーが
+ * ok:false（not_found / upstream）を返した場合はそのまま返し、
+ * 通信失敗・形が違う場合は null。どちらの場合も呼び出し側は
+ * Wikipedia には触れず従来の手順に戻る。
+ */
+async function fetchWiki(query) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/wiki`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      },
+      WIKI_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  if (
+    typeof data.title !== "string" || !data.title ||
+    typeof data.extract !== "string" || !data.extract ||
+    typeof data.url !== "string" || !data.url
+  ) {
+    return null;
+  }
+  return {
+    ok: true,
+    matched: data.matched === "search" ? "search" : "exact",
+    title: data.title,
+    extract: data.extract,
+    truncated: !!data.truncated,
+    url: httpUrlOrEmpty(data.url),
+  };
+}
+
+/* 記事の冒頭をチャット表示用に切り取る。文の途中で切れる場合は
+   近くの「。」まで戻す。戻り値 {text, cut}。 */
+function wikiExtractPreview(extract) {
+  const text = String(extract || "").trim();
+  if (text.length <= WIKI_PREVIEW_CHARS) return { text, cut: false };
+  let cut = text.slice(0, WIKI_PREVIEW_CHARS);
+  const lastPeriod = cut.lastIndexOf("。");
+  if (lastPeriod >= 120) cut = cut.slice(0, lastPeriod + 1);
+  return { text: cut, cut: true };
+}
+
 /**
  * 助詞・活用など、事実の中身を持たない言い回し。質問にも証拠にも
  * ほぼ必ず現れるため、「裏づけ」の材料にしてはいけない。
@@ -10929,6 +11256,14 @@ const BADGES = {
     label: "動画の要約（YouTubeの字幕から）",
     className: "badge-youtube",
   },
+  address: {
+    label: "住所・位置の検索結果（郵便番号・国土地理院）",
+    className: "badge-address",
+  },
+  wiki: {
+    label: "Wikipediaの記事から（出典つき）",
+    className: "badge-wiki",
+  },
   model: {
     label: "Cubeの答え（ネットで確認済み）",
     className: "badge-model",
@@ -11797,6 +12132,82 @@ const App = {
     });
   },
 
+  /* ---- 住所レーンの実行と表示 ----
+     郵便番号形は形式が決定的なので、どの結果でもこのレーンで
+     完結させる（見つからない場合も、推測の住所は出さない）。
+     キーワード形はサーバーに届かなかった場合だけ従来経路に
+     倒れるため、完結したら true、倒れる場合は false を返す。 */
+  async runAddressZipLane(zipDigits) {
+    this.setPhase("searching");
+    const data = await fetchAddress({ zipcode: zipDigits });
+    this.setPhase("idle");
+    const zipLabel = `${zipDigits.slice(0, 3)}-${zipDigits.slice(3)}`;
+    if (!data) {
+      this.pushAssistant({
+        text: "住所の取得サーバーに接続できませんでした。",
+        badge: "address",
+        note: "時間をおいてもう一度試してください。",
+      });
+      return;
+    }
+    if (!data.ok) {
+      if (data.error === "not_found") {
+        this.pushAssistant({
+          text: `〒${zipLabel} の住所は見つかりませんでした。`,
+          badge: "address",
+          note: "郵便番号が正しいか確認してください。分からない住所を推測で出すことはしません。",
+        });
+      } else {
+        this.pushAssistant({
+          text: "住所を取得できませんでした。",
+          badge: "address",
+          note: "時間をおいてもう一度試してください。",
+        });
+      }
+      return;
+    }
+    this.pushAssistant({
+      text: zipcodeAnswerText(data),
+      badge: "address",
+      note: "出典：zipcloud（郵便番号検索）。番号によっては市区町村までの範囲しか載っていません。",
+    });
+  },
+
+  async runAddressQueryLane(parsed) {
+    this.setPhase("searching");
+    const data = await fetchAddress({ query: parsed.target });
+    this.setPhase("idle");
+    if (!data) return false;
+    if (!data.ok) {
+      if (data.error === "not_found") {
+        this.pushAssistant({
+          text: parsed.wantsZip
+            ? `「${parsed.target}」の郵便番号も位置も見つかりませんでした。`
+            : `「${parsed.target}」の位置は見つかりませんでした。`,
+          badge: "address",
+          note: "地名や施設名を変えて（例：都道府県名から書く）もう一度聞いてください。分からない場所を推測で出すことはしません。",
+        });
+      } else {
+        this.pushAssistant({
+          text: "位置を取得できませんでした。",
+          badge: "address",
+          note: "時間をおいてもう一度試してください。",
+        });
+      }
+      return true;
+    }
+    const lead = parsed.wantsZip
+      ? `「${parsed.target}」の郵便番号は、名前からは検索できませんでした。代わりに位置をお知らせします。\n`
+      : "";
+    this.pushAssistant({
+      text: lead + geocodeAnswerText(data),
+      badge: "address",
+      cards: data.results.map(addressCardOf),
+      note: "出典：国土地理院（住所・地名の検索）。地図はカードのリンクから開けます。",
+    });
+    return true;
+  },
+
   /* ---- PC操作レーンの実行と表示 ----
      進行中は履歴に残らない仮メッセージでステップを見せ、完了後に
      最終結果を通常の回答として出す（履歴に残るのは結果だけ）。
@@ -12084,6 +12495,9 @@ const App = {
     for (const card of cards) {
       if (!card || typeof card !== "object") continue;
       if (card.kind === "place") wrap.appendChild(this.buildPlaceCard(card));
+      else if (card.kind === "address") {
+        wrap.appendChild(this.buildAddressCard(card));
+      }
       else if (card.kind === "topic") {
         wrap.appendChild(this.buildTopicCard(card));
       } else if (card.kind === "shop") {
@@ -12137,6 +12551,31 @@ const App = {
       sp.textContent = `出典：${srcLabels.join(" / ")}`;
       div.appendChild(sp);
     }
+    return div;
+  },
+
+  /* 住所レーンの位置カード。タイトルが地図へのリンクになり、
+     座標は API の値をそのまま転記する。 */
+  buildAddressCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    if (card.link) {
+      const a = document.createElement("a");
+      a.href = card.link;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = `${card.title}（地図で開く）`;
+      title.appendChild(a);
+    } else {
+      title.textContent = card.title;
+    }
+    div.appendChild(title);
+    const m = document.createElement("p");
+    m.className = "lane-card-meta";
+    m.textContent = `緯度 ${card.lat} / 経度 ${card.lng}`;
+    div.appendChild(m);
     return div;
   },
 
@@ -13672,6 +14111,15 @@ const App = {
       return;
     }
 
+    // 住所（郵便番号）：番号の形式が決定的で誤爆がほぼ無いため、
+    // YouTube レーンと同じ段で確定させる。当たれば必ずこの
+    // レーンで完結させる（見つからない場合も推測はしない）。
+    const zipDigits = extractZipcode(question);
+    if (zipDigits) {
+      await this.runAddressZipLane(zipDigits);
+      return;
+    }
+
     // PC操作：明確な操作の依頼表現のときだけ（detectPcQuery が
     // 事実・方法の質問を弾く）。実行は仮想PCの専門モデルが行い、
     // 結果（検証の成否を含む）は橋渡しが決めた文面をそのまま出す。
@@ -13705,6 +14153,16 @@ const App = {
         return;
       }
       // 取得失敗時は何も出さず従来経路へ（このまま手順を進める）。
+    }
+
+    // 住所（キーワード）：住所・郵便番号・座標そのものを聞く
+    // 質問は、場所レーンの直前で確定させる（近くの店探しは
+    // 場所レーンの担当）。サーバーに届かなかった場合だけ
+    // 従来の手順に倒れる。
+    const addrParsed = parseAddressQuery(question);
+    if (addrParsed) {
+      const handled = await this.runAddressQueryLane(addrParsed);
+      if (handled) return;
     }
 
     // 場所：ジャンル語＋場所の手がかりがあるときだけ。
@@ -13797,6 +14255,43 @@ const App = {
         return;
       }
       // 失敗時は何も出さず従来経路へ（従来の棄権表示に落ちる）。
+    }
+
+    // Wikipedia出典：「〜とは？」型の定義質問は、Wikipedia の
+    // 記事の冒頭を出典つきでそのまま提示する。検索ヒット
+    // （matched:"search"）は、完全に一致する記事が無かった
+    // ことを明示して一段弱い表示にする。記事が取れない場合は
+    // Wikipedia には触れず、従来の手順にそのまま倒れる。
+    const wikiSubject = parseWikiDefinitionQuery(question);
+    if (wikiSubject) {
+      this.setPhase("searching");
+      const wikiData = await fetchWiki(wikiSubject);
+      this.setPhase("idle");
+      if (wikiData && wikiData.ok) {
+        const preview = wikiExtractPreview(wikiData.extract);
+        const tail = preview.cut || wikiData.truncated
+          ? "続きは出典リンク先で読めます。"
+          : "";
+        if (wikiData.matched === "search") {
+          this.pushAssistant({
+            text: `『${wikiData.title}』\n${preview.text}`,
+            badge: "wiki",
+            sourceTitle: `Wikipedia『${wikiData.title}』`,
+            sourceUrl: wikiData.url,
+            note: `「${wikiSubject}」と完全に一致する記事は見つからなかったため、Wikipediaの検索で見つかった記事の冒頭を表示しています。別の対象の記事の可能性もあるため、出典リンクで確認してください。${tail}`,
+          });
+        } else {
+          this.pushAssistant({
+            text: preview.text,
+            badge: "wiki",
+            sourceTitle: `Wikipedia『${wikiData.title}』`,
+            sourceUrl: wikiData.url,
+            note: `Wikipediaの記事『${wikiData.title}』の冒頭を、出典としてそのまま表示しています。${tail}`,
+          });
+        }
+        return;
+      }
+      // 取れなかった場合は何も出さず従来経路へ。
     }
 
     // 2.5) 時間制メーターの関門：サーバー側モデル（Twin / Pro /
@@ -14493,6 +14988,9 @@ if (typeof module !== "undefined" && module.exports) {
     detectPcQuery, executePcTask, pcResultNote,
     extractYoutubeVideoId, fetchYoutubeCaptions, youtubeSummary,
     youtubeSummaryCap, ytLangLabel, YT_TIMEOUT_MS,
+    extractZipcode, parseAddressQuery, fetchAddress, zipcodeAnswerText,
+    geocodeAnswerText, addressCardOf, addressMapsUrl,
+    parseWikiDefinitionQuery, fetchWiki, wikiExtractPreview,
     formatTimestampLabel, formatDistanceLabel,
     factSourceRelatedToEntity,
     verifyModelAnswer, splitForGate, verifySentence,

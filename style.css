@@ -512,12 +512,16 @@ a { color: var(--accent); }
 .badge-shop { background: #b23a6d; color: #ffffff; }
 .badge-pc { background: #3a6ea5; color: #ffffff; }
 .badge-youtube { background: #c4302b; color: #ffffff; }
+.badge-address { background: #2f6f6a; color: #ffffff; }
+.badge-wiki { background: #5a5f6a; color: #ffffff; }
 @media (prefers-color-scheme: dark) {
   .badge-places { background: #7fc7a5; color: #1d1a15; }
   .badge-topics { background: #c39bd8; color: #1d1a15; }
   .badge-shop { background: #e58bb1; color: #1d1a15; }
   .badge-pc { background: #8fb8dd; color: #1d1a15; }
   .badge-youtube { background: #e88a85; color: #1d1a15; }
+  .badge-address { background: #7fc2ba; color: #1d1a15; }
+  .badge-wiki { background: #b9bec9; color: #1d1a15; }
 }
 
 /* 場所・話題・買い物レーンのカード */
