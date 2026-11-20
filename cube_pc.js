@@ -31,6 +31,10 @@
  *   消し、チャットやタスク文には一切書かせない。実行はモデル
  *   ではなく実行側ドライバが直接行い、成否はログイン後の
  *   ページ状態の外部確認で決まる。
+ * - 文書作成（お題だけ、2026-11-20 追加）：お題・目的だけを渡すと、
+ *   文面はサーバー側で Ultra が作り（PC専門モデルは作文しない）、
+ *   仮想PCに .txt で保存される。生成文は結果に表示される。
+ *   お題が読み取れないときは聞き返しの文面を出す。
  *
  * 使い方（ブラウザ）：
  *   <script src="cube_pc.js"></script>
@@ -50,6 +54,7 @@
     { id: "open_page", label: "ページを開く", example: "example.org を開いて" },
     { id: "browser_search", label: "ブラウザで検索", example: "『富士山の高さ』を検索して" },
     { id: "editor_save", label: "メモ帳に入力して保存", example: "メモ帳に『会議は午後3時からです』と書いて memo.txt に保存して" },
+    { id: "doc_compose", label: "お題だけで文書作成", example: "『地域の祭り』についての文書を作って" },
     { id: "editor_input", label: "メモ帳に入力", example: "メモ帳に『今日は良い天気です』と入力して" },
     { id: "folder_create", label: "フォルダ作成", example: "『shiryo-2026』フォルダを作って" },
     { id: "terminal", label: "端末でコマンド実行", example: "端末で echo OK123 を実行して" },
@@ -115,6 +120,35 @@
     return bare && safe(bare[1]) ? bare[1] : null;
   }
 
+  /* 文書作成のお題（サーバー extractDocTopic の軽量ミラー）。
+     取れなければ null。「『…』という文章を書いて」のような本文
+     そのものを指す言い方はお題として扱わない。 */
+  function docTopicPreview(t) {
+    let topic = null;
+    if (!/[』」]という/.test(t)) {
+      const q = t.match(/[『「]([^『」]{1,60})[』」]/);
+      if (q) topic = q[1];
+    }
+    if (!topic) {
+      const m = t.match(/(.{1,60}?)(?:について|に関する|をテーマに)(?:の)?(?:文書|レポート|文章)/);
+      if (m) topic = m[1];
+    }
+    if (!topic) {
+      const m = t.match(/(.{1,60}?)の(?:文書|レポート|文章)を/);
+      if (m) topic = m[1];
+    }
+    if (!topic) return null;
+    topic = topic
+      .replace(/^[『「]/, "").replace(/[』」]$/, "")
+      .replace(/(について|に関する|をテーマに|の)+$/, "")
+      .replace(/^(メモ帳に|仮想PCで|PCで|Cubeに)/, "")
+      .trim();
+    if (!topic || topic.length > 60) return null;
+    if (/(文書|レポート|文章)$/.test(topic)) return null;
+    if (/(作って|作成して|書いて|作る|作成|書く)$/.test(topic)) return null;
+    return topic;
+  }
+
   /*
    * 入力時の先行判定（サーバーの classifyTask の軽量ミラー）。
    * あくまで即時フィードバック用で、最終判定はサーバーが行う。
@@ -146,6 +180,10 @@
       return { supported: true, category: "form_send" };
     }
     if (/フォルダ/.test(t) && /(作|作成|つく)/.test(t)) return { supported: true, category: "folder_create" };
+    if (/(文書|レポート|文章)/.test(t) && /(作っ|作成|書い|作る|書く|つくっ)/.test(t)) {
+      if (docTopicPreview(t)) return { supported: true, category: "doc_compose" };
+      return { supported: false, reason: "need_detail", detail: "お題を指定してください（例：『地域の祭り』についての文書を作って）。文書はUltraが書き、仮想PCに保存します。" };
+    }
     if (/echo\s+\S+/.test(t)) return { supported: true, category: "terminal" };
     if (/保存/.test(t) && /\.(txt|md)/.test(t)) return { supported: true, category: "editor_save" };
     if (/(メモ帳|Mousepad|エディタ)/i.test(t) && /(書い|入力|打っ)/.test(t)) return { supported: true, category: "editor_input" };
