@@ -3991,6 +3991,21 @@ function extractZipcode(question) {
   return null;
 }
 
+/**
+ * 郵便番号の形＋場所の文脈を含む質問かどうか（「963-8001は
+ * どこ？」「〒963-8001の住所は？」等）。この形は計算レーンから
+ * 見ると引き算（963-8001）に化けるため、ask() の計算レーン
+ * （0.75 の CalcLane と手順2の evalArithmetic）の両方で対象外
+ * にし、住所レーン（パターンA）に委ねるための判定。場所の
+ * 文脈が無いもの（「963-8001を計算して」「963-8001は？」）は
+ * false を返し、従来どおり計算で答える。
+ */
+function isZipcodePlaceQuestion(question) {
+  const q = String(question || "");
+  if (!extractZipcode(q)) return false;
+  return /はどこ|どこ[？?]|どこです|どこに|どこの|住所|郵便番号|の場所/.test(q);
+}
+
 /* 住所キーワードの対象（地名・施設名）を整える。 */
 function cleanAddressTarget(s) {
   const t = String(s || "")
@@ -4164,70 +4179,116 @@ function addressCardOf(r) {
 }
 
 /* ================================================================== */
-/* Wikipedia出典レーン（cube-server の /wiki、2026-11-20 本人決定）   */
+/* 外部サービス連携 追加5件レーン（2026-11-20 本人決定）              */
 /*                                                                    */
-/* 「〜とは？」型の定義質問に、Wikipedia の記事の冒頭を出典つきで    */
-/* そのまま提示する。記事の文章が答えそのものなので、出典は本物      */
-/* になる（裏づけてもいない記事を出典に付けることはしない）。        */
-/* 全文検索のヒット（matched:"search"）は、完全に一致する記事が      */
-/* 無かったことを明示して一段弱い表示にする。記事が取れない場合は    */
-/* Wikipedia には触れず、従来の手順（モデル＋検証ゲート）にそのまま  */
-/* 倒れる——/wiki は出典の付加装置であり、回答の必須経路にはしない。  */
-/* 知識メモ帳には保存しない（記事の文章は Cube の答えではない）。     */
+/* 地震・警報 / 最寄り駅 / 祝日 / 為替・株価 / 音楽検索。いずれも    */
+/* cube-server の実データ API（/quake /station /holiday /market     */
+/* /music）で答え、モデル生成・検証ゲートは通さない。数値が要る    */
+/* レーン（地震・為替・株価）は、発火したら必ずこのレーンで完結    */
+/* させ、取れなかった場合も正直な文面を出す（モデルの推測に        */
+/* フォールスルーしない）。結果は変わる情報なので知識メモ帳には    */
+/* 保存しない。                                                       */
+/*                                                                    */
+/* Wikipedia 定義レーンは本人の判断（索引レーンと重複）で同日に     */
+/* 撤去した。サーバー側の /wiki は残してあるが、ページからは        */
+/* 呼ばない。                                                         */
 /* ================================================================== */
 
-const WIKI_TIMEOUT_MS = 20000;
+const QUAKE_TIMEOUT_MS = 15000;
+const STATION_TIMEOUT_MS = 20000;
+const HOLIDAY_TIMEOUT_MS = 15000;
+const MARKET_TIMEOUT_MS = 15000;
+const MUSIC_TIMEOUT_MS = 15000;
 
-/* チャットの答えに出す記事冒頭の上限（文字数）。全文は出典リンク
-   先で読めるため、ここでは冒頭だけを引用する。 */
-const WIKI_PREVIEW_CHARS = 400;
-
-/**
- * 「〜とは？」型の定義質問から対象を取り出す。対象が取れなければ
- * null（Wikipedia レーンは発火せず、従来の手順に任せる）。
- * 「〜とは限らない」のような定義でない言い回しは拾わない。
- */
-function parseWikiDefinitionQuery(question) {
-  const q = String(question || "").trim();
-  if (!q || q.length > 60) return null;
-  if (/https?:\/\//.test(q)) return null;
-  const m =
-    q.match(/^(.+?)とはどういう(?:意味|もの|こと)(?:ですか|なのですか|でしょうか|？|\?|。)*$/) ||
-    q.match(/^(.+?)とは(?:何|なに|なん)(?:ですか|なのですか|でしょうか|なの|？|\?|。)*$/) ||
-    q.match(/^(.+?)とは(?:ですか|なのですか|でしょうか|？|\?|。)+$/) ||
-    q.match(/^(.+?)って(?:何|なに|なん)(?:ですか|なのですか|なの|？|\?|。)*$/);
-  if (!m) return null;
-  const subject = String(m[1] || "")
-    .trim()
-    .replace(/^[「『]/, "")
-    .replace(/[」』]$/, "")
-    .replace(/(は|が|の|って)$/, "")
-    .trim();
-  if (!subject || subject.length > 30) return null;
-  if (/[、。？！?!]/.test(subject)) return null;
-  if (/^(それ|これ|あれ|何|なに|なん|どう|なぜ|いつ|どこ|だれ|誰|ここ|そこ)/.test(subject)) {
-    return null;
+/* ISO 日時を JST の「M月D日 HH:MM」に整える（取得・発表時刻の表示用）。 */
+function jstDateTimeLabel(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso || "");
+  try {
+    const parts = new Intl.DateTimeFormat("ja-JP", {
+      timeZone: "Asia/Tokyo",
+      month: "numeric", day: "numeric",
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    }).formatToParts(d);
+    const pick = (t) => (parts.find((p) => p.type === t) || {}).value || "";
+    return `${pick("month")}月${pick("day")}日 ${pick("hour")}:${pick("minute")}`;
+  } catch {
+    return String(iso || "");
   }
-  return subject;
+}
+
+/* ---- 地震・警報レーン（cube-server の /quake） ---- */
+
+/* 気象庁の府県予報区コード（警報JSONのURLに使う）。 */
+const JMA_PREFECTURE_CODES = {
+  "北海道": "010000", "青森県": "020000", "岩手県": "030000",
+  "宮城県": "040000", "秋田県": "050000", "山形県": "060000",
+  "福島県": "070000", "茨城県": "080000", "栃木県": "090000",
+  "群馬県": "100000", "埼玉県": "110000", "千葉県": "120000",
+  "東京都": "130000", "神奈川県": "140000", "新潟県": "150000",
+  "富山県": "160000", "石川県": "170000", "福井県": "180000",
+  "山梨県": "190000", "長野県": "200000", "岐阜県": "210000",
+  "静岡県": "220000", "愛知県": "230000", "三重県": "240000",
+  "滋賀県": "250000", "京都府": "260000", "大阪府": "270000",
+  "兵庫県": "280000", "奈良県": "290000", "和歌山県": "300000",
+  "鳥取県": "310000", "島根県": "320000", "岡山県": "330000",
+  "広島県": "340000", "山口県": "350000", "徳島県": "360000",
+  "香川県": "370000", "愛媛県": "380000", "高知県": "390000",
+  "福岡県": "400000", "佐賀県": "410000", "長崎県": "420000",
+  "熊本県": "430000", "大分県": "440000", "宮崎県": "450000",
+  "鹿児島県": "460000", "沖縄県": "470000",
+};
+
+/* 文中の都道府県名（略称でも可）を取り出す。無ければ null。 */
+function extractPrefecture(text) {
+  const t = String(text || "");
+  for (const name of Object.keys(JMA_PREFECTURE_CODES)) {
+    if (t.includes(name)) return { name, code: JMA_PREFECTURE_CODES[name] };
+  }
+  for (const name of Object.keys(JMA_PREFECTURE_CODES)) {
+    const short = name.replace(/[都府県]$/, "");
+    if (short.length >= 2 && t.includes(short)) {
+      return { name, code: JMA_PREFECTURE_CODES[name] };
+    }
+  }
+  return null;
 }
 
 /**
- * /wiki に対象を投げ、検証済みの形に整えて返す。サーバーが
- * ok:false（not_found / upstream）を返した場合はそのまま返し、
- * 通信失敗・形が違う場合は null。どちらの場合も呼び出し側は
- * Wikipedia には触れず従来の手順に戻る。
+ * 地震・警報の質問かどうか。直近の地震そのもの、または警報・
+ * 注意報の有無を聞いているときだけ発火する。仕組み・原因・
+ * 対処法などの知識質問と、ニュース紹介（話題レーン）は拾わない。
  */
-async function fetchWiki(query) {
+function parseQuakeQuery(question) {
+  const q = String(question || "");
+  if (!q) return null;
+  if (/ニュース|話題|トレンド/.test(q)) return null;
+  if (/なぜ|なんで|原因|仕組み|メカニズム|とは|どうすれば|対処|避難|備え/.test(q)) {
+    return null;
+  }
+  if (/警報|注意報/.test(q) &&
+      /出てる|出ている|出ています|出てます|出た|ありますか|ある？|ある\?|発令|今|現在|今日/.test(q)) {
+    return { kind: "warning", pref: extractPrefecture(q) };
+  }
+  if (/地震|津波/.test(q) &&
+      /さっき|今の|いま|最近|今日|あった|ありました|揺れた|揺れ|大丈夫|震度|どこ|いつ|大き|心配|マグニチュード/.test(q)) {
+    return { kind: "quake" };
+  }
+  return null;
+}
+
+/* /quake に投げ、検証済みの形に整えて返す（fetchAddress と同型）。 */
+async function fetchQuake(body) {
   let res;
   try {
     res = await fetchWithTimeout(
-      `${CUBE_SERVER_BASE_URL}/wiki`,
+      `${CUBE_SERVER_BASE_URL}/quake`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify(body),
       },
-      WIKI_TIMEOUT_MS,
+      QUAKE_TIMEOUT_MS,
     );
   } catch {
     return null;
@@ -4240,32 +4301,596 @@ async function fetchWiki(query) {
       error: typeof data.error === "string" ? data.error : "",
     };
   }
-  if (
-    typeof data.title !== "string" || !data.title ||
-    typeof data.extract !== "string" || !data.extract ||
-    typeof data.url !== "string" || !data.url
-  ) {
+  if (data.kind === "quake") {
+    const items = [];
+    for (const it of Array.isArray(data.items) ? data.items : []) {
+      if (!it || typeof it.place !== "string" || !it.place ||
+          typeof it.scaleLabel !== "string" || !it.scaleLabel) continue;
+      items.push({
+        time: typeof it.time === "string" ? it.time : "",
+        scaleLabel: it.scaleLabel,
+        place: it.place,
+        magnitude: typeof it.magnitude === "number" ? it.magnitude : null,
+        depth: typeof it.depth === "number" ? it.depth : null,
+        tsunami: typeof it.tsunami === "string" ? it.tsunami : "",
+      });
+    }
+    return {
+      ok: true, kind: "quake", items,
+      fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+    };
+  }
+  if (data.kind === "warning") {
+    const warnings = [];
+    for (const w of Array.isArray(data.warnings) ? data.warnings : []) {
+      if (!w || typeof w.name !== "string" || !w.name) continue;
+      warnings.push({ name: w.name });
+    }
+    return {
+      ok: true, kind: "warning",
+      pref: typeof data.pref === "string" ? data.pref : "",
+      headline: typeof data.headline === "string" ? data.headline : "",
+      reportDatetime:
+        typeof data.reportDatetime === "string" ? data.reportDatetime : "",
+      warnings,
+      fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+    };
+  }
+  return null;
+}
+
+/* P2P の発生時刻 "2026/11/20 13:50:00" → "11月20日 13:50"。 */
+function quakeTimeLabel(time) {
+  const m = String(time || "")
+    .match(/(\d{4})\/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})/);
+  if (!m) return String(time || "");
+  return `${Number(m[2])}月${Number(m[3])}日 ${m[4]}:${m[5]}`;
+}
+
+/* 地震情報の答え文。数字はすべて API の値の転記。 */
+function quakeAnswerText(data) {
+  if (!data.items.length) {
+    return "最近の地震情報が取得できませんでした。";
+  }
+  return data.items.slice(0, 3).map((it) => {
+    let s = `${quakeTimeLabel(it.time)}ごろ、${it.place}で最大震度${it.scaleLabel}の地震がありました`;
+    const sub = [];
+    if (it.magnitude !== null) sub.push(`マグニチュード${it.magnitude}`);
+    if (it.depth !== null) sub.push(`深さ約${it.depth}km`);
+    if (sub.length) s += `（${sub.join("、")}）`;
+    s += "。";
+    if (it.tsunami === "None") s += "津波の心配はありません。";
+    else if (it.tsunami === "Watch") s += "津波注意報が出ています。";
+    else if (it.tsunami === "Warning") s += "津波警報が出ています。";
+    else if (it.tsunami === "NonEffective") {
+      s += "若干の海面変動があるかもしれませんが、被害の心配はありません。";
+    }
+    return s;
+  }).join("\n");
+}
+
+/* 警報・注意報の答え文。出ている種別は API の集計だけを使う。 */
+function warningAnswerText(data) {
+  const when = data.reportDatetime
+    ? `（${jstDateTimeLabel(data.reportDatetime)}発表）` : "";
+  if (!data.warnings.length) {
+    return `${data.pref}では、現在発表されている警報・注意報はありません${when}。`;
+  }
+  const names = [...new Set(data.warnings.map((w) => w.name))];
+  let s = `${data.pref}では現在、${names.join("・")}が出ている地域があります${when}。`;
+  if (data.headline) s += `\n${data.headline}`;
+  return s;
+}
+
+/* ---- 最寄り駅レーン（住所レーンの座標 → cube-server の /station） ---- */
+
+/**
+ * 「〜の最寄り駅は？」形の質問から対象を取り出す。行き方・
+ * ルートの質問と、「近くの〜」のような対象の無い言い方は
+ * 拾わない（場所レーンの担当）。
+ */
+function parseStationQuery(question) {
+  const q = String(question || "");
+  if (!q) return null;
+  if (/行き方|どうやって行く|ルート|経路|乗り換え|作り方|とは/.test(q)) {
     return null;
   }
+  const finish = (raw) => {
+    const t = cleanAddressTarget(raw);
+    if (!t || t.length > 40) return null;
+    if (/[、。？！?!]/.test(t)) return null;
+    if (/^(近く|近所|周辺|ここ|そこ|それ|これ|何|なに)/.test(t)) return null;
+    return { target: t };
+  };
+  let m = q.match(/^(.+?)の最寄り?駅(?:は|を|って|が|に)?/);
+  if (m) return finish(m[1]);
+  m = q.match(/^(.+?)から(?:一番|いちばん)?近い駅/);
+  if (m) return finish(m[1]);
+  return null;
+}
+
+/* /station に座標を投げ、検証済みの形に整えて返す。 */
+async function fetchStation(lat, lng) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/station`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lat, lng }),
+      },
+      STATION_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  const results = [];
+  for (const r of Array.isArray(data.results) ? data.results : []) {
+    if (!r || typeof r.name !== "string" || !r.name) continue;
+    results.push({
+      name: r.name,
+      line: typeof r.line === "string" ? r.line : "",
+      prefecture: typeof r.prefecture === "string" ? r.prefecture : "",
+      distance: typeof r.distance === "string" ? r.distance : "",
+    });
+  }
+  if (!results.length) return null;
+  return { ok: true, results };
+}
+
+/* 最寄り駅の答え文（一番近い駅を本文、残りはカード）。 */
+function stationAnswerText(target, data) {
+  const r = data.results[0];
+  let s = `「${target}」の最寄り駅は、${r.name}駅`;
+  if (r.line) s += `（${r.line}）`;
+  if (r.distance) s += `で、約${r.distance}のところにあります。`;
+  else s += "です。";
+  if (data.results.length > 1) {
+    s += `ほかの近い駅はカードに表示しています。`;
+  }
+  return s;
+}
+
+/* 駅1件を表示用カードにする（タイトルが地図へのリンク）。 */
+function stationCardOf(r) {
   return {
-    ok: true,
-    matched: data.matched === "search" ? "search" : "exact",
-    title: data.title,
-    extract: data.extract,
-    truncated: !!data.truncated,
-    url: httpUrlOrEmpty(data.url),
+    kind: "station",
+    name: r.name,
+    line: r.line,
+    distance: r.distance,
+    prefecture: r.prefecture,
+    link: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${r.name}駅`)}`,
   };
 }
 
-/* 記事の冒頭をチャット表示用に切り取る。文の途中で切れる場合は
-   近くの「。」まで戻す。戻り値 {text, cut}。 */
-function wikiExtractPreview(extract) {
-  const text = String(extract || "").trim();
-  if (text.length <= WIKI_PREVIEW_CHARS) return { text, cut: false };
-  let cut = text.slice(0, WIKI_PREVIEW_CHARS);
-  const lastPeriod = cut.lastIndexOf("。");
-  if (lastPeriod >= 120) cut = cut.slice(0, lastPeriod + 1);
-  return { text: cut, cut: true };
+/* ---- 祝日レーン（cube-server の /holiday） ---- */
+
+/**
+ * 祝日の質問かどうか。今日・明日・明後日・次の祝日・日付指定・
+ * 一覧の形だけを拾い、店の営業質問や意味の質問は拾わない。
+ */
+function parseHolidayQuery(question) {
+  const q = String(question || "");
+  if (!q || !/祝日/.test(q)) return null;
+  if (/営業|とは|意味/.test(q)) return null;
+  if ((/一覧|全部|今年の祝日/.test(q)) && !/次の|今日|明日/.test(q)) {
+    return { kind: "list" };
+  }
+  const m = q.match(/(\d{1,2})月(\d{1,2})日/);
+  if (m) {
+    const month = Number(m[1]), day = Number(m[2]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return { kind: "date", month, day };
+    }
+  }
+  if (/明後日/.test(q)) return { kind: "offset", days: 2 };
+  if (/明日/.test(q)) return { kind: "offset", days: 1 };
+  if (/昨日/.test(q)) return { kind: "offset", days: -1 };
+  if (/次の|今度|直近/.test(q)) return { kind: "next" };
+  if (/今日|本日/.test(q)) return { kind: "offset", days: 0 };
+  if (/(?:は|が|って)いつ|いつ[？?ですか]/.test(q)) {
+    return { kind: "next" };
+  }
+  return null;
+}
+
+/* /holiday から祝日表（"YYYY-MM-DD" → 名前）を取得する。 */
+async function fetchHoliday() {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/holiday`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      },
+      HOLIDAY_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  if (!data.holidays || typeof data.holidays !== "object") return null;
+  const holidays = {};
+  for (const [k, v] of Object.entries(data.holidays)) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(k) && typeof v === "string" && v) {
+      holidays[k] = v;
+    }
+  }
+  if (!Object.keys(holidays).length) return null;
+  return { ok: true, holidays };
+}
+
+function jstDatePlus(days) {
+  return new Date(Date.now() + days * 86400000);
+}
+
+/* 祝日の答え文。判定はすべて祝日表（API の値）に対して行う。 */
+function holidayAnswerText(parsed, holidays) {
+  if (parsed.kind === "offset") {
+    const key = pointsJstDateKey(jstDatePlus(parsed.days));
+    const [, mo, d] = key.split("-");
+    const label = parsed.days === 0 ? "今日"
+      : parsed.days === 1 ? "明日"
+      : parsed.days === 2 ? "明後日" : "昨日";
+    const dateLabel = `${Number(mo)}月${Number(d)}日`;
+    const name = holidays[key];
+    return name
+      ? `${label}（${dateLabel}）は、${name}で祝日です。`
+      : `${label}（${dateLabel}）は祝日ではありません。`;
+  }
+  if (parsed.kind === "date") {
+    const y = Number(pointsJstDateKey().slice(0, 4));
+    const key = `${y}-${String(parsed.month).padStart(2, "0")}-` +
+      String(parsed.day).padStart(2, "0");
+    const name = holidays[key];
+    return name
+      ? `${y}年${parsed.month}月${parsed.day}日は、${name}で祝日です。`
+      : `${y}年${parsed.month}月${parsed.day}日は祝日ではありません。`;
+  }
+  if (parsed.kind === "next") {
+    for (let i = 0; i <= 370; i++) {
+      const key = pointsJstDateKey(jstDatePlus(i));
+      if (holidays[key]) {
+        const [, mo, d] = key.split("-");
+        const when = i === 0 ? "今日"
+          : i === 1 ? "明日" : `${Number(mo)}月${Number(d)}日`;
+        return `次の祝日は${when}、${holidays[key]}です（${key.replace(/-/g, "/")}）。`;
+      }
+    }
+    return "次の祝日は見つかりませんでした。";
+  }
+  const y = pointsJstDateKey().slice(0, 4);
+  const keys = Object.keys(holidays)
+    .filter((k) => k.startsWith(`${y}-`)).sort();
+  if (!keys.length) return "今年の祝日データが取得できませんでした。";
+  return `${y}年の祝日です。\n` + keys.map((k) => {
+    const [, mo, d] = k.split("-");
+    return `・${Number(mo)}月${Number(d)}日：${holidays[k]}`;
+  }).join("\n");
+}
+
+/* ---- 為替・株価レーン（cube-server の /market） ---- */
+
+/* 通貨の日本語名 → ISOコード（円への換算・ペア判定に使う）。 */
+const FX_CURRENCY_NAMES = {
+  "香港ドル": "HKD", "シンガポールドル": "SGD",
+  "オーストラリアドル": "AUD", "ニュージーランドドル": "NZD",
+  "カナダドル": "CAD", "スイスフラン": "CHF",
+  "南アフリカランド": "ZAR", "インドルピー": "INR",
+  "ブラジルレアル": "BRL", "メキシコペソ": "MXN",
+  "トルコリラ": "TRY", "人民元": "CNY", "豪ドル": "AUD",
+  "NZドル": "NZD", "ドル": "USD", "ユーロ": "EUR",
+  "ポンド": "GBP", "ウォン": "KRW", "元": "CNY",
+  "フラン": "CHF", "ランド": "ZAR", "バーツ": "THB",
+  "ルピー": "INR", "ペソ": "MXN", "リラ": "TRY", "レアル": "BRL",
+};
+
+/* 「〜円」のペア名 → 円に対する通貨コード。 */
+const FX_PAIR_NAMES = [
+  ["ドル円", "USD"], ["ユーロ円", "EUR"], ["ポンド円", "GBP"],
+  ["豪ドル円", "AUD"], ["オーストラリアドル円", "AUD"],
+  ["カナダドル円", "CAD"], ["スイスフラン円", "CHF"],
+  ["人民元円", "CNY"], ["ウォン円", "KRW"], ["NZドル円", "NZD"],
+  ["ニュージーランドドル円", "NZD"], ["香港ドル円", "HKD"],
+];
+
+/* 会社名・銘柄名 → 証券コード（Yahoo Finance のシンボル）。 */
+const STOCK_NAME_CODES = {
+  "トヨタ自動車": "7203.T", "トヨタ": "7203.T",
+  "ソニーグループ": "6758.T", "ソニー": "6758.T",
+  "任天堂": "7974.T", "本田技研": "7267.T", "ホンダ": "7267.T",
+  "日産自動車": "7201.T", "日産": "7201.T",
+  "パナソニック": "6752.T", "キーエンス": "6861.T",
+  "ソフトバンクグループ": "9984.T", "ソフトバンク": "9984.T",
+  "三菱UFJ": "8306.T", "三菱ＵＦＪ": "8306.T",
+  "ファーストリテイリング": "9983.T", "ユニクロ": "9983.T",
+  "セブン&アイ": "3382.T", "セブン＆アイ": "3382.T",
+  "イオン": "8267.T", "楽天グループ": "4755.T", "楽天": "4755.T",
+  "メルカリ": "4385.T", "NTT": "9432.T", "KDDI": "9433.T",
+  "JR東日本": "9020.T", "ANA": "9202.T", "JAL": "9201.T",
+  "東京電力": "9501.T", "関西電力": "9503.T",
+  "武田薬品": "4502.T", "日本郵船": "9101.T",
+  "アップル": "AAPL", "Apple": "AAPL",
+  "マイクロソフト": "MSFT", "Microsoft": "MSFT",
+  "エヌビディア": "NVDA", "NVIDIA": "NVDA",
+  "テスラ": "TSLA", "Tesla": "TSLA",
+  "アマゾン": "AMZN", "Amazon": "AMZN",
+  "グーグル": "GOOGL", "Google": "GOOGL", "アルファベット": "GOOGL",
+  "メタ": "META", "Meta": "META",
+  "ネットフリックス": "NFLX", "Netflix": "NFLX",
+  "ディズニー": "DIS", "Disney": "DIS",
+  "コカ・コーラ": "KO", "コカコーラ": "KO",
+  "マクドナルド": "MCD", "スターバックス": "SBUX", "ナイキ": "NKE",
+};
+
+/**
+ * 為替・株価の質問かどうか。ペア名・換算（「100ドルは何円？」）・
+ * 株価（会社名辞書・証券コード）の形だけを拾う。仕組みや理由を
+ * 聞く質問は拾わない。会社名が辞書に無く対象だけ分かる場合は
+ * stock_unknown を返し、レーン側で正直に完結させる（モデルの
+ * 推測価格を出させないため）。
+ */
+function parseMarketQuery(question) {
+  const q = String(question || "");
+  if (!q) return null;
+  if (/とは|仕組み|買い方|売り方|始め方|なぜ|なんで|理由|要因|ニュース|話題/.test(q)) {
+    return null;
+  }
+  let m = q.match(/([\d,]+(?:\.\d+)?)\s*(香港ドル|シンガポールドル|オーストラリアドル|ニュージーランドドル|カナダドル|スイスフラン|南アフリカランド|インドルピー|ブラジルレアル|メキシコペソ|トルコリラ|人民元|豪ドル|NZドル|ドル|ユーロ|ポンド|ウォン|元|フラン|ランド|バーツ|ルピー|ペソ|リラ|レアル)は(?:今)?(?:何円|いくら)/);
+  if (m) {
+    const code = FX_CURRENCY_NAMES[m[2]];
+    if (code && code !== "JPY") {
+      return {
+        kind: "fxconvert",
+        amount: Number(m[1].replace(/,/g, "")),
+        from: code,
+        fromName: m[2],
+      };
+    }
+  }
+  if (/いくら|レート|何円|今|教えて|ですか|は？|は\?/.test(q)) {
+    for (const [name, code] of FX_PAIR_NAMES) {
+      if (q.includes(name)) {
+        return { kind: "fx", base: code, quote: "JPY", pairName: name };
+      }
+    }
+    const names = Object.keys(FX_CURRENCY_NAMES)
+      .sort((a, b) => b.length - a.length);
+    for (const name of names) {
+      if (q.includes(name)) {
+        const code = FX_CURRENCY_NAMES[name];
+        return { kind: "fx", base: code, quote: "JPY", pairName: `${name}円` };
+      }
+    }
+  }
+  if (/株価/.test(q)) {
+    const names = Object.keys(STOCK_NAME_CODES)
+      .sort((a, b) => b.length - a.length);
+    for (const name of names) {
+      if (q.includes(name)) {
+        return { kind: "stock", symbol: STOCK_NAME_CODES[name], name };
+      }
+    }
+    m = q.match(/(\d{4})(?:\.T)?の株価/);
+    if (m) {
+      return { kind: "stock", symbol: `${m[1]}.T`, name: `証券コード${m[1]}` };
+    }
+    m = q.match(/([A-Z]{2,5})の株価/);
+    if (m) return { kind: "stock", symbol: m[1], name: m[1] };
+    m = q.match(/^(.+?)の株価/);
+    if (m) {
+      const t = m[1].trim();
+      if (t.length >= 2 && t.length <= 20 &&
+          !/^(今日|今|全体|日本|アメリカ|米国|最近)/.test(t)) {
+        return { kind: "stock_unknown", name: t };
+      }
+    }
+  }
+  return null;
+}
+
+/* /market に投げ、検証済みの形に整えて返す。 */
+async function fetchMarket(body) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/market`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      MARKET_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  if (data.kind === "fx") {
+    if (typeof data.rate !== "number" || !Number.isFinite(data.rate)) {
+      return null;
+    }
+    return {
+      ok: true, kind: "fx",
+      base: typeof data.base === "string" ? data.base : "",
+      quote: typeof data.quote === "string" ? data.quote : "",
+      rate: data.rate,
+      date: typeof data.date === "string" ? data.date : "",
+      fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+    };
+  }
+  if (data.kind === "stock") {
+    if (typeof data.price !== "number" || !Number.isFinite(data.price)) {
+      return null;
+    }
+    return {
+      ok: true, kind: "stock",
+      symbol: typeof data.symbol === "string" ? data.symbol : "",
+      name: typeof data.name === "string" ? data.name : "",
+      price: data.price,
+      prevClose: typeof data.prevClose === "number" ? data.prevClose : null,
+      change: typeof data.change === "number" ? data.change : null,
+      changePct: typeof data.changePct === "number" ? data.changePct : null,
+      currency: typeof data.currency === "string" ? data.currency : "",
+      marketTime: typeof data.marketTime === "string" ? data.marketTime : "",
+      fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+    };
+  }
+  return null;
+}
+
+/* レートの表示（小数3桁まで、末尾の0は落とす）。 */
+function rateText(rate) {
+  if (typeof rate !== "number" || !Number.isFinite(rate)) return "";
+  return String(Number(rate.toFixed(3)));
+}
+
+/* Frankfurter の基準日 "2026-11-19" → "2026年11月19日"。 */
+function fxDateLabel(date) {
+  const m = String(date || "").match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return String(date || "");
+  return `${Number(m[1])}年${Number(m[2])}月${Number(m[3])}日`;
+}
+
+/* 為替の答え文。1単位で小さすぎるレートは100単位で出す。 */
+function marketFxText(data, pairName) {
+  const when = data.date ? `（${fxDateLabel(data.date)}時点）` : "";
+  if (data.rate < 1) {
+    return `${pairName}は、100${data.base}＝${rateText(data.rate * 100)}円です${when}。`;
+  }
+  return `${pairName}は、1${data.base}＝${rateText(data.rate)}円です${when}。`;
+}
+
+/* 株価の答え文。価格・前日比はすべて API の値の転記。 */
+function marketStockText(data, displayName) {
+  const name = displayName || data.name || data.symbol;
+  const price = data.price
+    .toLocaleString("ja-JP", { maximumFractionDigits: 2 });
+  const unit = data.currency === "JPY" ? "円" : ` ${data.currency}`;
+  let s = `${name}（${data.symbol}）の株価は、${price}${unit}です。`;
+  if (data.change !== null && data.changePct !== null) {
+    const sign = data.change > 0 ? "+" : "";
+    const chg = data.change
+      .toLocaleString("ja-JP", { maximumFractionDigits: 2 });
+    s += `前日比は${sign}${chg}（${sign}${data.changePct.toFixed(2)}%）です。`;
+  }
+  if (data.marketTime) s += `（${jstDateTimeLabel(data.marketTime)}時点）`;
+  return s;
+}
+
+/* ---- 音楽検索レーン（cube-server の /music） ---- */
+
+/**
+ * 曲の検索・試聴の質問かどうか。アーティスト名＋「の曲を
+ * 検索／教えて／聴きたい」等の形だけを拾う。歌詞の質問は
+ * 拾わない（歌詞そのものは出さない）。
+ */
+function parseMusicQuery(question) {
+  const q = String(question || "");
+  if (!q) return null;
+  if (/歌詞|作り方|作曲|とは|意味|行き方/.test(q)) return null;
+  const finish = (raw) => {
+    const t = String(raw || "")
+      .trim()
+      .replace(/^[「『]/, "")
+      .replace(/[」』]$/, "")
+      .replace(/(の|は|が|って)$/, "")
+      .trim();
+    if (!t || t.length > 40) return null;
+    if (/^(それ|これ|何|なに)/.test(t)) return null;
+    return { query: t };
+  };
+  let m = q.match(/^(.+?)の(?:曲|歌|楽曲)を(?:検索|探して|探す|教えて|知りたい|聴きたい|聞きたい|聞かせて)/);
+  if (m) return finish(m[1]);
+  m = q.match(/^(.+?)の(?:曲|歌|楽曲)(?:を|は|って)?(?:試聴|検索)/);
+  if (m) return finish(m[1]);
+  m = q.match(/^(.+?)の(?:曲|歌|楽曲)(?:は|って)\s*[？?]\s*$/);
+  if (m) return finish(m[1]);
+  m = q.match(/^(.+?)を試聴(?:したい|させて|できますか|できる)?/);
+  if (m) return finish(m[1]);
+  m = q.match(/^(.+?)の試聴(?:を|は|したい|させて)?/);
+  if (m) return finish(m[1]);
+  return null;
+}
+
+/* /music に投げ、検証済みの形に整えて返す。 */
+async function fetchMusic(query) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/music`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      },
+      MUSIC_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  const results = [];
+  for (const r of Array.isArray(data.results) ? data.results : []) {
+    if (!r || typeof r.track !== "string" || !r.track ||
+        typeof r.artist !== "string" || !r.artist) continue;
+    results.push({
+      track: r.track,
+      artist: r.artist,
+      album: typeof r.album === "string" ? r.album : "",
+      trackUrl: httpUrlOrEmpty(typeof r.trackUrl === "string" ? r.trackUrl : ""),
+      previewUrl:
+        httpUrlOrEmpty(typeof r.previewUrl === "string" ? r.previewUrl : ""),
+      artwork: httpUrlOrEmpty(typeof r.artwork === "string" ? r.artwork : ""),
+    });
+  }
+  if (!results.length) return null;
+  return { ok: true, results };
+}
+
+/* 曲1件を表示用カードにする。 */
+function musicCardOf(r) {
+  return {
+    kind: "music",
+    track: r.track,
+    artist: r.artist,
+    album: r.album,
+    link: r.trackUrl,
+    preview: r.previewUrl,
+    artwork: r.artwork,
+  };
 }
 
 /**
@@ -11264,6 +11889,26 @@ const BADGES = {
     label: "Wikipediaの記事から（出典つき）",
     className: "badge-wiki",
   },
+  quake: {
+    label: "地震・警報の情報（P2P地震情報・気象庁）",
+    className: "badge-quake",
+  },
+  station: {
+    label: "最寄り駅の検索結果（HeartRails）",
+    className: "badge-station",
+  },
+  holiday: {
+    label: "祝日の情報（holidays-jp）",
+    className: "badge-holiday",
+  },
+  market: {
+    label: "為替・株価の情報（Frankfurter・Yahoo Finance）",
+    className: "badge-market",
+  },
+  music: {
+    label: "音楽の検索結果（iTunes）",
+    className: "badge-music",
+  },
   model: {
     label: "Cubeの答え（ネットで確認済み）",
     className: "badge-model",
@@ -12208,6 +12853,200 @@ const App = {
     return true;
   },
 
+  /* ---- 地震・警報レーンの実行と表示 ----
+     発火したらこのレーンで完結させる（true）。サーバーに届か
+     なかった場合だけ false を返し、従来の手順に倒れる。警報で
+     都道府県が質問に無い場合は、天気の既定地から補う。 */
+  async runQuakeLane(parsed) {
+    this.setPhase("searching");
+    let data;
+    if (parsed.kind === "warning") {
+      const pref = parsed.pref || extractPrefecture(this.weatherPlace);
+      if (!pref) {
+        this.setPhase("idle");
+        return false;
+      }
+      data = await fetchQuake({ prefCode: pref.code, prefName: pref.name });
+    } else {
+      data = await fetchQuake({});
+    }
+    this.setPhase("idle");
+    if (!data) return false;
+    if (!data.ok) {
+      this.pushAssistant({
+        text: parsed.kind === "warning"
+          ? "警報・注意報を取得できませんでした。"
+          : "地震情報を取得できませんでした。",
+        badge: "quake",
+        note: "時間をおいてもう一度試してください。分からない情報を推測で出すことはしません。",
+      });
+      return true;
+    }
+    this.pushAssistant({
+      text: data.kind === "warning"
+        ? warningAnswerText(data) : quakeAnswerText(data),
+      badge: "quake",
+      note: data.kind === "warning"
+        ? "出典：気象庁（警報・注意報）。詳しい地域は気象庁の警報・注意報ページで確認してください。"
+        : "出典：P2P地震情報（気象庁の発表をもとにした情報）。",
+    });
+    return true;
+  },
+
+  /* ---- 最寄り駅レーンの実行と表示 ----
+     対象を住所レーンの geocode で座標にし、/station で一番近い
+     駅を引く。対象が見つからない場合は正直に完結させ、サーバー
+     に届かない場合だけ false で従来の手順に倒れる。 */
+  async runStationLane(parsed) {
+    this.setPhase("searching");
+    const geo = await fetchAddress({ query: parsed.target });
+    if (!geo) {
+      this.setPhase("idle");
+      return false;
+    }
+    if (!geo.ok) {
+      this.setPhase("idle");
+      if (geo.error === "not_found") {
+        this.pushAssistant({
+          text: `「${parsed.target}」の場所が見つからなかったため、最寄り駅を調べられませんでした。`,
+          badge: "station",
+          note: "地名や施設名を変えて（例：都道府県名から書く）もう一度聞いてください。分からない場所を推測で出すことはしません。",
+        });
+        return true;
+      }
+      return false;
+    }
+    const top = geo.results[0];
+    const data = await fetchStation(top.lat, top.lng);
+    this.setPhase("idle");
+    if (!data) return false;
+    if (!data.ok) {
+      this.pushAssistant({
+        text: `「${parsed.target}」の最寄り駅を取得できませんでした。`,
+        badge: "station",
+        note: "時間をおいてもう一度試してください。",
+      });
+      return true;
+    }
+    this.pushAssistant({
+      text: stationAnswerText(parsed.target, data),
+      badge: "station",
+      cards: data.results.map(stationCardOf),
+      note: "出典：HeartRails Express（駅情報）。距離は目安です。",
+    });
+    return true;
+  },
+
+  /* ---- 祝日レーンの実行と表示 ---- */
+  async runHolidayLane(parsed) {
+    this.setPhase("searching");
+    const data = await fetchHoliday();
+    this.setPhase("idle");
+    if (!data) return false;
+    if (!data.ok) {
+      this.pushAssistant({
+        text: "祝日の情報を取得できませんでした。",
+        badge: "holiday",
+        note: "時間をおいてもう一度試してください。",
+      });
+      return true;
+    }
+    this.pushAssistant({
+      text: holidayAnswerText(parsed, data.holidays),
+      badge: "holiday",
+      note: "出典：holidays-jp（内閣府の「国民の祝日」データ）。",
+    });
+    return true;
+  },
+
+  /* ---- 為替・株価レーンの実行と表示 ----
+     数値が要る質問なので、発火したら必ずこのレーンで完結
+     させる。取れなかった場合も正直な文面を出し、モデルの
+     推測価格には倒さない。 */
+  async runMarketLane(parsed) {
+    if (parsed.kind === "stock_unknown") {
+      this.pushAssistant({
+        text: `「${parsed.name}」の証券コードが対応表に無いため、株価を調べられませんでした。`,
+        badge: "market",
+        note: "証券コード（4桁の数字）が分かれば、「7203の株価は？」のように聞いてください。分からない株価を推測で出すことはしません。",
+      });
+      return;
+    }
+    this.setPhase("searching");
+    let data = null;
+    if (parsed.kind === "fx") {
+      data = await fetchMarket({ fx: `${parsed.base}${parsed.quote}` });
+    } else if (parsed.kind === "fxconvert") {
+      data = await fetchMarket({ fx: `${parsed.from}JPY` });
+    } else {
+      data = await fetchMarket({ symbol: parsed.symbol });
+    }
+    this.setPhase("idle");
+    if (!data || !data.ok) {
+      this.pushAssistant({
+        text: "為替・株価の情報を取得できませんでした。",
+        badge: "market",
+        note: "時間をおいてもう一度試してください。分からない価格を推測で出すことはしません。",
+      });
+      return;
+    }
+    if (parsed.kind === "fxconvert") {
+      const result = parsed.amount * data.rate;
+      const rounded = result >= 100
+        ? Math.round(result) : Math.round(result * 100) / 100;
+      this.pushAssistant({
+        text: `${parsed.amount.toLocaleString("ja-JP")}${parsed.fromName}は、約${rounded.toLocaleString("ja-JP")}円です（1${parsed.from}＝${rateText(data.rate)}円、${fxDateLabel(data.date)}時点のレートで計算しました）。`,
+        badge: "market",
+        note: "出典：Frankfurter（欧州中央銀行の参考レート）。実際の両替レートとは異なります。",
+      });
+      return;
+    }
+    if (data.kind === "fx") {
+      this.pushAssistant({
+        text: marketFxText(data, parsed.pairName),
+        badge: "market",
+        note: "出典：Frankfurter（欧州中央銀行の参考レート）。",
+      });
+      return;
+    }
+    this.pushAssistant({
+      text: marketStockText(data, parsed.name),
+      badge: "market",
+      note: "出典：Yahoo Finance。株価は遅れて表示される場合があります。",
+    });
+  },
+
+  /* ---- 音楽検索レーンの実行と表示 ---- */
+  async runMusicLane(parsed) {
+    this.setPhase("searching");
+    const data = await fetchMusic(parsed.query);
+    this.setPhase("idle");
+    if (!data) return false;
+    if (!data.ok) {
+      if (data.error === "not_found") {
+        this.pushAssistant({
+          text: `「${parsed.query}」の曲は見つかりませんでした。`,
+          badge: "music",
+          note: "アーティスト名や曲名を変えてもう一度聞いてください。",
+        });
+      } else {
+        this.pushAssistant({
+          text: "音楽情報を取得できませんでした。",
+          badge: "music",
+          note: "時間をおいてもう一度試してください。",
+        });
+      }
+      return true;
+    }
+    this.pushAssistant({
+      text: `「${parsed.query}」の曲を${data.results.length}件見つけました。`,
+      badge: "music",
+      cards: data.results.map(musicCardOf),
+      note: "出典：iTunes。カードの「試聴する」から一部を聴けます。",
+    });
+    return true;
+  },
+
   /* ---- PC操作レーンの実行と表示 ----
      進行中は履歴に残らない仮メッセージでステップを見せ、完了後に
      最終結果を通常の回答として出す（履歴に残るのは結果だけ）。
@@ -12500,6 +13339,10 @@ const App = {
       }
       else if (card.kind === "topic") {
         wrap.appendChild(this.buildTopicCard(card));
+      } else if (card.kind === "station") {
+        wrap.appendChild(this.buildStationCard(card));
+      } else if (card.kind === "music") {
+        wrap.appendChild(this.buildMusicCard(card));
       } else if (card.kind === "shop") {
         wrap.appendChild(this.buildShopCard(card));
       } else if (card.kind === "suggest") {
@@ -12576,6 +13419,84 @@ const App = {
     m.className = "lane-card-meta";
     m.textContent = `緯度 ${card.lat} / 経度 ${card.lng}`;
     div.appendChild(m);
+    return div;
+  },
+
+  /* 最寄り駅カード。駅名・路線・距離は API の値の転記だけ。 */
+  buildStationCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    if (card.link) {
+      const a = document.createElement("a");
+      a.href = card.link;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = `${card.name}駅（地図で開く）`;
+      title.appendChild(a);
+    } else {
+      title.textContent = `${card.name}駅`;
+    }
+    div.appendChild(title);
+    const meta = [];
+    if (card.line) meta.push(card.line);
+    if (card.distance) meta.push(`約${card.distance}`);
+    if (card.prefecture) meta.push(card.prefecture);
+    if (meta.length) {
+      const m = document.createElement("p");
+      m.className = "lane-card-meta";
+      m.textContent = meta.join("　");
+      div.appendChild(m);
+    }
+    return div;
+  },
+
+  /* 音楽カード。曲名が Apple Music へのリンク、試聴リンクつき。 */
+  buildMusicCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    if (card.link) {
+      const a = document.createElement("a");
+      a.href = card.link;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = card.track;
+      title.appendChild(a);
+    } else {
+      title.textContent = card.track;
+    }
+    div.appendChild(title);
+    const meta = [];
+    if (card.artist) meta.push(card.artist);
+    if (card.album) meta.push(card.album);
+    if (meta.length) {
+      const m = document.createElement("p");
+      m.className = "lane-card-meta";
+      m.textContent = meta.join(" / ");
+      div.appendChild(m);
+    }
+    if (card.preview) {
+      const p = document.createElement("p");
+      p.className = "lane-card-meta";
+      const a = document.createElement("a");
+      a.href = card.preview;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = "試聴する";
+      p.appendChild(a);
+      div.appendChild(p);
+    }
+    if (card.artwork) {
+      const img = document.createElement("img");
+      img.className = "lane-card-img";
+      img.src = card.artwork;
+      img.alt = "";
+      img.loading = "lazy";
+      div.appendChild(img);
+    }
     return div;
   },
 
@@ -13957,10 +14878,17 @@ const App = {
       return;
     }
 
+    // 郵便番号＋場所の文脈の質問（「963-8001はどこ？」）は、計算
+    // の形（963-8001＝引き算）に化けるため、計算レーン（0.75 と
+    // 手順2）の両方で対象外にし、2.25 の住所レーンに委ねる。
+    // 場所の文脈が無い純粋な計算は従来どおり計算で答える
+    // （2026-11-20 実機バグ報告への対応）。
+    const zipPlaceQ = isZipcodePlaceQuestion(question);
+
     // 0.75) 計算レーン：文章題を含む計算のパターンに一致したら、
     // モデル・メモ帳を素通りして、正確な計算結果（過程つき）を
     // そのまま答える。結果は従来の計算経路と同じ形でメモ帳に残す。
-    const lane = CalcLane.solve(question);
+    const lane = zipPlaceQ ? null : CalcLane.solve(question);
     if (lane) {
       this.pushAssistant({
         text: lane.steps,
@@ -14049,7 +14977,7 @@ const App = {
     // が計算結果と食い違う時だけ、従来と同じ modelSaid＋注記を後追い
     // の返答として出す。裏の生成が失敗しても、表示済みの答え（生成
     // には依存していない）には影響させない。
-    const calc = evalArithmetic(question);
+    const calc = zipPlaceQ ? null : evalArithmetic(question);
     if (calc !== null) {
       this.setPhase("idle");
       this.pushAssistant({
@@ -14128,6 +15056,16 @@ const App = {
       return;
     }
 
+    // 地震・警報：直近の実データで答える。安全に関わる数値情報
+    // なので、発火したらこのレーンで完結させ、取れない場合も
+    // 正直な文面を出す。サーバーに届かない場合だけ従来の手順に
+    // 倒れる。
+    const quakeParsed = parseQuakeQuery(question);
+    if (quakeParsed) {
+      const handled = await this.runQuakeLane(quakeParsed);
+      if (handled) return;
+    }
+
     // 話題：定型の聞き方に一致したときだけ。
     if (detectTopicsQuery(question)) {
       this.setPhase("searching");
@@ -14162,6 +15100,15 @@ const App = {
     const addrParsed = parseAddressQuery(question);
     if (addrParsed) {
       const handled = await this.runAddressQueryLane(addrParsed);
+      if (handled) return;
+    }
+
+    // 最寄り駅：対象の座標（住所レーンの geocode）から一番近い
+    // 駅を引く。場所レーンの直前に置き、「〜の最寄り駅」を
+    // 場所探しと取り違えない。サーバーに届かない場合だけ倒れる。
+    const stationParsed = parseStationQuery(question);
+    if (stationParsed) {
+      const handled = await this.runStationLane(stationParsed);
       if (handled) return;
     }
 
@@ -14257,41 +15204,29 @@ const App = {
       // 失敗時は何も出さず従来経路へ（従来の棄権表示に落ちる）。
     }
 
-    // Wikipedia出典：「〜とは？」型の定義質問は、Wikipedia の
-    // 記事の冒頭を出典つきでそのまま提示する。検索ヒット
-    // （matched:"search"）は、完全に一致する記事が無かった
-    // ことを明示して一段弱い表示にする。記事が取れない場合は
-    // Wikipedia には触れず、従来の手順にそのまま倒れる。
-    const wikiSubject = parseWikiDefinitionQuery(question);
-    if (wikiSubject) {
-      this.setPhase("searching");
-      const wikiData = await fetchWiki(wikiSubject);
-      this.setPhase("idle");
-      if (wikiData && wikiData.ok) {
-        const preview = wikiExtractPreview(wikiData.extract);
-        const tail = preview.cut || wikiData.truncated
-          ? "続きは出典リンク先で読めます。"
-          : "";
-        if (wikiData.matched === "search") {
-          this.pushAssistant({
-            text: `『${wikiData.title}』\n${preview.text}`,
-            badge: "wiki",
-            sourceTitle: `Wikipedia『${wikiData.title}』`,
-            sourceUrl: wikiData.url,
-            note: `「${wikiSubject}」と完全に一致する記事は見つからなかったため、Wikipediaの検索で見つかった記事の冒頭を表示しています。別の対象の記事の可能性もあるため、出典リンクで確認してください。${tail}`,
-          });
-        } else {
-          this.pushAssistant({
-            text: preview.text,
-            badge: "wiki",
-            sourceTitle: `Wikipedia『${wikiData.title}』`,
-            sourceUrl: wikiData.url,
-            note: `Wikipediaの記事『${wikiData.title}』の冒頭を、出典としてそのまま表示しています。${tail}`,
-          });
-        }
-        return;
-      }
-      // 取れなかった場合は何も出さず従来経路へ。
+    // 祝日：holidays-jp の実データで答える（今日・明日・次の
+    // 祝日・日付指定・一覧）。サーバーに届かない場合だけ倒れる。
+    const holidayParsed = parseHolidayQuery(question);
+    if (holidayParsed) {
+      const handled = await this.runHolidayLane(holidayParsed);
+      if (handled) return;
+    }
+
+    // 為替・株価：数値が要る質問なので、発火したら必ずこの
+    // レーンで完結させる（取れなかった場合も正直な文面を出し、
+    // モデルの推測価格には倒さない）。
+    const marketParsed = parseMarketQuery(question);
+    if (marketParsed) {
+      await this.runMarketLane(marketParsed);
+      return;
+    }
+
+    // 音楽検索：iTunes の実データで答える。サーバーに届かない
+    // 場合だけ従来の手順に倒れる。
+    const musicParsed = parseMusicQuery(question);
+    if (musicParsed) {
+      const handled = await this.runMusicLane(musicParsed);
+      if (handled) return;
     }
 
     // 2.5) 時間制メーターの関門：サーバー側モデル（Twin / Pro /
@@ -14990,7 +15925,13 @@ if (typeof module !== "undefined" && module.exports) {
     youtubeSummaryCap, ytLangLabel, YT_TIMEOUT_MS,
     extractZipcode, parseAddressQuery, fetchAddress, zipcodeAnswerText,
     geocodeAnswerText, addressCardOf, addressMapsUrl,
-    parseWikiDefinitionQuery, fetchWiki, wikiExtractPreview,
+    isZipcodePlaceQuestion,
+    parseQuakeQuery, fetchQuake, quakeAnswerText, warningAnswerText,
+    extractPrefecture, JMA_PREFECTURE_CODES,
+    parseStationQuery, fetchStation, stationAnswerText, stationCardOf,
+    parseHolidayQuery, fetchHoliday, holidayAnswerText,
+    parseMarketQuery, fetchMarket, marketFxText, marketStockText,
+    parseMusicQuery, fetchMusic, musicCardOf,
     formatTimestampLabel, formatDistanceLabel,
     factSourceRelatedToEntity,
     verifyModelAnswer, splitForGate, verifySentence,

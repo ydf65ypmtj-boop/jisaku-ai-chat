@@ -514,6 +514,11 @@ a { color: var(--accent); }
 .badge-youtube { background: #c4302b; color: #ffffff; }
 .badge-address { background: #2f6f6a; color: #ffffff; }
 .badge-wiki { background: #5a5f6a; color: #ffffff; }
+.badge-quake { background: #b03a2e; color: #ffffff; }
+.badge-station { background: #1f618d; color: #ffffff; }
+.badge-holiday { background: #a67c00; color: #ffffff; }
+.badge-market { background: #1e8449; color: #ffffff; }
+.badge-music { background: #a9328f; color: #ffffff; }
 @media (prefers-color-scheme: dark) {
   .badge-places { background: #7fc7a5; color: #1d1a15; }
   .badge-topics { background: #c39bd8; color: #1d1a15; }
@@ -522,6 +527,11 @@ a { color: var(--accent); }
   .badge-youtube { background: #e88a85; color: #1d1a15; }
   .badge-address { background: #7fc2ba; color: #1d1a15; }
   .badge-wiki { background: #b9bec9; color: #1d1a15; }
+  .badge-quake { background: #e88a7d; color: #1d1a15; }
+  .badge-station { background: #85b7dd; color: #1d1a15; }
+  .badge-holiday { background: #e3c565; color: #1d1a15; }
+  .badge-market { background: #82d19b; color: #1d1a15; }
+  .badge-music { background: #e58bd0; color: #1d1a15; }
 }
 
 /* 場所・話題・買い物レーンのカード */
