@@ -229,6 +229,45 @@ body {
 .account-logout-btn:hover { color: var(--text); }
 .account-note { font-size: 11px; color: var(--dim); margin: 0; line-height: 1.5; }
 
+/* Google連携（アカウント領域内・ログイン中のみ表示） */
+.google-link-area { display: flex; flex-direction: column; gap: 6px; }
+.google-link-status { font-size: 11px; color: var(--dim); margin: 0; line-height: 1.5; overflow-wrap: anywhere; }
+.google-link-btn {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit; font-size: 12px; font-weight: 600;
+  border-radius: 999px;
+  padding: 6px 12px;
+  cursor: pointer;
+  align-self: flex-start;
+}
+.google-link-btn:hover { background: var(--surface-alt); }
+.google-unlink-btn {
+  border: 0; background: transparent;
+  color: var(--dim);
+  font: inherit; font-size: 12px;
+  cursor: pointer; padding: 4px 6px;
+  align-self: flex-start;
+}
+.google-unlink-btn:hover { color: var(--text); }
+.google-notices { display: flex; flex-direction: column; gap: 6px; }
+.google-notice {
+  display: flex; align-items: flex-start; gap: 6px;
+  font-size: 11px; line-height: 1.5;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface);
+  padding: 6px 8px;
+}
+.google-notice-close {
+  margin-left: auto; flex: none;
+  border: 0; background: transparent;
+  color: var(--dim);
+  font: inherit; font-size: 13px; line-height: 1;
+  cursor: pointer; padding: 2px 4px;
+}
+.google-notice-close:hover { color: var(--text); }
+
 /* Cubeポイント（アカウント領域内・ログイン中のみ表示） */
 .points-area { display: flex; flex-direction: column; gap: 4px; }
 .points-balance { font-size: 12px; font-weight: 600; margin: 0; }
@@ -519,6 +558,8 @@ a { color: var(--accent); }
 .badge-holiday { background: #a67c00; color: #ffffff; }
 .badge-market { background: #1e8449; color: #ffffff; }
 .badge-music { background: #a9328f; color: #ffffff; }
+.badge-gmail { background: #b3261e; color: #ffffff; }
+.badge-gcal { background: #1a73e8; color: #ffffff; }
 @media (prefers-color-scheme: dark) {
   .badge-places { background: #7fc7a5; color: #1d1a15; }
   .badge-topics { background: #c39bd8; color: #1d1a15; }
@@ -532,6 +573,8 @@ a { color: var(--accent); }
   .badge-holiday { background: #e3c565; color: #1d1a15; }
   .badge-market { background: #82d19b; color: #1d1a15; }
   .badge-music { background: #e58bd0; color: #1d1a15; }
+  .badge-gmail { background: #f2b8b5; color: #601410; }
+  .badge-gcal { background: #a8c7fa; color: #0b3050; }
 }
 
 /* 場所・話題・買い物レーンのカード */

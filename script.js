@@ -4906,6 +4906,587 @@ function musicCardOf(r) {
   };
 }
 
+/* ---- Google連携レーン（cube-server の /google・/gmail・/gcal） ---- */
+/* 本人の決定（2026-11-20）：Gmail 送信もカレンダーの作成・変更も
+   全自動（送信前の確認は挟まない）。条件は「送信ログ＋通知」。
+   宛先は会話内に明示された単一のメールアドレスだけ。名前だけ・
+   推測の宛先には絶対に送らず、揃わなければ聞き返す。
+   認証は Supabase セッションの JWT を cube-server に渡し、
+   サーバー側が保管する Google のリフレッシュトークンで実行する
+   （ページに Google の秘密は置かない）。未ログイン・未連携の
+   ときは、このレーンの中で正直に案内して完結させる。設計の
+   正本は ~/workspace/cube_ext/GOOGLE_PLAN.md §5。 */
+
+const GOOGLE_API_TIMEOUT_MS = 30000;
+const GOOGLE_SENDLOG_SEEN_KEY = "cube.googleSendlogSeen.v1";
+
+/* cube-server の Google 系エンドポイントへの POST（JWT つき）。
+   応答 JSON をそのまま返す（401 の {ok:false} も含む）。通信
+   失敗・JSON でない応答は null。 */
+async function googlePost(path, token, body) {
+  if (!token) return null;
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}${path}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(body || {}),
+      },
+      GOOGLE_API_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  if (!res) return null;
+  const data = await res.json().catch(() => null);
+  return data && typeof data === "object" ? data : null;
+}
+
+async function fetchGoogleStatus(token) {
+  const data = await googlePost("/google/status", token, {});
+  if (!data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) return { ok: false, error: String(data.error || "") };
+  return {
+    ok: true,
+    configured: !!data.configured,
+    linked: !!data.linked,
+    googleEmail:
+      typeof data.google_email === "string" ? data.google_email : "",
+  };
+}
+
+async function startGoogleLink(token) {
+  const data = await googlePost("/google/link/start", token, {});
+  if (!data || !data.ok || typeof data.url !== "string" || !data.url) {
+    return {
+      ok: false,
+      error: data && typeof data.error === "string" ? data.error : "",
+    };
+  }
+  return { ok: true, url: data.url };
+}
+
+async function unlinkGoogle(token) {
+  const data = await googlePost("/google/unlink", token, {});
+  return !!data && data.ok === true;
+}
+
+/* ---- Gmail ---- */
+
+const GMAIL_ADDRESS_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+
+/* 本文の末尾に残った命令表現（「、とメールを送って」等）を落とす。 */
+function cleanGmailBodyTail(body) {
+  return String(body || "")
+    .replace(/[、,]\s*と\s*(メールを|メールで)?\s*(送ってください|送信してください|送って|送信して|送る|送信|送付)[。！!]*$/, "")
+    .replace(/(メールを|メールで)(送ってください|送信してください|送って|送信して|送る|送信|送付)[。！!]*$/, "")
+    .trim();
+}
+
+function extractGmailAddress(text) {
+  const m = String(text || "").match(GMAIL_ADDRESS_RE);
+  return m ? m[0] : "";
+}
+
+/**
+ * メール送信の依頼かどうか。宛先・件名・本文を取り出し、揃わ
+ * ないものは missing に入れる。送信の意図が無ければ null。
+ * 宛先は文中の明示されたアドレスだけ（名前からは作らない）。
+ */
+function parseGmailSendQuery(question) {
+  const q = String(question || "");
+  if (!q || !/メール/.test(q)) return null;
+  if (/とは|書き方|文例|例文|意味/.test(q)) return null;
+  if (!/送って|送信|送る|送付|メールして|メールで知らせ|メールで送/.test(q)) {
+    return null;
+  }
+  const to = extractGmailAddress(q);
+  let subject = "";
+  const sm =
+    q.match(/件名[は:：]?\s*[「『]([^」』]+)[」』]/) ||
+    q.match(/件名[は:：]\s*([^、。\n]+)/) ||
+    q.match(/[「『]([^」』]+)[」』]という件名/);
+  if (sm) subject = sm[1].trim();
+  let body = "";
+  const bm = q.match(/本文[は:：]\s*([\s\S]+)$/);
+  if (bm) body = cleanGmailBodyTail(bm[1].trim());
+  if (!body) {
+    const qm = q.match(/[「『]([^」』]+)[」』]\s*と(?:いう内容で)?\s*(?:メール|送)/);
+    if (qm && qm[1].trim() && qm[1].trim() !== subject) body = qm[1].trim();
+  }
+  if (!body) {
+    // 宛先・件名・命令表現を取り除いた残りを本文とみなす。
+    let rest = q;
+    if (to) rest = rest.replace(to, " ");
+    if (subject) rest = rest.replace(subject, " ");
+    if (!to) {
+      // アドレスが無い場合、先頭の「（名前）に」は宛先の指し方
+      // なので本文には入れない。
+      rest = rest.replace(/^[^\s、。]{1,20}[にへ][、,\s]*/, "");
+    }
+    rest = rest
+      .replace(/件名[は:：]?/g, " ")
+      .replace(/本文[は:：]?/g, " ")
+      .replace(/[「『」』]/g, " ")
+      .replace(/メールで知らせて|メールを送って|メールして|メールで|メールを|メール/g, " ")
+      .replace(/送ってください|送信してください|送って|送信して|送る|送信|送付/g, " ")
+      .replace(/という内容で|という件名で/g, " ")
+      .replace(/^[にへ、。・\s]+|[にへ、。・\s]+$/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (rest) body = rest;
+  }
+  const missing = [];
+  if (!to) missing.push("宛先のメールアドレス");
+  if (!subject) missing.push("件名");
+  if (!body) missing.push("本文");
+  return { kind: "send", to, subject, body, missing };
+}
+
+/**
+ * 聞き返しへの返信で下書きを埋める。マーカー（アドレス・
+ * 件名：・本文：）は常に取り込む。マーカー無しの素の文は、
+ * 足りない項目が1つだけのときにその項目として取り込む
+ * （別の話題を下書きに吸い込まないための制限）。
+ */
+function mergeGmailDraft(draft, question) {
+  const q = String(question || "");
+  const next = {
+    to: draft.to || "",
+    subject: draft.subject || "",
+    body: draft.body || "",
+  };
+  const em = extractGmailAddress(q);
+  if (em) next.to = em;
+  const sm =
+    q.match(/件名[は:：]?\s*[「『]([^」』]+)[」』]/) ||
+    q.match(/件名[は:：]\s*([^、。\n]+)/);
+  if (sm) next.subject = sm[1].trim();
+  const bm = q.match(/本文[は:：]\s*([\s\S]+)$/);
+  if (bm) next.body = bm[1].trim();
+  if (!em && !sm && !bm) {
+    const missingCount = [next.to, next.subject, next.body]
+      .filter((v) => !v).length;
+    const text = q.trim();
+    if (missingCount === 1 && text && !/[？?]/.test(text)) {
+      if (!next.body) next.body = text;
+      else if (!next.subject) next.subject = text;
+    }
+  }
+  return next;
+}
+
+function gmailSendAskBackText(draft) {
+  const missing = [];
+  if (!draft.to) missing.push("宛先のメールアドレス");
+  if (!draft.subject) missing.push("件名");
+  if (!draft.body) missing.push("本文");
+  return (
+    `メールを送るには、${missing.join("と")}が必要です。` +
+    "例えば「相手のアドレスに、件名：明日の会議、本文：10時に集合です、とメールを送って」のように教えてください。" +
+    "宛先は名前だけでは送れません（間違った相手に送らないためです）。分かった分だけでも送ってくれれば、残りを聞き直します。"
+  );
+}
+
+/**
+ * メールの読み取りの依頼かどうか（新着の確認・一覧・最新を
+ * 読む）。送信の依頼は送信レーンの担当なので拾わない。
+ */
+function parseGmailReadQuery(question) {
+  const q = String(question || "");
+  if (!q || !/メール/.test(q)) return null;
+  if (/とは|書き方|文例|例文|意味/.test(q)) return null;
+  if (parseGmailSendQuery(q)) return null;
+  if (!/来てる|来ている|届い|新着|受信|未読|見せて|読んで|開いて|ある[？?]|チェック|確認|一覧/.test(q)) {
+    return null;
+  }
+  let query = "";
+  const em = extractGmailAddress(q);
+  if (em) {
+    query = `from:${em}`;
+  } else {
+    const fm = q.match(/([^\s、。・]+)からのメール/);
+    if (fm && fm[1] !== "メール") query = `from:${fm[1]}`;
+  }
+  if (/未読/.test(q)) query = query ? `${query} is:unread` : "is:unread";
+  const openFirst = /読んで|開いて|本文/.test(q);
+  return { kind: "list", q: query, openFirst };
+}
+
+async function sendGmail(token, mail) {
+  const data = await googlePost("/gmail/send", token, mail);
+  if (!data) return null;
+  if (!data.ok) return { ok: false, error: String(data.error || "") };
+  return {
+    ok: true,
+    messageId: String(data.messageId || ""),
+    log: data.log && typeof data.log === "object" ? data.log : null,
+  };
+}
+
+async function fetchGmailList(token, opts) {
+  const body = { maxResults: (opts && opts.maxResults) || 10 };
+  if (opts && opts.q) body.q = opts.q;
+  const data = await googlePost("/gmail/list", token, body);
+  if (!data) return null;
+  if (!data.ok) return { ok: false, error: String(data.error || "") };
+  const messages = (Array.isArray(data.messages) ? data.messages : [])
+    .filter((m) => m && typeof m === "object")
+    .map((m) => ({
+      id: String(m.id || ""),
+      from: String(m.from || ""),
+      subject: String(m.subject || ""),
+      date: String(m.date || ""),
+      snippet: String(m.snippet || ""),
+      unread: !!m.unread,
+    }));
+  return { ok: true, messages };
+}
+
+async function fetchGmailMessage(token, id) {
+  const data = await googlePost("/gmail/get", token, { id });
+  if (!data) return null;
+  if (!data.ok) return { ok: false, error: String(data.error || "") };
+  const m = data.message || {};
+  return {
+    ok: true,
+    message: {
+      id: String(m.id || ""),
+      from: String(m.from || ""),
+      to: String(m.to || ""),
+      subject: String(m.subject || ""),
+      date: String(m.date || ""),
+      bodyText: String(m.bodyText || ""),
+    },
+  };
+}
+
+async function fetchGmailSendLog(token, limit) {
+  const data = await googlePost("/gmail/sendlog", token, {
+    limit: limit || 20,
+  });
+  if (!data) return null;
+  if (!data.ok) return { ok: false, error: String(data.error || "") };
+  const entries = (Array.isArray(data.entries) ? data.entries : [])
+    .filter((e) => e && typeof e === "object")
+    .map((e) => ({
+      ts: String(e.ts || ""),
+      to: String(e.to || ""),
+      subject: String(e.subject || ""),
+      messageId: String(e.messageId || ""),
+    }));
+  return { ok: true, entries };
+}
+
+function gmailSendLogKey(entry) {
+  return `${entry.ts}|${entry.messageId}|${entry.to}|${entry.subject}`;
+}
+
+function gmailListText(messages) {
+  if (!messages.length) return "条件に合うメールはありませんでした。";
+  const lines = messages.map((m, i) => {
+    const unread = m.unread ? "【未読】" : "";
+    const subj = m.subject || "（件名なし）";
+    const from = m.from || "（差出人不明）";
+    return `${i + 1}. ${unread}${subj}（${from}）`;
+  });
+  return `メールが${messages.length}件あります。\n` + lines.join("\n");
+}
+
+/* ---- Googleカレンダー ---- */
+
+const GCAL_WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
+
+/* JST の日付キー（YYYY-MM-DD）。今日から days 日ずらす。 */
+function gcalDateKeyPlus(days) {
+  return pointsJstDateKey(jstDatePlus(days));
+}
+
+/* 日付キーの翌日（YYYY-MM-DD）。 */
+function gcalNextDateKey(key) {
+  const [y, m, d] = String(key).split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d) + 86400000)
+    .toISOString()
+    .slice(0, 10);
+}
+
+function gcalWeekdayOf(dateKey) {
+  const [y, m, d] = String(dateKey).split("-").map(Number);
+  return GCAL_WEEKDAYS[new Date(Date.UTC(y, m - 1, d)).getUTCDay()];
+}
+
+/**
+ * 質問文から日付を取り出す。{key, label, explicit} か null。
+ * 今日・明日・明後日・昨日・M月D日・M/D・曜日に対応する。
+ */
+function parseGcalDate(question) {
+  const q = String(question || "");
+  if (/明後日/.test(q)) return { key: gcalDateKeyPlus(2), label: "明後日", explicit: false };
+  if (/明日/.test(q)) return { key: gcalDateKeyPlus(1), label: "明日", explicit: false };
+  if (/今日|本日/.test(q)) return { key: gcalDateKeyPlus(0), label: "今日", explicit: false };
+  if (/昨日/.test(q)) return { key: gcalDateKeyPlus(-1), label: "昨日", explicit: false };
+  const md = q.match(/(\d{1,2})月(\d{1,2})日/);
+  if (md) {
+    const month = Number(md[1]);
+    const day = Number(md[2]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const y = Number(gcalDateKeyPlus(0).slice(0, 4));
+      const key = `${y}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+      return { key, label: `${month}月${day}日`, explicit: true };
+    }
+  }
+  const slash = q.match(/(?:^|[^\d])(\d{1,2})\/(\d{1,2})(?:[^\d]|$)/);
+  if (slash) {
+    const month = Number(slash[1]);
+    const day = Number(slash[2]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const y = Number(gcalDateKeyPlus(0).slice(0, 4));
+      const key = `${y}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+      return { key, label: `${month}月${day}日`, explicit: true };
+    }
+  }
+  const wd = q.match(/([日月火水木金土])曜日/);
+  if (wd) {
+    const target = GCAL_WEEKDAYS.indexOf(wd[1]);
+    const todayKey = gcalDateKeyPlus(0);
+    const todayWd = GCAL_WEEKDAYS.indexOf(gcalWeekdayOf(todayKey));
+    const delta = (target - todayWd + 7) % 7;
+    return {
+      key: gcalDateKeyPlus(delta),
+      label: `${wd[1]}曜日`,
+      explicit: false,
+    };
+  }
+  return null;
+}
+
+/* 文中の時刻をすべて "HH:MM" で取り出す（「3時間」のような
+   所要時間は除く）。範囲指定は [開始, 終了] の順になる。 */
+function gcalTimeTokens(question) {
+  const q = String(question || "");
+  const tokens = [];
+  const re = /(午前|午後)?\s*(\d{1,2})時(?:(\d{1,2})分)?|(\d{1,2}):(\d{2})/g;
+  let m;
+  while ((m = re.exec(q)) !== null) {
+    if (q[re.lastIndex] === "間") continue;
+    if (m[4] !== undefined) {
+      const h = Number(m[4]);
+      const min = Number(m[5]);
+      if (h > 23 || min > 59) continue;
+      tokens.push(
+        `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`);
+    } else {
+      let h = Number(m[2]);
+      const min = m[3] ? Number(m[3]) : 0;
+      if (m[1] === "午後" && h < 12) h += 12;
+      if (m[1] === "午前" && h === 12) h = 0;
+      if (h > 23 || min > 59) continue;
+      tokens.push(
+        `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`);
+    }
+  }
+  return tokens;
+}
+
+/* 日付・時刻・命令表現を取り除いた残り（予定名の候補）。 */
+function gcalStripScheduleWords(q) {
+  let s = String(q || "");
+  s = s.replace(/(\d{1,2}月\d{1,2}日|\d{1,2}\/\d{1,2}|明後日|明日|今日|本日|昨日|来週|今週|[日月火水木金土]曜日)/g, " ");
+  s = s.replace(/(午前|午後)?\s*\d{1,2}時(\d{1,2}分)?/g, " ");
+  s = s.replace(/\d{1,2}:\d{2}/g, " ");
+  s = s.replace(/から|まで/g, " ");
+  return s;
+}
+
+function extractGcalTitle(question) {
+  const q = String(question || "");
+  const quoted = q.match(/[『「]([^』」]+)[』」]/);
+  if (quoted) return quoted[1].trim();
+  let s = gcalStripScheduleWords(q);
+  s = s.replace(/(の)?予定(を|に)?(入れて|追加して|登録して|作って|作成して|入れる|追加|登録|作成)?/g, " ");
+  s = s.replace(/スケジュール/g, " ");
+  s = s.replace(/お願いします|ください/g, " ");
+  s = s.replace(/^[にへ、。・\s]+|[にへ、。・\s]+$/g, "");
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
+/* 削除・変更の対象を指す手がかり（予定名の一部）。 */
+function extractGcalHint(question) {
+  const q = String(question || "");
+  const quoted = q.match(/[『「]([^』」]+)[』」]/);
+  if (quoted) return quoted[1].trim();
+  let s = gcalStripScheduleWords(q);
+  s = s.replace(/(の)?予定(を|は|に)?/g, " ");
+  s = s.replace(/スケジュール/g, " ");
+  s = s.replace(/消して|削除|取り消し|キャンセル|変更して|変更|ずらして|移動して|延期して|延期/g, " ");
+  s = s.replace(/\d+\s*番目|最初|さっき/g, " ");
+  s = s.replace(/お願いします|ください/g, " ");
+  s = s.replace(/^[をにへの、。・\s]+|[をにへの、。・\s]+$/g, "");
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
+function parseGcalOrdinal(question) {
+  const q = String(question || "");
+  const m = q.match(/(\d+)\s*番目/);
+  if (m) return Number(m[1]) - 1;
+  if (/最初|さっき|1つ目|一つ目/.test(q)) return 0;
+  if (/2つ目|二つ目/.test(q)) return 1;
+  if (/3つ目|三つ目/.test(q)) return 2;
+  return null;
+}
+
+/**
+ * カレンダーの依頼かどうか。kind は list / create / update /
+ * delete。作成で揃わないものは missing に入れる（聞き返す）。
+ * 予定の話題でも操作でもない質問は null。
+ */
+function parseGcalQuery(question) {
+  const q = String(question || "");
+  if (!q || !/予定|スケジュール/.test(q)) return null;
+  if (/とは|意味/.test(q)) return null;
+  const date = parseGcalDate(q);
+  const times = gcalTimeTokens(q);
+  if (/消して|削除|取り消し|キャンセル/.test(q)) {
+    return {
+      kind: "delete",
+      hint: extractGcalHint(q),
+      ordinal: parseGcalOrdinal(q),
+      date,
+    };
+  }
+  if (/変更|ずらし|移動|延期/.test(q)) {
+    const quoted = q.match(/[『「]([^』」]+)[』」]/);
+    return {
+      kind: "update",
+      hint: extractGcalHint(q),
+      ordinal: parseGcalOrdinal(q),
+      date,
+      times,
+      title: quoted ? quoted[1].trim() : "",
+    };
+  }
+  if (/入れて|追加|登録|作って|作成|予約/.test(q)) {
+    const title = extractGcalTitle(q);
+    const missing = [];
+    if (!date) missing.push("日付");
+    if (!times.length) missing.push("時刻");
+    if (!title) missing.push("予定の名前");
+    return { kind: "create", date, times, title, missing };
+  }
+  // 確認（一覧）：日付指定があればその日、無ければ今後1週間。
+  if (date) {
+    return {
+      kind: "list",
+      label: date.label,
+      timeMin: `${date.key}T00:00:00+09:00`,
+      timeMax: `${gcalNextDateKey(date.key)}T00:00:00+09:00`,
+    };
+  }
+  return {
+    kind: "list",
+    label: "今後1週間",
+    timeMin: `${gcalDateKeyPlus(0)}T00:00:00+09:00`,
+    timeMax: `${gcalDateKeyPlus(7)}T00:00:00+09:00`,
+  };
+}
+
+function sanitizeGcalEvents(list) {
+  return (Array.isArray(list) ? list : [])
+    .filter((e) => e && typeof e === "object" && e.id)
+    .map((e) => ({
+      id: String(e.id),
+      summary: String(e.summary || ""),
+      start: String(e.start || ""),
+      end: String(e.end || ""),
+      location: String(e.location || ""),
+      description: String(e.description || ""),
+      htmlLink: String(e.htmlLink || ""),
+    }));
+}
+
+async function fetchGcalEvents(token, timeMin, timeMax) {
+  const data = await googlePost("/gcal/list", token, { timeMin, timeMax });
+  if (!data) return null;
+  if (!data.ok) return { ok: false, error: String(data.error || "") };
+  return { ok: true, events: sanitizeGcalEvents(data.events) };
+}
+
+async function createGcalEvent(token, ev) {
+  const data = await googlePost("/gcal/create", token, ev);
+  if (!data) return null;
+  if (!data.ok) return { ok: false, error: String(data.error || "") };
+  return { ok: true, event: sanitizeGcalEvents([data.event])[0] || null };
+}
+
+async function updateGcalEvent(token, eventId, patch) {
+  const data = await googlePost("/gcal/update", token, {
+    eventId,
+    ...patch,
+  });
+  if (!data) return null;
+  if (!data.ok) return { ok: false, error: String(data.error || "") };
+  return { ok: true, event: sanitizeGcalEvents([data.event])[0] || null };
+}
+
+async function deleteGcalEvent(token, eventId) {
+  const data = await googlePost("/gcal/delete", token, { eventId });
+  if (!data) return null;
+  if (!data.ok) return { ok: false, error: String(data.error || "") };
+  return { ok: true };
+}
+
+/* "YYYY-MM-DDTHH:MM:00+09:00" に1時間を足した ISO 文字列。 */
+function gcalPlusOneHour(iso) {
+  const key = iso.slice(0, 10);
+  const [h, m] = iso.slice(11, 16).split(":").map(Number);
+  const total = h * 60 + m + 60;
+  const hh = Math.floor(total / 60) % 24;
+  const day = total >= 24 * 60 ? gcalNextDateKey(key) : key;
+  return (
+    `${day}T${String(hh).padStart(2, "0")}:` +
+    `${String(total % 60).padStart(2, "0")}:00+09:00`
+  );
+}
+
+/* epoch ms を JST の ISO 文字列（+09:00）に戻す。 */
+function gcalIsoFromMs(ms) {
+  const jst = new Date(ms + 9 * 3600000);
+  const key = jst.toISOString().slice(0, 10);
+  const hh = String(jst.getUTCHours()).padStart(2, "0");
+  const mm = String(jst.getUTCMinutes()).padStart(2, "0");
+  return `${key}T${hh}:${mm}:00+09:00`;
+}
+
+/* 予定の日時表示（例：11月21日（金） 10:00〜11:00）。 */
+function gcalWhenText(ev) {
+  const s = String(ev.start || "");
+  const e = String(ev.end || "");
+  const key = s.slice(0, 10);
+  const [, mo, d] = key.split("-");
+  const dateLabel = `${Number(mo)}月${Number(d)}日（${gcalWeekdayOf(key)}）`;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return `${dateLabel} 終日`;
+  const st = s.slice(11, 16);
+  const et = e.slice(0, 10) === key ? e.slice(11, 16) : "";
+  return et ? `${dateLabel} ${st}〜${et}` : `${dateLabel} ${st}〜`;
+}
+
+function gcalEventLine(ev) {
+  const loc = ev.location ? `（場所：${ev.location}）` : "";
+  return `・${gcalWhenText(ev)}：${ev.summary || "（無題）"}${loc}`;
+}
+
+function gcalListText(label, events) {
+  if (!events.length) return `${label}の予定はありません。`;
+  return `${label}の予定です。\n` + events.map(gcalEventLine).join("\n");
+}
+
 /**
  * 助詞・活用など、事実の中身を持たない言い回し。質問にも証拠にも
  * ほぼ必ず現れるため、「裏づけ」の材料にしてはいけない。
@@ -11922,6 +12503,14 @@ const BADGES = {
     label: "音楽の検索結果（iTunes）",
     className: "badge-music",
   },
+  gmail: {
+    label: "Gmail（Google連携で実行）",
+    className: "badge-gmail",
+  },
+  gcal: {
+    label: "Googleカレンダー（Google連携で実行）",
+    className: "badge-gcal",
+  },
   model: {
     label: "Cubeの答え（ネットで確認済み）",
     className: "badge-model",
@@ -13060,6 +13649,612 @@ const App = {
     return true;
   },
 
+  /* ---- Google連携レーンの実行と表示 ----
+     本人の決定どおり全自動で実行する。送信・作成・変更・削除の
+     前に確認は挟まない。失敗・未連携・未ログインは、この中で
+     正直に案内して完結させる（モデルの推測には倒さない）。 */
+
+  googleToken() {
+    const mgr = this.account;
+    if (!mgr || !mgr.signedIn) return "";
+    return (mgr.session && mgr.session.access_token) || "";
+  },
+
+  /* 連携状態をサーバーに確認する（60秒はキャッシュを使う）。 */
+  async refreshGoogleStatus(force) {
+    const token = this.googleToken();
+    if (!token) {
+      this.googleState = null;
+      return null;
+    }
+    if (
+      !force &&
+      this.googleState &&
+      Date.now() - this.googleStateAt < 60000
+    ) {
+      return this.googleState;
+    }
+    const st = await fetchGoogleStatus(token);
+    if (st && st.ok) {
+      this.googleState = st;
+      this.googleStateAt = Date.now();
+    }
+    return this.googleState;
+  },
+
+  /* Google 系レーンの前段：進めない状態なら案内を出して
+     false を返す。 */
+  async ensureGoogleReady(badge) {
+    if (!this.account || !this.account.signedIn) {
+      this.pushAssistant({
+        text: "Google連携を使うには、まずCubeにログインしてください。サイドバーの「Googleでログイン」からログインできます。",
+        badge,
+      });
+      return false;
+    }
+    const st = await this.refreshGoogleStatus(false);
+    if (!st) {
+      this.pushAssistant({
+        text: "Google連携の状態を確認できませんでした。",
+        badge,
+        note: "サーバーに届かなかった可能性があります。時間をおいてもう一度試してください。",
+      });
+      return false;
+    }
+    if (!st.configured) {
+      this.pushAssistant({
+        text: "Google連携はまだ準備中です。",
+        badge,
+      });
+      return false;
+    }
+    if (!st.linked) {
+      this.pushAssistant({
+        text: "まだGoogleと連携していません。サイドバーのアカウント欄にある「Googleと連携する」ボタンを押して、Googleの画面で許可してください。",
+        badge,
+        note: "連携すると、CubeからGmailの読み書きと、Googleカレンダーの予定の読み書きができるようになります。",
+      });
+      return false;
+    }
+    return true;
+  },
+
+  /* Google 系エンドポイントの失敗を、理由に応じて正直に出す。 */
+  googleFailMessage(data, badge) {
+    if (!data) {
+      this.pushAssistant({
+        text: "サーバーに届きませんでした。",
+        badge,
+        note: "時間をおいてもう一度試してください。",
+      });
+      return;
+    }
+    if (data.error === "not_linked" || data.error === "relink_required") {
+      if (this.googleState) this.googleState.linked = false;
+      this.renderGoogleLink();
+      this.pushAssistant({
+        text: "Google連携が切れています。サイドバーの「Googleと連携する」ボタンから、もう一度連携してください。",
+        badge,
+        note: "連携の許可は一定期間で切れることがあります。",
+      });
+      return;
+    }
+    if (data.error === "not_configured") {
+      this.pushAssistant({
+        text: "Google連携はまだ準備中です。",
+        badge,
+      });
+      return;
+    }
+    this.pushAssistant({
+      text: "うまくいきませんでした。",
+      badge,
+      note: "時間をおいてもう一度試してください。分からない情報を推測で出すことはしません。",
+    });
+  },
+
+  async runGmailSendLane(parsed) {
+    if (!(await this.ensureGoogleReady("gmail"))) return;
+    if (parsed.missing.length) {
+      this._gmailDraft = {
+        to: parsed.to,
+        subject: parsed.subject,
+        body: parsed.body,
+      };
+      this.pushAssistant({
+        text: gmailSendAskBackText(this._gmailDraft),
+        badge: "gmail",
+      });
+      return;
+    }
+    await this.executeGmailSend({
+      to: parsed.to,
+      subject: parsed.subject,
+      body: parsed.body,
+    });
+  },
+
+  /* 聞き返しへの返信で下書きが埋まれば送信まで進める。
+     埋まらなければ下書きを捨てて通常処理に倒す（true=処理済み）。 */
+  async handleGmailDraftReply(question) {
+    const draft = this._gmailDraft;
+    if (!draft) return false;
+    const merged = mergeGmailDraft(draft, question);
+    const before = [draft.to, draft.subject, draft.body]
+      .filter(Boolean).length;
+    const after = [merged.to, merged.subject, merged.body]
+      .filter(Boolean).length;
+    if (after === 3) {
+      this._gmailDraft = null;
+      if (!(await this.ensureGoogleReady("gmail"))) return true;
+      await this.executeGmailSend(merged);
+      return true;
+    }
+    if (after > before) {
+      this._gmailDraft = merged;
+      this.pushAssistant({
+        text: gmailSendAskBackText(merged),
+        badge: "gmail",
+      });
+      return true;
+    }
+    this._gmailDraft = null;
+    return false;
+  },
+
+  async executeGmailSend(mail) {
+    this.setPhase("searching");
+    const res = await sendGmail(this.googleToken(), mail);
+    this.setPhase("idle");
+    if (!res) {
+      this.googleFailMessage(null, "gmail");
+      return;
+    }
+    if (!res.ok) {
+      this.googleFailMessage(res, "gmail");
+      return;
+    }
+    this._gmailDraft = null;
+    this.pushAssistant({
+      text: `${mail.to} へメールを送信しました。\n件名：${mail.subject}`,
+      badge: "gmail",
+      note: "送信は送信ログに記録され、サイドバーの通知欄にも表示されます。",
+    });
+    if (res.log) {
+      this.showSendLogNotices([res.log]);
+    } else {
+      void this.checkSendLogNotices();
+    }
+  },
+
+  async runGmailReadLane(parsed) {
+    if (!(await this.ensureGoogleReady("gmail"))) return;
+    this.setPhase("searching");
+    const data = await fetchGmailList(this.googleToken(), {
+      maxResults: 10,
+      q: parsed.q,
+    });
+    if (!data) {
+      this.setPhase("idle");
+      this.googleFailMessage(null, "gmail");
+      return;
+    }
+    if (!data.ok) {
+      this.setPhase("idle");
+      this.googleFailMessage(data, "gmail");
+      return;
+    }
+    if (parsed.openFirst && data.messages.length) {
+      const full = await fetchGmailMessage(
+        this.googleToken(), data.messages[0].id);
+      this.setPhase("idle");
+      if (full && full.ok) {
+        const m = full.message;
+        const body =
+          m.bodyText.length > 1200
+            ? `${m.bodyText.slice(0, 1200)}\n…（以下省略）`
+            : m.bodyText;
+        this.pushAssistant({
+          text:
+            `最新のメールです。\n件名：${m.subject || "（件名なし）"}\n` +
+            `差出人：${m.from || "（差出人不明）"}\n\n${body}`,
+          badge: "gmail",
+        });
+        return;
+      }
+    }
+    this.setPhase("idle");
+    this.pushAssistant({
+      text: gmailListText(data.messages),
+      badge: "gmail",
+      note: parsed.q
+        ? "条件に合う新しい順のメールです。"
+        : "新しい順のメールです。",
+    });
+  },
+
+  async runGcalLane(parsed) {
+    if (!(await this.ensureGoogleReady("gcal"))) return;
+    const token = this.googleToken();
+    if (parsed.kind === "list") {
+      this.setPhase("searching");
+      const data = await fetchGcalEvents(
+        token, parsed.timeMin, parsed.timeMax);
+      this.setPhase("idle");
+      if (!data) return this.googleFailMessage(null, "gcal");
+      if (!data.ok) return this.googleFailMessage(data, "gcal");
+      this._gcalEvents = data.events;
+      this.pushAssistant({
+        text: gcalListText(parsed.label, data.events),
+        badge: "gcal",
+      });
+      return;
+    }
+    if (parsed.kind === "create") {
+      if (parsed.missing.length) {
+        this.pushAssistant({
+          text:
+            `予定を入れるには、${parsed.missing.join("と")}が必要です。` +
+            "例えば「明日の10時に『歯医者』の予定を入れて」のように教えてください。",
+          badge: "gcal",
+        });
+        return;
+      }
+      let dateKey = parsed.date.key;
+      // 日付指定が過去なら来年の同じ日とみなす（今年の過去日に
+      // 予定を作る聞き間違いを避ける）。
+      if (parsed.date.explicit && dateKey < gcalDateKeyPlus(0)) {
+        dateKey = `${Number(dateKey.slice(0, 4)) + 1}${dateKey.slice(4)}`;
+      }
+      const start = `${dateKey}T${parsed.times[0]}:00+09:00`;
+      const end = parsed.times[1]
+        ? `${dateKey}T${parsed.times[1]}:00+09:00`
+        : gcalPlusOneHour(start);
+      this.setPhase("searching");
+      const res = await createGcalEvent(token, {
+        summary: parsed.title,
+        start,
+        end,
+      });
+      this.setPhase("idle");
+      if (!res) return this.googleFailMessage(null, "gcal");
+      if (!res.ok) return this.googleFailMessage(res, "gcal");
+      this.pushAssistant({
+        text: `予定を入れました。\n${res.event ? gcalEventLine(res.event) : `・${parsed.title}`}`,
+        badge: "gcal",
+      });
+      return;
+    }
+    // 変更・削除：対象の予定を特定してから実行する。
+    const target = await this.resolveGcalTarget(parsed, token);
+    if (!target) return;
+    if (parsed.kind === "delete") {
+      this.setPhase("searching");
+      const res = await deleteGcalEvent(token, target.id);
+      this.setPhase("idle");
+      if (!res) return this.googleFailMessage(null, "gcal");
+      if (!res.ok) return this.googleFailMessage(res, "gcal");
+      this._gcalEvents = (this._gcalEvents || [])
+        .filter((e) => e.id !== target.id);
+      this.pushAssistant({
+        text: `予定を削除しました。\n${gcalEventLine(target)}`,
+        badge: "gcal",
+      });
+      return;
+    }
+    // update
+    const patch = {};
+    if (parsed.title) patch.summary = parsed.title;
+    if (parsed.date || parsed.times.length) {
+      const baseDate = parsed.date
+        ? parsed.date.key
+        : target.start.slice(0, 10);
+      const baseStart = parsed.times[0] || target.start.slice(11, 16);
+      if (!baseStart) {
+        this.pushAssistant({
+          text: "その予定は終日の予定なので、時刻の変更はできませんでした。日付だけの変更は「○月○日に変更して」と言ってください。",
+          badge: "gcal",
+        });
+        return;
+      }
+      patch.start = `${baseDate}T${baseStart}:00+09:00`;
+      if (parsed.times[1]) {
+        patch.end = `${baseDate}T${parsed.times[1]}:00+09:00`;
+      } else if (
+        /^\d{4}-\d{2}-\d{2}T/.test(target.start) &&
+        /^\d{4}-\d{2}-\d{2}T/.test(target.end)
+      ) {
+        // 元の所要時間を保つ。
+        const durMs =
+          Date.parse(target.end) - Date.parse(target.start);
+        patch.end = gcalIsoFromMs(Date.parse(patch.start) + durMs);
+      } else {
+        patch.end = gcalPlusOneHour(patch.start);
+      }
+    }
+    if (!Object.keys(patch).length) {
+      this.pushAssistant({
+        text: "変更の内容が分かりませんでした。「○○の予定を明日の15時に変更して」のように、新しい日時や名前を含めて言ってください。",
+        badge: "gcal",
+      });
+      return;
+    }
+    this.setPhase("searching");
+    const res = await updateGcalEvent(token, target.id, patch);
+    this.setPhase("idle");
+    if (!res) return this.googleFailMessage(null, "gcal");
+    if (!res.ok) return this.googleFailMessage(res, "gcal");
+    this.pushAssistant({
+      text: `予定を変更しました。\n${res.event ? gcalEventLine(res.event) : gcalEventLine(target)}`,
+      badge: "gcal",
+    });
+  },
+
+  /* 変更・削除の対象を、直近表示した予定→今後2週間の予定の
+     順で特定する。特定できない・複数ある場合は正直に出して
+     null を返す（推測で消したり変えたりはしない）。 */
+  async resolveGcalTarget(parsed, token) {
+    const pick = (events) => {
+      if (
+        parsed.ordinal != null &&
+        parsed.ordinal >= 0 &&
+        events[parsed.ordinal]
+      ) {
+        return { event: events[parsed.ordinal] };
+      }
+      if (parsed.hint) {
+        const hits = events.filter(
+          (e) =>
+            e.summary &&
+            (e.summary.includes(parsed.hint) ||
+              parsed.hint.includes(e.summary)),
+        );
+        if (hits.length === 1) return { event: hits[0] };
+        if (hits.length > 1) return { candidates: hits };
+      }
+      if (parsed.ordinal == null && !parsed.hint && events.length === 1) {
+        return { event: events[0] };
+      }
+      return {};
+    };
+    let pool = Array.isArray(this._gcalEvents) ? this._gcalEvents : [];
+    let r = pick(pool);
+    if (!r.event && !r.candidates) {
+      this.setPhase("searching");
+      const data = await fetchGcalEvents(
+        token,
+        `${gcalDateKeyPlus(0)}T00:00:00+09:00`,
+        `${gcalDateKeyPlus(14)}T00:00:00+09:00`,
+      );
+      this.setPhase("idle");
+      if (data && data.ok) {
+        pool = data.events;
+        this._gcalEvents = pool;
+        r = pick(pool);
+      }
+    }
+    if (r.event) return r.event;
+    if (r.candidates) {
+      this.pushAssistant({
+        text:
+          "対象の予定が複数見つかりました。どれですか？\n" +
+          r.candidates.map(gcalEventLine).join("\n"),
+        badge: "gcal",
+        note: "「2番目の予定を消して」のように番号で言うか、予定の名前を含めてもう一度言ってください。",
+      });
+      return null;
+    }
+    this.pushAssistant({
+      text: "対象の予定が見つかりませんでした。",
+      badge: "gcal",
+      note: "「今週の予定は？」などで確認してから、予定の名前を含めてもう一度言ってください。推測で消したり変更したりはしません。",
+    });
+    return null;
+  },
+
+  /* ---- Google連携（アカウント欄の UI） ---- */
+
+  /* 連携 UI の DOM をアカウント欄に差し込む（index.html は
+     触らず、script.js から作る）。 */
+  initGoogleLinkUi() {
+    const area = el("account-area");
+    if (!area || el("google-link-area")) return;
+    const box = document.createElement("div");
+    box.id = "google-link-area";
+    box.className = "google-link-area";
+    box.hidden = true;
+    const status = document.createElement("p");
+    status.id = "google-link-status";
+    status.className = "google-link-status";
+    const linkBtn = document.createElement("button");
+    linkBtn.type = "button";
+    linkBtn.id = "google-link-btn";
+    linkBtn.className = "google-link-btn";
+    linkBtn.textContent = "Googleと連携する";
+    linkBtn.addEventListener("click", () => void this.googleLinkStart());
+    const unlinkBtn = document.createElement("button");
+    unlinkBtn.type = "button";
+    unlinkBtn.id = "google-unlink-btn";
+    unlinkBtn.className = "google-unlink-btn";
+    unlinkBtn.textContent = "連携を解除";
+    unlinkBtn.hidden = true;
+    unlinkBtn.addEventListener("click", () => void this.googleUnlink());
+    box.appendChild(status);
+    box.appendChild(linkBtn);
+    box.appendChild(unlinkBtn);
+    area.appendChild(box);
+    const notices = document.createElement("div");
+    notices.id = "google-notices";
+    notices.className = "google-notices";
+    notices.hidden = true;
+    area.appendChild(notices);
+    // Google 同意からの戻り（?google=linked / ?google=error）。
+    try {
+      const params = new URLSearchParams(location.search);
+      const g = params.get("google");
+      if (g === "linked") {
+        this.googleReturnNotice = "Googleと連携しました。";
+      } else if (g === "error") {
+        this.googleReturnNotice =
+          "Google連携が完了しませんでした。もう一度「Googleと連携する」から試してください。";
+      }
+      if (g) {
+        params.delete("google");
+        params.delete("reason");
+        const qs = params.toString();
+        history.replaceState(
+          null, "",
+          location.pathname + (qs ? `?${qs}` : "") + location.hash);
+      }
+    } catch {
+      /* URL が読めない環境では何もしない */
+    }
+  },
+
+  renderGoogleLink() {
+    const box = el("google-link-area");
+    if (!box) return;
+    const mgr = this.account;
+    if (!mgr || !mgr.signedIn) {
+      box.hidden = true;
+      return;
+    }
+    box.hidden = false;
+    const status = el("google-link-status");
+    const linkBtn = el("google-link-btn");
+    const unlinkBtn = el("google-unlink-btn");
+    const st = this.googleState;
+    if (!st) {
+      if (status && !this.googleReturnNotice) {
+        status.textContent = "Google連携：確認中…";
+      }
+      if (linkBtn) linkBtn.hidden = true;
+      if (unlinkBtn) unlinkBtn.hidden = true;
+      return;
+    }
+    if (!st.configured) {
+      if (status) status.textContent = "Google連携：準備中";
+      if (linkBtn) linkBtn.hidden = true;
+      if (unlinkBtn) unlinkBtn.hidden = true;
+      return;
+    }
+    if (st.linked) {
+      if (status) {
+        status.textContent =
+          this.googleReturnNotice ||
+          `Google連携済み：${st.googleEmail || ""}`;
+      }
+      if (linkBtn) linkBtn.hidden = true;
+      if (unlinkBtn) unlinkBtn.hidden = false;
+    } else {
+      if (status) {
+        status.textContent =
+          this.googleReturnNotice || "Google連携：未連携";
+      }
+      if (linkBtn) linkBtn.hidden = false;
+      if (unlinkBtn) unlinkBtn.hidden = true;
+    }
+  },
+
+  async googleLinkStart() {
+    const token = this.googleToken();
+    if (!token) return;
+    const status = el("google-link-status");
+    if (status) status.textContent = "Googleの許可画面を開いています…";
+    const r = await startGoogleLink(token);
+    if (r && r.ok && r.url) {
+      location.href = r.url;
+      return;
+    }
+    if (status) {
+      status.textContent =
+        "連携を開始できませんでした。時間をおいてもう一度試してください。";
+    }
+  },
+
+  async googleUnlink() {
+    const token = this.googleToken();
+    if (!token) return;
+    await unlinkGoogle(token);
+    this.googleState = {
+      ok: true,
+      configured: true,
+      linked: false,
+      googleEmail: "",
+    };
+    this.googleStateAt = Date.now();
+    this.googleReturnNotice = "";
+    this.renderGoogleLink();
+    const notices = el("google-notices");
+    if (notices) {
+      notices.innerHTML = "";
+      notices.hidden = true;
+    }
+  },
+
+  /* 送信ログの未表示分を通知欄に出す（本人の条件：送信ログ＋
+     通知）。表示した分は既読として localStorage に残す。 */
+  async checkSendLogNotices() {
+    const st = this.googleState;
+    if (!st || !st.linked) return;
+    const data = await fetchGmailSendLog(this.googleToken(), 20);
+    if (!data || !data.ok) return;
+    let seen = [];
+    try {
+      seen = JSON.parse(
+        localStorage.getItem(GOOGLE_SENDLOG_SEEN_KEY) || "[]");
+    } catch {
+      seen = [];
+    }
+    const seenSet = new Set(Array.isArray(seen) ? seen : []);
+    const fresh = data.entries
+      .filter((e) => !seenSet.has(gmailSendLogKey(e)));
+    if (fresh.length) this.showSendLogNotices(fresh);
+    try {
+      localStorage.setItem(
+        GOOGLE_SENDLOG_SEEN_KEY,
+        JSON.stringify(data.entries.map(gmailSendLogKey).slice(-100)));
+    } catch {
+      /* 保存できなくても通知の表示は続ける */
+    }
+  },
+
+  showSendLogNotices(entries) {
+    const box = el("google-notices");
+    if (!box || !entries.length) return;
+    box.hidden = false;
+    for (const e of entries) {
+      const item = document.createElement("div");
+      item.className = "google-notice";
+      const text = document.createElement("span");
+      text.textContent =
+        `メール送信：${e.to} へ「${e.subject}」を送信しました`;
+      const close = document.createElement("button");
+      close.type = "button";
+      close.className = "google-notice-close";
+      close.textContent = "×";
+      close.setAttribute("aria-label", "通知を閉じる");
+      close.addEventListener("click", () => {
+        item.remove();
+        if (!box.children.length) box.hidden = true;
+      });
+      item.appendChild(text);
+      item.appendChild(close);
+      box.appendChild(item);
+    }
+    try {
+      const seen = JSON.parse(
+        localStorage.getItem(GOOGLE_SENDLOG_SEEN_KEY) || "[]");
+      const set = new Set(Array.isArray(seen) ? seen : []);
+      for (const e of entries) set.add(gmailSendLogKey(e));
+      localStorage.setItem(
+        GOOGLE_SENDLOG_SEEN_KEY,
+        JSON.stringify([...set].slice(-100)));
+    } catch {
+      /* 既読の保存に失敗しても表示は済んでいる */
+    }
+  },
+
   /* ---- PC操作レーンの実行と表示 ----
      進行中は履歴に残らない仮メッセージでステップを見せ、完了後に
      最終結果を通常の回答として出す（履歴に残るのは結果だけ）。
@@ -14142,6 +15337,19 @@ const App = {
      無効な環境では null。 */
   historyStore: null,
 
+  /* Google連携の状態（/google/status の結果）と取得時刻。 */
+  googleState: null,
+  googleStateAt: 0,
+
+  /* Google 同意から戻った直後の案内文（連携欄に一度出す）。 */
+  googleReturnNotice: "",
+
+  /* メール送信の下書き（聞き返しの間だけ保持する）。 */
+  _gmailDraft: null,
+
+  /* 直近に表示したカレンダーの予定（変更・削除の対象特定用）。 */
+  _gcalEvents: [],
+
   /* いま開いている会話 {id,title,created_at,updated_at,turns}。
      まだ何も話していない間は null で、最初の発言で作られる。 */
   historyCurrent: null,
@@ -14192,6 +15400,7 @@ const App = {
         }
       }
       this.pointsLoadBonus();
+      this.initGoogleLinkUi();
       const newChat = el("new-chat-btn");
       if (newChat) {
         newChat.addEventListener("click", (e) => {
@@ -14247,6 +15456,7 @@ const App = {
       if (note) note.textContent = "ログインすると会話履歴を他の端末と同期できます";
     }
     this.renderPoints();
+    this.renderGoogleLink();
   },
 
   /* 認証状態が変わったら：アカウント表示を更新し、履歴を
@@ -14255,6 +15465,10 @@ const App = {
   async handleAccountChange() {
     this.renderAccount();
     void this.refreshPoints();
+    void this.refreshGoogleStatus(true).then(() => {
+      this.renderGoogleLink();
+      void this.checkSendLogNotices();
+    });
     await this.renderHistoryList();
   },
 
@@ -15074,6 +16288,31 @@ const App = {
         badge: "pc",
         note: "認証情報はモデルの文脈にもログにも残りません。",
       });
+      return;
+    }
+
+    // Google連携（Gmail・カレンダー）：本人のアカウントでの
+    // 実操作なので、PC操作レーンより前に確定させる（「メールを
+    // 送って」が仮想PCのフォーム送信に化けないため。ログイン
+    // レーンと同じ理由）。未ログイン・未連携のときも、この
+    // レーンの中で正直に案内して完結させる。
+    if (this._gmailDraft) {
+      const handledDraft = await this.handleGmailDraftReply(question);
+      if (handledDraft) return;
+    }
+    const gmailSendParsed = parseGmailSendQuery(question);
+    if (gmailSendParsed) {
+      await this.runGmailSendLane(gmailSendParsed);
+      return;
+    }
+    const gmailReadParsed = parseGmailReadQuery(question);
+    if (gmailReadParsed) {
+      await this.runGmailReadLane(gmailReadParsed);
+      return;
+    }
+    const gcalParsed = parseGcalQuery(question);
+    if (gcalParsed) {
+      await this.runGcalLane(gcalParsed);
       return;
     }
 
@@ -15961,6 +17200,14 @@ if (typeof module !== "undefined" && module.exports) {
     parseHolidayQuery, fetchHoliday, holidayAnswerText,
     parseMarketQuery, fetchMarket, marketFxText, marketStockText,
     parseMusicQuery, fetchMusic, musicCardOf,
+    fetchGoogleStatus, startGoogleLink, unlinkGoogle,
+    parseGmailSendQuery, mergeGmailDraft, gmailSendAskBackText,
+    parseGmailReadQuery, sendGmail, fetchGmailList, fetchGmailMessage,
+    fetchGmailSendLog, gmailSendLogKey, gmailListText,
+    parseGcalQuery, parseGcalDate, gcalTimeTokens, gcalNextDateKey,
+    fetchGcalEvents, createGcalEvent, updateGcalEvent, deleteGcalEvent,
+    sanitizeGcalEvents, gcalWhenText, gcalEventLine, gcalListText,
+    gcalPlusOneHour, GOOGLE_SENDLOG_SEEN_KEY,
     formatTimestampLabel, formatDistanceLabel,
     factSourceRelatedToEntity,
     verifyModelAnswer, splitForGate, verifySentence,
