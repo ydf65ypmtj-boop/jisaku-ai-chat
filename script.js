@@ -3224,6 +3224,121 @@ function httpUrlOrEmpty(u) {
   return typeof u === "string" && /^https?:\/\//i.test(u) ? u : "";
 }
 
+/* ================================================================== */
+/* YouTube要約レーン（cube-server の /yt、2026-11-20 本人決定）        */
+/*                                                                    */
+/* チャットに YouTube の URL が貼られたら、サーバー側（/yt）が動画   */
+/* の字幕トラック（日本語の手動→自動、英語の順）を取得し、その字幕   */
+/* を選択中のモデルに読解形式で読ませて要約させる。仮想PCで再生      */
+/* する方式ではない（字幕テキストだけを使う）。URL が明示された      */
+/* 依頼なので、このレーンは必ずここで完結させる：字幕なし・取得      */
+/* 失敗・生成失敗でも通常経路には倒さず、正直な文面を出す（検索      */
+/* レーン等に化けると「要約して」と頼んだのに無関係な答えが返る）。  */
+/* 要約は検証ゲートを通さない「モデルの読み取り」であり、バッジと    */
+/* 注記で字幕由来であることを明示する。知識メモ帳には保存しない。    */
+/* ================================================================== */
+
+/* /yt のページ側タイムアウト。サーバー側は字幕一覧の取得＋字幕      */
+/* 本文の取得で数秒が通常だが、混雑時の余裕を見て 30 秒。             */
+const YT_TIMEOUT_MS = 30000;
+
+/* 要約のためにモデルへ渡す字幕の上限（文字数）。Ultra（iMac の       */
+/* llama-server、コンテキスト 2048 トークン）に渡せる大きさと、       */
+/* 端末・サーバーの自作モデル（ブロック長が短く、プロンプトは末尾      */
+/* から切り取られる）に渡せる大きさで分ける。字幕が上限を超えたら    */
+/* 先頭から切り、切り詰めた旨を注記する。                             */
+const YT_SUMMARY_CAP_ULTRA = 1500;
+const YT_SUMMARY_CAP_DEFAULT = 500;
+
+function youtubeSummaryCap(modelId) {
+  return modelId === "ultra" ? YT_SUMMARY_CAP_ULTRA : YT_SUMMARY_CAP_DEFAULT;
+}
+
+/* 質問文から YouTube の動画 ID（11桁）を取り出す。対応する形：      */
+/* youtube.com/watch?v=…、youtu.be/…、shorts/、live/、embed/。       */
+/* どれにも当たらなければ null。                                      */
+function extractYoutubeVideoId(question) {
+  const q = String(question || "");
+  const m = q.match(
+    /(?:youtube\.com\/(?:watch\?[^ \t\r\n]*v=|shorts\/|live\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/,
+  );
+  return m ? m[1] : null;
+}
+
+/* サーバー側（/yt）に字幕取得を依頼する。戻り値はサーバーの応答      */
+/* そのまま（{ok:true, transcript...} / {ok:true, hasCaptions:false}  */
+/* / {ok:false, error}）。届かない・解釈できない場合は null。         */
+async function fetchYoutubeCaptions(videoId) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/yt`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoId }),
+      },
+      YT_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!data || typeof data.ok !== "boolean") return null;
+  return data;
+}
+
+/* 字幕の表示用ラベル（「日本語字幕（自動生成）」など）。 */
+function ytLangLabel(data) {
+  const lang = (data && data.lang) || "";
+  const base = lang.split("-")[0];
+  const name = base === "ja" ? "日本語" : base === "en" ? "英語" : (lang || "不明な言語");
+  return `${name}字幕${data && data.kind === "asr" ? "（自動生成）" : ""}`;
+}
+
+/* YouTube要約レーン本体：字幕を取り、選択中モデルに要約させる。      */
+/* 戻り値は表示分岐用の {kind, videoId, data?, text?, truncated?,     */
+/* cap?}。kind: summary / no_captions / unreachable / failed /        */
+/* meter_empty / generate_failed。URL が無ければ null（レーン自体     */
+/* が発火していない）。                                               */
+async function youtubeSummary(question, modelId) {
+  const videoId = extractYoutubeVideoId(question);
+  if (!videoId) return null;
+  const data = await fetchYoutubeCaptions(videoId);
+  if (!data) return { kind: "unreachable", videoId };
+  if (!data.ok) return { kind: "failed", videoId, data };
+  if (typeof data.transcript !== "string" || !data.transcript) {
+    return { kind: "no_captions", videoId, data };
+  }
+  const cap = youtubeSummaryCap(modelId);
+  const truncated = data.transcript.length > cap;
+  const passage = truncated ? data.transcript.slice(0, cap) : data.transcript;
+  let written = "";
+  try {
+    written = (
+      (await generateForModel(
+        modelId,
+        `文：${passage}\n質問：この動画の内容を分かりやすく要約してください。`,
+      )) || ""
+    ).trim();
+  } catch (e) {
+    if (e && e.code === "METER_EMPTY") {
+      return { kind: "meter_empty", videoId, data };
+    }
+    return { kind: "generate_failed", videoId, data };
+  }
+  if (!written) return { kind: "generate_failed", videoId, data };
+  if (modelId === "ultra") {
+    if (isUltraAbstention(written)) {
+      return { kind: "generate_failed", videoId, data };
+    }
+    // 公開版Cubeの Ultra の文章は「です・ます」調にそろえる
+    // （既存の提示文と同じ整形。適用先は Ultra の生成だけ）。
+    written = normalizeUltraWrittenStyle(written);
+  }
+  return { kind: "summary", videoId, data, text: written, truncated, cap };
+}
+
 /* ---- 場所レーン（POST /places） ---- */
 
 /* ジャンル語はサーバー側（places_endpoint.js の GENRES）と揃える。
@@ -10799,6 +10914,10 @@ const BADGES = {
     label: "PC操作の結果（仮想PCで実行）",
     className: "badge-pc",
   },
+  youtube: {
+    label: "動画の要約（YouTubeの字幕から）",
+    className: "badge-youtube",
+  },
   model: {
     label: "Cubeの答え（ネットで確認済み）",
     className: "badge-model",
@@ -11591,6 +11710,80 @@ const App = {
     el("msg-list").appendChild(li);
     this.historyCaptureAssistant(msg);
     this.scrollChat();
+  },
+
+  /* ---- YouTube要約レーンの実行と表示 ----
+     字幕の取得と要約の生成が終わるまで検索中表示にし、結果は
+     通常の回答として出す。どの失敗でも通常経路には倒さず、
+     理由ごとの正直な文面をこのレーンで完結させる。 */
+  async runYoutubeLane(question, videoId) {
+    this.setPhase("searching");
+    let r = null;
+    try {
+      r = await youtubeSummary(question, this.modelId);
+    } catch {
+      r = null;
+    }
+    this.setPhase("idle");
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    if (!r || r.kind === "unreachable") {
+      this.pushAssistant({
+        text: "字幕の取得サーバーに接続できませんでした。",
+        badge: "youtube",
+        sourceTitle: "YouTube",
+        sourceUrl: watchUrl,
+        note: "時間をおいてもう一度試してください。",
+      });
+      return;
+    }
+    const title = (r.data && r.data.title) || "";
+    const channel = (r.data && r.data.channel) || "";
+    const sourceTitle = title || "YouTube";
+    if (r.kind === "summary") {
+      const noteParts = [
+        `動画「${title || videoId}」${channel ? `（${channel}）` : ""}の${ytLangLabel(r.data)}をもとに、選択中のモデルが要約しました。`,
+      ];
+      if (r.truncated) {
+        noteParts.push(`字幕が長いため、冒頭約${r.cap}字の範囲での要約です。`);
+      }
+      this.pushAssistant({
+        text: r.text,
+        badge: "youtube",
+        sourceTitle,
+        sourceUrl: watchUrl,
+        note: noteParts.join(""),
+      });
+      return;
+    }
+    if (r.kind === "no_captions") {
+      this.pushAssistant({
+        text: "この動画は字幕が無いため、要約できませんでした。",
+        badge: "youtube",
+        sourceTitle,
+        sourceUrl: watchUrl,
+        note: "字幕（日本語・英語など）が付いている動画なら要約できます。",
+      });
+      return;
+    }
+    if (r.kind === "meter_empty") {
+      this.pushAssistant({
+        text: "サーバーモデルの時間メーターが0のため、要約を作れませんでした。",
+        badge: "youtube",
+        sourceTitle,
+        sourceUrl: watchUrl,
+        note: "Cube Nano / Cube Flash（この端末の中で動くモデル）に切り替えると、メーターなしで要約できます。ログイン中なら、ポイントでメーター時間を追加することもできます。",
+      });
+      return;
+    }
+    this.pushAssistant({
+      text: r.kind === "failed"
+        ? "字幕を取得できませんでした。"
+        : "字幕は取得できましたが、要約を作れませんでした。",
+      badge: "youtube",
+      sourceTitle,
+      sourceUrl: watchUrl,
+      note: "時間をおくか、モデルを切り替えてもう一度試してください。",
+    });
   },
 
   /* ---- PC操作レーンの実行と表示 ----
@@ -13380,6 +13573,16 @@ const App = {
     // は何も出さず、従来の手順（2.5 以降）にそのまま倒れる。
     // 結果は変わる情報なので知識メモ帳には保存しない。
 
+    // YouTube要約：動画URLが明示された依頼なので、URLを含む質問は
+    // 必ずこのレーンで完結させる（字幕なし・失敗でも通常経路に
+    // 倒さない）。PC操作レーンより前に置くのは、URL の貼り付けを
+    // 「ページを開く」操作と取り違えないため。
+    const ytVideoId = extractYoutubeVideoId(question);
+    if (ytVideoId) {
+      await this.runYoutubeLane(question, ytVideoId);
+      return;
+    }
+
     // PC操作：明確な操作の依頼表現のときだけ（detectPcQuery が
     // 事実・方法の質問を弾く）。実行は仮想PCの専門モデルが行い、
     // 結果（検証の成否を含む）は橋渡しが決めた文面をそのまま出す。
@@ -14199,6 +14402,8 @@ if (typeof module !== "undefined" && module.exports) {
     parseShopQuery, extractShopConditions, extractShopKeyword,
     fetchShop, shopCardOf, shopIntroText, shopConditionsHash,
     detectPcQuery, executePcTask, pcResultNote,
+    extractYoutubeVideoId, fetchYoutubeCaptions, youtubeSummary,
+    youtubeSummaryCap, ytLangLabel, YT_TIMEOUT_MS,
     formatTimestampLabel, formatDistanceLabel,
     factSourceRelatedToEntity,
     verifyModelAnswer, splitForGate, verifySentence,
