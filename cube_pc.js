@@ -12,6 +12,13 @@
  * - 成功の表示はサーバー側の外部検証が pass のときだけ。モデルの
  *   自己申告だけでは成功にしない（結果文面はサーバーが決めた
  *   result.message をそのまま出す）。
+ * - ライブ画面と乗っ取り（2026-11-20 追加）：実行中は実行側が
+ *   ライブ画面（step "live" のスクリーンショット）を流し続ける。
+ *   乗っ取りは専用の「操作する」ボタンからだけ行う（画面タップ
+ *   では切り替わらない）。ボタンを押すと AI を止めてユーザーが
+ *   直接操作でき、操作中は画面タップがクリックとして送られる。
+ *   操作モードの正本はサーバーの control イベントで、手入力は
+ *   mode:"user" の間だけ橋渡しが通す（AI と競合させない）。
  *
  * 使い方（ブラウザ）：
  *   <script src="cube_pc.js"></script>
@@ -32,6 +39,48 @@
     { id: "editor_input", label: "メモ帳に入力", example: "メモ帳に『今日は良い天気です』と入力して" },
     { id: "folder_create", label: "フォルダ作成", example: "『shiryo-2026』フォルダを作って" },
     { id: "terminal", label: "端末でコマンド実行", example: "端末で echo OK123 を実行して" },
+  ];
+
+  /* 実画面の大きさ（体の Xvfb は 1280x800 固定） */
+  const SCREEN_W = 1280;
+  const SCREEN_H = 800;
+
+  /*
+   * 表示中の画面要素の矩形とタップ位置から、実画面（1280x800）の
+   * 座標へ換算する。矩形が取れない／大きさゼロなら null。
+   * 換算は橋渡し側の検証範囲（x:0〜1279、y:0〜799）に丸める。
+   */
+  function toScreenCoords(rect, clientX, clientY) {
+    if (!rect || !rect.width || !rect.height) return null;
+    const clamp = (v, max) => Math.min(max, Math.max(0, v));
+    return {
+      x: clamp(Math.round((clientX - rect.left) / rect.width * SCREEN_W), SCREEN_W - 1),
+      y: clamp(Math.round((clientY - rect.top) / rect.height * SCREEN_H), SCREEN_H - 1),
+    };
+  }
+
+  /*
+   * ライブ操作の入力を橋渡しへ送る（POST /pc/tasks/:id/input）。
+   * 戻り値： {status, ok, data}。fetch 自体の失敗は throw する
+   * （呼び出し側で「接続できませんでした」と正直に出すため）。
+   */
+  async function postInput(baseUrl, taskId, cmd, fetchImpl) {
+    const f = fetchImpl || global.fetch.bind(global);
+    const base = (baseUrl || "").replace(/\/$/, "");
+    const resp = await f(`${base}/pc/tasks/${taskId}/input`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cmd),
+    });
+    const data = await resp.json().catch(() => ({}));
+    return { status: resp.status, ok: resp.ok, data };
+  }
+
+  /* 乗っ取り中の基本キーのボタン定義（表示ラベル → 橋渡しのキー名） */
+  const KEY_BUTTONS = [
+    ["Enter", "Return"], ["Backspace", "BackSpace"], ["Tab", "Tab"],
+    ["Esc", "Escape"], ["↑", "Up"], ["↓", "Down"], ["←", "Left"],
+    ["→", "Right"], ["Space", "space"],
   ];
 
   /*
@@ -92,6 +141,9 @@
     const state = {
       taskId: null, running: false, es: null,
       els: {},
+      // ライブ操作：操作モードはサーバーの control イベントが正本。
+      // "ai"（AI操作中）／"user"（ユーザー操作中・AI停止）。
+      controlMode: "ai", controlBusy: false,
     };
 
     function el(tag, className, text) {
@@ -147,7 +199,53 @@
 
       els.screen = el("img", "cubepc-screen");
       els.screen.setAttribute("alt", "仮想PCの画面");
+      els.screen.addEventListener("click", (ev) => onScreenTap(ev));
       root.appendChild(els.screen);
+
+      // ライブ操作（乗っ取り）コントロール
+      const controls = el("div", "cubepc-controls");
+      els.takeover = el("button", "cubepc-takeover", "操作する");
+      els.takeover.setAttribute("type", "button");
+      els.takeover.addEventListener("click", () => requestTakeover());
+      els.release = el("button", "cubepc-release", "AIに戻す");
+      els.release.setAttribute("type", "button");
+      els.release.hidden = true;
+      els.release.addEventListener("click", () => requestRelease());
+      els.controlState = el("span", "cubepc-control-state", "");
+      controls.appendChild(els.takeover);
+      controls.appendChild(els.release);
+      controls.appendChild(els.controlState);
+      root.appendChild(controls);
+
+      const keys = el("div", "cubepc-keys");
+      keys.hidden = true;
+      els.keys = keys;
+      for (const [label, key] of KEY_BUTTONS) {
+        const b = el("button", "cubepc-key", label);
+        b.setAttribute("type", "button");
+        b.addEventListener("click", () => sendInput({ type: "key", key }));
+        keys.appendChild(b);
+      }
+      root.appendChild(keys);
+
+      const typeRow = el("div", "cubepc-type-row");
+      typeRow.hidden = true;
+      els.typeRow = typeRow;
+      els.typeInput = el("input", "cubepc-type-input");
+      els.typeInput.setAttribute("type", "text");
+      els.typeInput.setAttribute("placeholder", "入力する文字");
+      const typeBtn = el("button", "cubepc-type-btn", "入力する");
+      typeBtn.setAttribute("type", "button");
+      typeBtn.addEventListener("click", () => {
+        const text = els.typeInput.value;
+        if (text) {
+          sendInput({ type: "type", text });
+          els.typeInput.value = "";
+        }
+      });
+      typeRow.appendChild(els.typeInput);
+      typeRow.appendChild(typeBtn);
+      root.appendChild(typeRow);
 
       els.log = el("ol", "cubepc-log");
       root.appendChild(els.log);
@@ -158,6 +256,7 @@
 
       container.appendChild(root);
       state.root = root;
+      updateControlUi();
       return panel;
     }
 
@@ -172,6 +271,82 @@
       state.els.run.disabled = running;
       state.els.stop.disabled = !running;
       state.els.input.disabled = running;
+      updateControlUi();
+    }
+
+    /* ---- ライブ操作（乗っ取り） ---- */
+
+    function updateControlUi() {
+      const els = state.els;
+      if (!els.takeover) return;
+      const mode = state.controlMode;
+      els.takeover.hidden = mode === "user";
+      els.takeover.disabled = !state.running || mode === "user";
+      els.release.hidden = mode !== "user";
+      els.release.disabled = !state.running;
+      els.keys.hidden = mode !== "user";
+      els.typeRow.hidden = mode !== "user";
+      els.controlState.textContent = !state.running ? "" :
+        mode === "user"
+          ? "あなたが操作中です（AIは止まっています）。画面をタップするとクリックできます。"
+          : state.controlBusy
+            ? "AIを止めています…"
+            : "AIが操作中です。自分で操作したいときは「操作する」を押してください。";
+    }
+
+    async function sendInput(cmd) {
+      if (!state.taskId) return;
+      try {
+        const r = await postInput(baseUrl, state.taskId, cmd, fetchImpl);
+        if (!r.ok) {
+          state.els.controlState.textContent =
+            (r.data && r.data.detail) || "入力を受け付けられませんでした。";
+        }
+      } catch (e) {
+        state.els.controlState.textContent = "サーバーに接続できませんでした。";
+      }
+    }
+
+    async function requestTakeover() {
+      if (!state.taskId || state.controlMode === "user") return;
+      state.controlBusy = true;
+      updateControlUi();
+      await sendInput({ type: "takeover" });
+      // 実際の停止は実行側の control イベントで確定する。一定時間
+      // 来なければ「切り替え中」を解除する（固まらせない）。
+      const t = setTimeout(() => {
+        if (state.controlMode !== "user") {
+          state.controlBusy = false;
+          updateControlUi();
+        }
+      }, 10000);
+      if (t && typeof t.unref === "function") t.unref();
+    }
+
+    async function requestRelease() {
+      if (!state.taskId) return;
+      await sendInput({ type: "release" });
+    }
+
+    function onScreenTap(ev) {
+      if (!state.running || !state.taskId) return;
+      if (!ev || typeof ev.clientX !== "number") return;
+      const rect = typeof state.els.screen.getBoundingClientRect === "function"
+        ? state.els.screen.getBoundingClientRect() : null;
+      const pt = toScreenCoords(rect, ev.clientX, ev.clientY);
+      if (!pt) return;
+      if (state.controlMode === "user") {
+        sendInput({ type: "click", x: pt.x, y: pt.y });
+      }
+      // AI操作中のタップは何もしない（乗っ取りは「操作する」
+      // ボタンからだけ。誤タップで AI を止めないため）
+    }
+
+    function onControlEvent(d) {
+      if (!d || (d.mode !== "user" && d.mode !== "ai")) return;
+      state.controlMode = d.mode;
+      state.controlBusy = false;
+      updateControlUi();
     }
 
     function logLine(text) {
@@ -190,6 +365,8 @@
       // 前回分を片付ける
       state.els.log.textContent = "";
       state.els.result.hidden = true;
+      state.controlMode = "ai";
+      state.controlBusy = false;
       setRunning(true);
       state.els.state.textContent = "開始しています…";
       let resp;
@@ -235,7 +412,13 @@
       });
       es.addEventListener("screenshot", (ev) => {
         const d = JSON.parse(ev.data);
-        state.els.screen.src = `${baseUrl}${d.url}`;
+        // ライブ画面は URL が同じまま中身が差し替わるため、
+        // キャッシュ避けのクエリを付ける（ステップ画面は URL が変わる）。
+        const bust = d.step === "live" ? `?t=${Date.now()}` : "";
+        state.els.screen.src = `${baseUrl}${d.url}${bust}`;
+      });
+      es.addEventListener("control", (ev) => {
+        onControlEvent(JSON.parse(ev.data));
       });
       es.addEventListener("verification", (ev) => {
         const d = JSON.parse(ev.data);
@@ -287,7 +470,10 @@
     return panel;
   }
 
-  const api = { createPanel, classifyPreview, actionLabel, CATEGORIES };
+  const api = {
+    createPanel, classifyPreview, actionLabel, CATEGORIES,
+    toScreenCoords, postInput, SCREEN_W, SCREEN_H,
+  };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   global.CubePc = api;
 })(typeof window !== "undefined" ? window : globalThis);

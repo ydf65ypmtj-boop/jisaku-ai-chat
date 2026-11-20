@@ -840,6 +840,21 @@ a { color: var(--accent); }
 .cubepc-result--failed, .cubepc-result--error { background: #fdeaea; border: 1px solid #d9534f; }
 .cubepc-result--stopped { background: #eeeeee; border: 1px solid #999; }
 
+/* ---- PC操作：ライブ画面と乗っ取り（チャット・パネル共通） ---- */
+.cubepc-screen { cursor: pointer; touch-action: manipulation; }
+.cubepc-controls { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; align-items: center; }
+.cubepc-takeover, .cubepc-release, .cubepc-key, .cubepc-type-btn { border: 1px solid #bbb; border-radius: 999px; background: #f6f6f6; padding: 4px 10px; cursor: pointer; }
+.cubepc-keys, .cubepc-type-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; align-items: center; }
+.cubepc-type-input { flex: 1; min-width: 120px; padding: 6px 8px; }
+.cubepc-control-state { font-size: 12px; color: #555; }
+.cubepc-controls[hidden], .cubepc-keys[hidden], .cubepc-type-row[hidden] { display: none; }
+.pc-live-screen { width: 100%; border: 1px solid #ccc; background: #111; border-radius: 6px; margin-top: 8px; touch-action: manipulation; cursor: pointer; }
+.pc-live-controls, .pc-live-keys { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; align-items: center; }
+.pc-live-controls[hidden], .pc-live-keys[hidden] { display: none; }
+.pc-live-btn { border: 1px solid #bbb; border-radius: 999px; background: #f6f6f6; padding: 4px 10px; cursor: pointer; font-size: 13px; }
+.pc-live-state { font-size: 12px; color: #555; }
+.pc-live-type-input { flex: 1; min-width: 120px; padding: 6px 8px; }
+
 /* ---- 健康相談（試作・cube_doctor.js） ---- */
 /* 高齢の利用者も想定し、基本の文字は大きめ。doctor-large でさらに拡大。 */
 .doctor-root { max-width: 760px; margin: 0 auto; font-size: 17px; line-height: 1.8; color: var(--text); }

@@ -3103,7 +3103,9 @@ function pcResultNote(result) {
 
 /**
  * PC操作を橋渡しへ依頼し、SSE で経過を受けながら完了を待つ。
- * onProgress({type:"step"|"verification", ...}) を随時呼ぶ。
+ * onProgress({type:"started"|"step"|"screenshot"|"control"|"verification", ...})
+ * を随時呼ぶ。screenshot はライブ画面（step:"live"）を含む画面更新、
+ * control は操作モード（AI／ユーザー乗っ取り）の確定通知。
  * 戻り値：
  *   {kind:"finished", result}    橋渡しが決めた最終結果
  *   {kind:"unsupported", detail} 橋渡しが受け付けなかった（422）
@@ -3134,6 +3136,9 @@ async function executePcTask(question, onProgress) {
   }
   if (!res.ok || !data.taskId) return { kind: "unreachable" };
   const taskId = data.taskId;
+  if (onProgress) {
+    try { onProgress({ type: "started", taskId }); } catch { /* noop */ }
+  }
   return await new Promise((resolve) => {
     let settled = false;
     let es = null;
@@ -3152,6 +3157,16 @@ async function executePcTask(question, onProgress) {
     es.addEventListener("step", (ev) => {
       try {
         if (onProgress) onProgress({ type: "step", ...JSON.parse(ev.data) });
+      } catch { /* noop */ }
+    });
+    es.addEventListener("screenshot", (ev) => {
+      try {
+        if (onProgress) onProgress({ type: "screenshot", ...JSON.parse(ev.data) });
+      } catch { /* noop */ }
+    });
+    es.addEventListener("control", (ev) => {
+      try {
+        if (onProgress) onProgress({ type: "control", ...JSON.parse(ev.data) });
       } catch { /* noop */ }
     });
     es.addEventListener("verification", (ev) => {
@@ -11580,7 +11595,11 @@ const App = {
 
   /* ---- PC操作レーンの実行と表示 ----
      進行中は履歴に残らない仮メッセージでステップを見せ、完了後に
-     最終結果を通常の回答として出す（履歴に残るのは結果だけ）。 */
+     最終結果を通常の回答として出す（履歴に残るのは結果だけ）。
+     進行中はライブ画面（仮想PCのスクリーンショット）も流し続け、
+     画面タップや「自分で操作する」で AI を止めてユーザーが直接
+     操作できる（乗っ取り）。操作モードの正本はサーバーの
+     control イベントで、手入力は mode:"user" の間だけ通る。 */
   async runPcLane(question) {
     el("empty-state").hidden = true;
     const li = document.createElement("li");
@@ -11597,6 +11616,124 @@ const App = {
     n.className = "note";
     n.textContent = "開始しています…";
     li.appendChild(n);
+
+    /* ---- ライブ画面と乗っ取りコントロール ---- */
+    const liveImg = document.createElement("img");
+    liveImg.className = "pc-live-screen";
+    liveImg.alt = "仮想PCの画面（ライブ）";
+    liveImg.hidden = true;
+    li.appendChild(liveImg);
+    const live = { taskId: null, mode: "ai", busy: false };
+    const canInput = typeof CubePc !== "undefined" &&
+      typeof CubePc.postInput === "function" &&
+      typeof CubePc.toScreenCoords === "function";
+    const controls = document.createElement("div");
+    controls.className = "pc-live-controls";
+    controls.hidden = true;
+    const takeoverBtn = document.createElement("button");
+    takeoverBtn.type = "button";
+    takeoverBtn.className = "pc-live-btn";
+    takeoverBtn.textContent = "操作する";
+    const releaseBtn = document.createElement("button");
+    releaseBtn.type = "button";
+    releaseBtn.className = "pc-live-btn";
+    releaseBtn.textContent = "AIに戻す";
+    releaseBtn.hidden = true;
+    const liveState = document.createElement("span");
+    liveState.className = "pc-live-state";
+    controls.appendChild(takeoverBtn);
+    controls.appendChild(releaseBtn);
+    controls.appendChild(liveState);
+    li.appendChild(controls);
+    const keyRow = document.createElement("div");
+    keyRow.className = "pc-live-keys";
+    keyRow.hidden = true;
+    const KEY_BUTTONS = [
+      ["Enter", "Return"], ["Backspace", "BackSpace"], ["Tab", "Tab"],
+      ["Esc", "Escape"], ["↑", "Up"], ["↓", "Down"], ["←", "Left"],
+      ["→", "Right"], ["Space", "space"],
+    ];
+    const typeRow = document.createElement("div");
+    typeRow.className = "pc-live-keys";
+    typeRow.hidden = true;
+    const typeInput = document.createElement("input");
+    typeInput.type = "text";
+    typeInput.className = "pc-live-type-input";
+    typeInput.placeholder = "入力する文字";
+    const typeBtn = document.createElement("button");
+    typeBtn.type = "button";
+    typeBtn.className = "pc-live-btn";
+    typeBtn.textContent = "入力する";
+    typeRow.appendChild(typeInput);
+    typeRow.appendChild(typeBtn);
+    li.appendChild(keyRow);
+    li.appendChild(typeRow);
+
+    const updateLiveUi = () => {
+      takeoverBtn.hidden = live.mode === "user";
+      releaseBtn.hidden = live.mode !== "user";
+      keyRow.hidden = live.mode !== "user";
+      typeRow.hidden = live.mode !== "user";
+      liveState.textContent = live.mode === "user"
+        ? "あなたが操作中です（AIは止まっています）。画面をタップするとクリックできます。"
+        : live.busy
+          ? "AIを止めています…"
+          : "AIが操作中です。自分で操作したいときは「操作する」を押してください。";
+    };
+    const sendInput = async (cmd) => {
+      if (!live.taskId || !canInput) return;
+      try {
+        const r = await CubePc.postInput(
+          CUBE_SERVER_BASE_URL, live.taskId, cmd);
+        if (!r.ok) {
+          liveState.textContent =
+            (r.data && r.data.detail) || "入力を受け付けられませんでした。";
+        }
+      } catch {
+        liveState.textContent = "サーバーに接続できませんでした。";
+      }
+    };
+    takeoverBtn.addEventListener("click", () => {
+      if (live.mode === "user" || live.busy) return;
+      live.busy = true;
+      updateLiveUi();
+      void sendInput({ type: "takeover" });
+      const t = setTimeout(() => {
+        if (live.mode !== "user") { live.busy = false; updateLiveUi(); }
+      }, 10000);
+      if (t && typeof t.unref === "function") t.unref();
+    });
+    releaseBtn.addEventListener("click", () => {
+      void sendInput({ type: "release" });
+    });
+    for (const [label, key] of KEY_BUTTONS) {
+      const kb = document.createElement("button");
+      kb.type = "button";
+      kb.className = "pc-live-btn";
+      kb.textContent = label;
+      kb.addEventListener("click", () => { void sendInput({ type: "key", key }); });
+      keyRow.appendChild(kb);
+    }
+    typeBtn.addEventListener("click", () => {
+      const text = typeInput.value;
+      if (text) {
+        void sendInput({ type: "type", text });
+        typeInput.value = "";
+      }
+    });
+    liveImg.addEventListener("click", (ev) => {
+      if (!live.taskId || !canInput) return;
+      if (!ev || typeof ev.clientX !== "number") return;
+      const rect = typeof liveImg.getBoundingClientRect === "function"
+        ? liveImg.getBoundingClientRect() : null;
+      const pt = CubePc.toScreenCoords(rect, ev.clientX, ev.clientY);
+      if (!pt) return;
+      if (live.mode === "user") {
+        void sendInput({ type: "click", x: pt.x, y: pt.y });
+      }
+      // AI操作中のタップは何もしない（乗っ取りは「操作する」
+      // ボタンからだけ。誤タップで AI を止めないため）
+    });
     el("msg-list").appendChild(li);
     this.scrollChat();
 
@@ -11610,6 +11747,23 @@ const App = {
           ? `ステップ${ev.step}：${labels[labels.length - 1]}`
           : `ステップ${ev.step} を実行中…`;
         this.scrollChat();
+      } else if (ev.type === "started") {
+        live.taskId = ev.taskId;
+        if (canInput) {
+          controls.hidden = false;
+          updateLiveUi();
+        }
+      } else if (ev.type === "screenshot") {
+        liveImg.hidden = false;
+        liveImg.src = `${CUBE_SERVER_BASE_URL}${ev.url}` +
+          (ev.step === "live" ? `?t=${Date.now()}` : "");
+        this.scrollChat();
+      } else if (ev.type === "control") {
+        if (ev.mode === "user" || ev.mode === "ai") {
+          live.mode = ev.mode;
+          live.busy = false;
+          updateLiveUi();
+        }
       } else if (ev.type === "verification" && ev.phase === "done_reject") {
         n.textContent = "確認：まだ完了していないため差し戻しました";
         this.scrollChat();
