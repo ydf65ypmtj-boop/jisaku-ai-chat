@@ -35,6 +35,11 @@
  *   文面はサーバー側で Ultra が作り（PC専門モデルは作文しない）、
  *   仮想PCに .txt で保存される。生成文は結果に表示される。
  *   お題が読み取れないときは聞き返しの文面を出す。
+ * - プログラミング（2026-11-20 追加）：作るプログラムの内容だけを
+ *   渡すと、コードはサーバー側で Ultra が作り（PC専門モデルは
+ *   コーディングしない）、仮想PCの専用フォルダに保存して実行され、
+ *   コードと実行結果が結果に表示される。対応は Python のみ。
+ *   内容が読み取れないときは聞き返しの文面を出す。
  *
  * 使い方（ブラウザ）：
  *   <script src="cube_pc.js"></script>
@@ -55,6 +60,7 @@
     { id: "browser_search", label: "ブラウザで検索", example: "『富士山の高さ』を検索して" },
     { id: "editor_save", label: "メモ帳に入力して保存", example: "メモ帳に『会議は午後3時からです』と書いて memo.txt に保存して" },
     { id: "doc_compose", label: "お題だけで文書作成", example: "『地域の祭り』についての文書を作って" },
+    { id: "code_run", label: "プログラム作成・実行", example: "『1から100までの合計を計算する』プログラムを作って" },
     { id: "editor_input", label: "メモ帳に入力", example: "メモ帳に『今日は良い天気です』と入力して" },
     { id: "folder_create", label: "フォルダ作成", example: "『shiryo-2026』フォルダを作って" },
     { id: "terminal", label: "端末でコマンド実行", example: "端末で echo OK123 を実行して" },
@@ -149,6 +155,26 @@
     return topic;
   }
 
+  /* プログラムの仕様（サーバー extractCodeSpec の軽量ミラー）。
+     取れなければ null。他言語の明示は "other" を返す。 */
+  function codeSpecPreview(t) {
+    if (!/Python|パイソン/i.test(t) &&
+        /JavaScript|ジャバスクリプト|TypeScript|Java(?!Script)|C\+\+|C#|Ruby|ルビー|PHP|Go言語|Rust|Swift|Kotlin|Perl/i.test(t)) {
+      return "other";
+    }
+    const q = t.match(/[『「]([^』」]+)[』」]/);
+    if (q) return q[1].trim() || null;
+    let s = t.replace(/^(仮想PCで|PCで|パソコンで|Cubeに|プログラムで)\s*/, "");
+    s = s.replace(/(の)?(プログラム|コード|スクリプト)(を)?(作って|書いて|作成して|作る|書く|つくって|作成|作製).*$/, "");
+    s = s.replace(/(プログラム|コード|スクリプト)(で|を)?\s*$/, "");
+    s = s.replace(/^(Pythonで|パイソンで)\s*/i, "");
+    s = s.replace(/(ください|お願いします)。?\s*$/, "");
+    s = s.trim();
+    if (!s || s.length > 200) return null;
+    if (/^(プログラム|コード|スクリプト)$/.test(s)) return null;
+    return s;
+  }
+
   /*
    * 入力時の先行判定（サーバーの classifyTask の軽量ミラー）。
    * あくまで即時フィードバック用で、最終判定はサーバーが行う。
@@ -180,6 +206,18 @@
       return { supported: true, category: "form_send" };
     }
     if (/フォルダ/.test(t) && /(作|作成|つく)/.test(t)) return { supported: true, category: "folder_create" };
+    if (/(プログラム|コード|スクリプト)/.test(t) && /(作っ|書い|作成|作る|書く|つくっ)/.test(t) &&
+        !(/メモ帳|Mousepad|エディタ/i.test(t) && /保存/.test(t) && /[A-Za-z0-9_.\-]+\.(?:txt|md)/.test(t))) {
+      if (/作り方|とは|使い方|やり方|方法/.test(t)) {
+        return { supported: false, reason: "out_of_scope", detail: "プログラムの作り方の説明は扱いません。作って実行してほしいプログラムの内容を指定してください（例：『1から100までの合計を計算する』プログラムを作って）。" };
+      }
+      const spec = codeSpecPreview(t);
+      if (spec === "other") {
+        return { supported: false, reason: "unsupported_lang", detail: "プログラムの作成・実行は今は Python だけ対応しています。Python でよければ、作るプログラムの内容を指定してください。" };
+      }
+      if (spec) return { supported: true, category: "code_run" };
+      return { supported: false, reason: "need_detail", detail: "作るプログラムの内容を指定してください（例：『1から100までの合計を計算する』プログラムを作って）。プログラムはUltraが書き、仮想PCに保存して実行し、結果を表示します。" };
+    }
     if (/(文書|レポート|文章)/.test(t) && /(作っ|作成|書い|作る|書く|つくっ)/.test(t)) {
       if (docTopicPreview(t)) return { supported: true, category: "doc_compose" };
       return { supported: false, reason: "need_detail", detail: "お題を指定してください（例：『地域の祭り』についての文書を作って）。文書はUltraが書き、仮想PCに保存します。" };
@@ -759,7 +797,8 @@
 
   const api = {
     createPanel, classifyPreview, actionLabel, CATEGORIES,
-    toScreenCoords, postInput, deleteNamePreview, SCREEN_W, SCREEN_H,
+    toScreenCoords, postInput, deleteNamePreview, codeSpecPreview,
+    SCREEN_W, SCREEN_H,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   global.CubePc = api;
