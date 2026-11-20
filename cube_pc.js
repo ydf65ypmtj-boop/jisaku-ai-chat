@@ -40,6 +40,12 @@
  *   コーディングしない）、仮想PCの専用フォルダに保存して実行され、
  *   コードと実行結果が結果に表示される。対応は Python のみ。
  *   内容が読み取れないときは聞き返しの文面を出す。
+ * - 軽いWebアプリ（2026-11-20 追加）：作るアプリの内容だけを渡すと、
+ *   HTML・CSS・JavaScript を1ファイルに収めた軽いアプリをサーバー
+ *   側で Ultra が作り（PC専門モデルはコーディングしない）、仮想PC
+ *   の専用フォルダに保存してブラウザで開き、表示を確認する。
+ *   サーバーが要るアプリは対象外と正直に返す。内容が読み取れない
+ *   ときは聞き返しの文面を出す。
  *
  * 使い方（ブラウザ）：
  *   <script src="cube_pc.js"></script>
@@ -61,6 +67,7 @@
     { id: "editor_save", label: "メモ帳に入力して保存", example: "メモ帳に『会議は午後3時からです』と書いて memo.txt に保存して" },
     { id: "doc_compose", label: "お題だけで文書作成", example: "『地域の祭り』についての文書を作って" },
     { id: "code_run", label: "プログラム作成・実行", example: "『1から100までの合計を計算する』プログラムを作って" },
+    { id: "web_app", label: "軽いWebアプリ作成", example: "『クリックカウンター』のWebアプリを作って" },
     { id: "editor_input", label: "メモ帳に入力", example: "メモ帳に『今日は良い天気です』と入力して" },
     { id: "folder_create", label: "フォルダ作成", example: "『shiryo-2026』フォルダを作って" },
     { id: "terminal", label: "端末でコマンド実行", example: "端末で echo OK123 を実行して" },
@@ -175,6 +182,26 @@
     return s;
   }
 
+  /* Webアプリの仕様（サーバー extractWebAppSpec の軽量ミラー）。
+     取れなければ null。サーバーが要るアプリは "server" を返す。 */
+  function webAppSpecPreview(t) {
+    if (/サーバー|データベース|オンライン対戦|オンライン共有|掲示板|会員登録|決済|課金/.test(t)) {
+      return "server";
+    }
+    const q = t.match(/[『「]([^』」]+)[』」]/);
+    if (q) return q[1].trim() || null;
+    let s = t.replace(/^(仮想PCで|PCで|パソコンで|Cubeに)\s*/, "");
+    s = s.replace(/^(軽い)?(Webアプリ|ウェブアプリ|Webページ|ウェブページ)(で|として)\s*/, "");
+    s = s.replace(/(の)?(軽い)?(Webアプリ|ウェブアプリ|Webページ|ウェブページ|ブラウザアプリ|ホームページ|アプリ|ページ)(を)?(作って|書いて|作成して|作る|書く|つくって|作成|作製).*$/, "");
+    s = s.replace(/(Webアプリ|ウェブアプリ|アプリ)(で|を)?\s*$/, "");
+    s = s.replace(/(を)?(作って|書いて|作成して|つくって)(ください)?。?\s*$/, "");
+    s = s.replace(/(ください|お願いします)。?\s*$/, "");
+    s = s.trim();
+    if (!s || s.length > 200) return null;
+    if (/^(Webアプリ|ウェブアプリ|アプリ|ページ)$/i.test(s)) return null;
+    return s;
+  }
+
   /*
    * 入力時の先行判定（サーバーの classifyTask の軽量ミラー）。
    * あくまで即時フィードバック用で、最終判定はサーバーが行う。
@@ -206,6 +233,18 @@
       return { supported: true, category: "form_send" };
     }
     if (/フォルダ/.test(t) && /(作|作成|つく)/.test(t)) return { supported: true, category: "folder_create" };
+    if (/(Webアプリ|ウェブアプリ|Webページ|ウェブページ|ブラウザアプリ|ホームページ)/i.test(t) && /(作っ|作成|書い|作る|書く|つくっ)/.test(t) &&
+        !(/(文書|レポート|文章)/.test(t) && !/(Webアプリ|ウェブアプリ)(を)?(作っ|作成|つくっ)/.test(t))) {
+      if (/作り方|とは|使い方|やり方|方法/.test(t)) {
+        return { supported: false, reason: "out_of_scope", detail: "Webアプリの作り方の説明は扱いません。作ってほしい軽いWebアプリの内容を指定してください（例：『クリックカウンター』のWebアプリを作って）。" };
+      }
+      const wspec = webAppSpecPreview(t);
+      if (wspec === "server") {
+        return { supported: false, reason: "needs_server", detail: "サーバーやデータベースが要るアプリは今は作れません。作れるのは、ブラウザだけで動く軽いWebアプリ（HTML・CSS・JavaScript を1ファイルに収めたもの）だけです。" };
+      }
+      if (wspec) return { supported: true, category: "web_app" };
+      return { supported: false, reason: "need_detail", detail: "作るWebアプリの内容を指定してください（例：『クリックカウンター』のWebアプリを作って）。アプリはUltraが書き、仮想PCに保存してブラウザで開き、表示を確認します。" };
+    }
     if (/(プログラム|コード|スクリプト)/.test(t) && /(作っ|書い|作成|作る|書く|つくっ)/.test(t) &&
         !(/メモ帳|Mousepad|エディタ/i.test(t) && /保存/.test(t) && /[A-Za-z0-9_.\-]+\.(?:txt|md)/.test(t))) {
       if (/作り方|とは|使い方|やり方|方法/.test(t)) {
@@ -798,6 +837,7 @@
   const api = {
     createPanel, classifyPreview, actionLabel, CATEGORIES,
     toScreenCoords, postInput, deleteNamePreview, codeSpecPreview,
+    webAppSpecPreview,
     SCREEN_W, SCREEN_H,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
