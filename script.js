@@ -4430,6 +4430,7 @@ const STATION_TIMEOUT_MS = 20000;
 const HOLIDAY_TIMEOUT_MS = 15000;
 const MARKET_TIMEOUT_MS = 15000;
 const MUSIC_TIMEOUT_MS = 15000;
+const PAPERS_TIMEOUT_MS = 30000;
 
 /* ISO 日時を JST の「M月D日 HH:MM」に整える（取得・発表時刻の表示用）。 */
 function jstDateTimeLabel(iso) {
@@ -5121,6 +5122,138 @@ function musicCardOf(r) {
     link: r.trackUrl,
     preview: r.previewUrl,
     artwork: r.artwork,
+  };
+}
+
+/* ---- 論文検索レーン（cube-server の /papers） ---- */
+/* 発動条件の正本はサーバー側 papers_endpoint.js の matchPapersLane。
+   ここはその移植で、学術意図が明示的な質問だけを拾う。誤爆ガード
+   （自由研究・小論文・研究所などの施設名・場所の質問）もサーバー
+   と同一。検索語の抽出もサーバー側で行われるが、表示文のために
+   ページ側でも同じ抽出を行う。結果は変わる情報なので知識メモ帳
+   には保存しない（他のデータレーンと同じ）。 */
+
+/* 質問文からフィラーを除いて検索語を作る（サーバー側と同一）。 */
+const PAPERS_FILLER_PATTERNS = [
+  /に関する(論文|研究|学術論文)/g,
+  /(の|に)(関する|ついての?)/g,
+  /(論文|研究|学術論文)を?(探して|検索して|教えて|知りたい|見せて|紹介して|ありますか|ある\?|ある？)/g,
+  /(論文|研究)(を|が|は|も|に)/g,
+  /(について|とは|って何|の動向|の最先端|の成果|のテーマ|の分野)/g,
+  /\b(recent\s+)?(papers?|research|studies|literature)\s+(on|about|regarding)\b/gi,
+  /\b(research\s+)?papers?\b/gi,
+  /\barxiv\b/gi,
+  /(教えて|知りたい|探して|検索して|紹介して|見せて|ありますか|あります|ください)/g,
+  /[？?！!。、\s]+/g,
+];
+
+function extractPapersTerms(text) {
+  let t = String(text || "");
+  for (const re of PAPERS_FILLER_PATTERNS) t = t.replace(re, " ");
+  /* 汎用の学術語は意図の印であって検索語ではない。 */
+  t = t.replace(/学術論文|論文|研究|査読付き|査読/g, " ");
+  t = t.replace(/の?\s*(動向|成果|最先端)/g, " ");
+  const tokens = t.split(/\s+/).map((tok) =>
+    tok.replace(/^[をがはのにでへとも、。]+/, "")
+      .replace(/[をがはのにでへとも、。]+$/, ""),
+  ).filter(Boolean);
+  return tokens.join(" ").slice(0, 120);
+}
+
+/**
+ * 論文を探す質問かどうか。学術意図が明示的なときだけ発火し、
+ * { query（元の質問）, terms（抽出した検索語） } を返す。
+ */
+function parsePapersQuery(question) {
+  const raw = String(question || "").trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+
+  /* --- 誤爆ガード（サーバー側 matchPapersLane と同一） --- */
+  const hasStrong = /論文|arxiv|学術|査読/i.test(raw);
+  if (/自由研究/.test(raw) && !hasStrong) return null;
+  if (/小論文/.test(raw) && !/学術|査読|arxiv/i.test(raw)) return null;
+  if (/(研究所|研究室|研究会)/.test(raw) && !hasStrong) return null;
+  if (/(はどこ|への行き方|までの道|の場所|の住所)/.test(raw) && !hasStrong) {
+    return null;
+  }
+
+  /* --- 発火条件 --- */
+  let fire = false;
+  if (/論文/.test(raw) && !/小論文/.test(raw)) fire = true;
+  if (/\barxiv\b/i.test(raw)) fire = true;
+  if (/学術/.test(raw)) fire = true;
+  if (/査読/.test(raw)) fire = true;
+  if (/研究/.test(raw) &&
+      /(に関する研究|の研究|研究(を|が|は|も|の)|研究されている|研究が進)/.test(raw)) {
+    fire = true;
+  }
+  if (/\b(papers?\s+(on|about)|research\s+paper|studies\s+on|research\s+on|scientific\s+literature)\b/i.test(lower)) {
+    fire = true;
+  }
+  if (!fire) return null;
+  return { query: raw, terms: extractPapersTerms(raw) };
+}
+
+/* /papers に投げ、検証済みの形に整えて返す。 */
+async function fetchPapers(query) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/papers`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      },
+      PAPERS_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  const results = [];
+  for (const r of Array.isArray(data.results) ? data.results : []) {
+    if (!r || typeof r.title !== "string" || !r.title) continue;
+    results.push({
+      title: r.title,
+      authors: (Array.isArray(r.authors) ? r.authors : [])
+        .filter((a) => typeof a === "string" && a),
+      year: typeof r.year === "number" || typeof r.year === "string"
+        ? r.year : "",
+      summary: typeof r.summary === "string" ? r.summary : "",
+      url: httpUrlOrEmpty(typeof r.url === "string" ? r.url : ""),
+      source: typeof r.source === "string" ? r.source : "",
+    });
+  }
+  if (!results.length) return null;
+  return {
+    ok: true,
+    results,
+    source: typeof data.source === "string" ? data.source : "",
+    attribution:
+      typeof data.attribution === "string" ? data.attribution : "",
+    fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+  };
+}
+
+/* 論文1件を表示用カードにする。 */
+function paperCardOf(r) {
+  return {
+    kind: "paper",
+    title: r.title,
+    authors: r.authors.join("、"),
+    year: r.year,
+    summary: r.summary,
+    link: r.url,
+    source: r.source,
   };
 }
 
@@ -12721,6 +12854,10 @@ const BADGES = {
     label: "音楽の検索結果（iTunes）",
     className: "badge-music",
   },
+  papers: {
+    label: "論文の検索結果（arXiv / Semantic Scholar）",
+    className: "badge-papers",
+  },
   gmail: {
     label: "Gmail（Google連携で実行）",
     className: "badge-gmail",
@@ -14067,6 +14204,43 @@ const App = {
     return true;
   },
 
+  /* ---- 論文検索レーンの実行と表示 ---- */
+  async runPapersLane(parsed) {
+    this.setPhase("searching");
+    const data = await fetchPapers(parsed.query);
+    this.setPhase("idle");
+    if (!data) return false;
+    const topic = parsed.terms || parsed.query;
+    if (!data.ok) {
+      if (data.error === "not_found") {
+        this.pushAssistant({
+          text: `「${topic}」に関する論文は見つかりませんでした。`,
+          badge: "papers",
+          note: "キーワードを変えると見つかることがあります（英語のキーワードだと見つかりやすいです）。",
+        });
+      } else {
+        this.pushAssistant({
+          text: "論文情報を取得できませんでした。",
+          badge: "papers",
+          note: "時間をおいてもう一度試してください。",
+        });
+      }
+      return true;
+    }
+    let note = `出典：${data.source || "arXiv / Semantic Scholar"}。`;
+    if (data.attribution) note += `${data.attribution} `;
+    if (data.fetchedAt) {
+      note += `（${jstDateTimeLabel(data.fetchedAt)}取得）`;
+    }
+    this.pushAssistant({
+      text: `「${topic}」に関する論文を${data.results.length}件見つけました。`,
+      badge: "papers",
+      cards: data.results.map(paperCardOf),
+      note,
+    });
+    return true;
+  },
+
   /* ---- Google連携レーンの実行と表示 ----
      本人の決定どおり全自動で実行する。送信・作成・変更・削除の
      前に確認は挟まない。失敗・未連携・未ログインは、この中で
@@ -14969,6 +15143,8 @@ const App = {
         wrap.appendChild(this.buildStationCard(card));
       } else if (card.kind === "music") {
         wrap.appendChild(this.buildMusicCard(card));
+      } else if (card.kind === "paper") {
+        wrap.appendChild(this.buildPaperCard(card));
       } else if (card.kind === "shop") {
         wrap.appendChild(this.buildShopCard(card));
       } else if (card.kind === "suggest") {
@@ -15122,6 +15298,43 @@ const App = {
       img.alt = "";
       img.loading = "lazy";
       div.appendChild(img);
+    }
+    return div;
+  },
+
+  /* 論文カード。タイトルが論文ページへのリンクになり、著者・
+     年・出典・抄録の抜粋は API の値の転記だけ（文章は作らない）。 */
+  buildPaperCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    if (card.link) {
+      const a = document.createElement("a");
+      a.href = card.link;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = card.title;
+      title.appendChild(a);
+    } else {
+      title.textContent = card.title;
+    }
+    div.appendChild(title);
+    const meta = [];
+    if (card.authors) meta.push(card.authors);
+    if (card.year) meta.push(String(card.year));
+    if (card.source) meta.push(card.source);
+    if (meta.length) {
+      const m = document.createElement("p");
+      m.className = "lane-card-meta";
+      m.textContent = meta.join(" / ");
+      div.appendChild(m);
+    }
+    if (card.summary) {
+      const s = document.createElement("p");
+      s.className = "lane-card-meta";
+      s.textContent = card.summary;
+      div.appendChild(s);
     }
     return div;
   },
@@ -16972,6 +17185,16 @@ const App = {
       if (handled) return;
     }
 
+    // 論文検索：arXiv / Semantic Scholar の実データで答える。
+    // 学術意図が明示的な質問だけが発火する（発動条件の正本は
+    // サーバー側の matchPapersLane）。サーバーに届かない場合
+    // だけ従来の手順に倒れる。
+    const papersParsed = parsePapersQuery(question);
+    if (papersParsed) {
+      const handled = await this.runPapersLane(papersParsed);
+      if (handled) return;
+    }
+
     // 2.5) 時間制メーターの関門：サーバー側モデル（Twin / Pro /
     // Max / Ultra）が選択され、接続済みで、残量が0なら、生成も
     // 検索照合も始めずに穏やかに止める。端末内モデルへの案内と、
@@ -17722,6 +17945,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseHolidayQuery, fetchHoliday, holidayAnswerText,
     parseMarketQuery, fetchMarket, marketFxText, marketStockText,
     parseMusicQuery, fetchMusic, musicCardOf,
+    parsePapersQuery, fetchPapers, paperCardOf,
     fetchGoogleStatus, startGoogleLink, unlinkGoogle,
     parseGmailSendQuery, mergeGmailDraft, gmailSendAskBackText,
     parseGmailReadQuery, sendGmail, fetchGmailList, fetchGmailMessage,
