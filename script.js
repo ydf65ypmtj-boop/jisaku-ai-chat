@@ -1856,6 +1856,106 @@ function disposeUltra() {
   UltraImacModel.dispose();
 }
 
+/* ================================================================== */
+/* Ultra 画像質問（添付画像）                                           */
+/*                                                                    */
+/* 画像を見られるのは Ultra（Qwen2.5-VL）だけ。ページで選んだ画像は   */
+/* 長辺1024pxまでに縮小して JPEG の data URI にし、送信まではこの     */
+/* 変数の中だけに保持する。送信時は cube-server の /ultra/image       */
+/* レーンを通し、サーバー側で検証してから llama-server（8082）へ      */
+/* image_url として転送する。画像はサーバーに保存されない。生成条件・ */
+/* システムプロンプトはテキスト経路（UltraImacModel）と同一にそろえ、 */
+/* 時間制メーターの扱いもテキストの Ultra 生成と同じにする。          */
+/* ================================================================== */
+
+let pendingChatImage = null;
+
+const ULTRA_IMAGE_GENERATE_TIMEOUT_MS = 300000;
+
+const UltraImageModel = {
+  async generate(question, imageDataUrl, historyMessages) {
+    let res;
+    try {
+      res = await fetchWithTimeout(
+        `${CUBE_SERVER_BASE_URL}/ultra/image`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            system: ULTRA_SYSTEM_PROMPT + cubeMemorySystemSuffix,
+            history: Array.isArray(historyMessages) ? historyMessages : [],
+            question,
+            image: imageDataUrl,
+            max_tokens: ULTRA_MAX_NEW_TOKENS,
+          }),
+        },
+        ULTRA_IMAGE_GENERATE_TIMEOUT_MS,
+      );
+    } catch {
+      throw new Error(CUBE_SERVER_UNREACHABLE);
+    }
+    const data = res ? await res.json().catch(() => null) : null;
+    if (!res || !res.ok || !data || typeof data.text !== "string") {
+      const detail = data && typeof data.error === "string" ? data.error : "";
+      throw new Error(
+        detail ? `${CUBE_SERVER_UNREACHABLE}（サーバーの応答: ${detail}）` : CUBE_SERVER_UNREACHABLE,
+      );
+    }
+    return data.text.trim();
+  },
+};
+
+/* Ultra の画像生成：テキスト生成と同じく時間制メーターの対象
+   （残量0なら生成を始めず、専用の例外で止める）。 */
+async function generateUltraImage(question, imageDataUrl, historyMessages) {
+  const meter = getCubeMeter();
+  if (meter) {
+    if (!meter.canUse()) throw meterEmptyError();
+    return meter.consumeAround(
+      () => UltraImageModel.generate(question, imageDataUrl, historyMessages));
+  }
+  return UltraImageModel.generate(question, imageDataUrl, historyMessages);
+}
+
+/* 添付用に選ばれた画像ファイルを、長辺1024pxまでの JPEG data URI に
+   変換する。透過は白で埋める。読み込めない形式（壊れたファイル等）
+   は例外にして、呼び出し側が正直な文面で知らせる。 */
+function fileToResizedJpegDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const MAX_EDGE = 1024;
+        const scale = Math.min(1, MAX_EDGE / Math.max(img.naturalWidth, img.naturalHeight));
+        const w = Math.max(1, Math.round(img.naturalWidth * scale));
+        const h = Math.max(1, Math.round(img.naturalHeight * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.88);
+        if (!dataUrl || !dataUrl.startsWith("data:image/jpeg")) {
+          throw new Error("convert failed");
+        }
+        resolve(dataUrl);
+      } catch (e) {
+        URL.revokeObjectURL(url);
+        reject(e);
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("image load failed"));
+    };
+    img.src = url;
+  });
+}
+
 /* 選択中モデルの生成ディスパッチャ：Ultra は generateUltra、自作の
    サーバーモデル（Twin / Pro / Max）は iMac サーバーの ServerModel、
    それ以外（Nano / Flash）は端末内の LocalModel。LocalModel.generate
@@ -12633,6 +12733,10 @@ const BADGES = {
     label: "Cubeの答え（ネットで確認済み）",
     className: "badge-model",
   },
+  image: {
+    label: "画像を見た答え（Cube Ultra）",
+    className: "badge-model",
+  },
   net: { label: "ネット検索の答え", className: "badge-net" },
   unverified: {
     label: "Cubeの答え（ネットで確認できなかった）",
@@ -12743,6 +12847,23 @@ const App = {
       }
     });
     el("question-input").addEventListener("input", () => this.syncSend());
+    // 画像添付（Ultra 専用）：ボタンでファイル選択を開き、選ばれたら
+    // 縮小して保持する。取り消しボタンで添付を外す。
+    const attachBtn = el("attach-btn");
+    const imageFile = el("image-file");
+    if (attachBtn && imageFile) {
+      attachBtn.addEventListener("click", () => imageFile.click());
+      imageFile.addEventListener("change", () => {
+        const f = imageFile.files && imageFile.files[0];
+        imageFile.value = "";
+        if (f) void this.attachImageFile(f);
+      });
+      const attachRemove = el("attach-remove");
+      if (attachRemove) {
+        attachRemove.addEventListener("click", () => this.clearAttachedImage());
+      }
+    }
+    this.syncAttach();
     for (const btn of document.querySelectorAll(".suggestion-btn")) {
       btn.addEventListener("click", () => void this.ask(btn.dataset.q));
     }
@@ -12865,6 +12986,11 @@ const App = {
     el("base-url").value = this.baseUrl;
     el("current-url").textContent = this.baseUrl;
     this.renderModelSwitch();
+    // 画像の添付は Ultra 専用：モデルを離れたら添付を外す
+    // （他のモデルへ画像が黙って送られないように）。
+    if (id !== "ultra" && pendingChatImage) pendingChatImage = null;
+    this.syncAttach();
+    this.syncSend();
     // iMac で動かすモデル（Twin / Pro / Max / Ultra / 会話）は、
     // 選ばれた時点でそのまま接続する（待機表示で止めない）。端末内
     // モデルは従来どおり loadModel で読み込む。
@@ -13392,7 +13518,8 @@ const App = {
   },
 
   syncSend() {
-    el("send-btn").disabled = !el("question-input").value.trim() || this.phase !== "idle";
+    el("send-btn").disabled =
+      !(el("question-input").value.trim() || pendingChatImage) || this.phase !== "idle";
   },
 
   scrollChat() {
@@ -13400,12 +13527,19 @@ const App = {
     sc.scrollTo({ top: sc.scrollHeight, behavior: "smooth" });
   },
 
-  pushUser(text) {
+  pushUser(text, imageDataUrl) {
     el("empty-state").hidden = true;
     const li = document.createElement("li");
     li.className = "msg-user";
     const bubble = document.createElement("div");
     bubble.className = "bubble";
+    if (imageDataUrl) {
+      const img = document.createElement("img");
+      img.className = "bubble-img";
+      img.src = imageDataUrl;
+      img.alt = "添付した画像";
+      bubble.appendChild(img);
+    }
     const p = document.createElement("p");
     p.textContent = text;
     bubble.appendChild(p);
@@ -13413,6 +13547,99 @@ const App = {
     el("msg-list").appendChild(li);
     this.historyCaptureUser(text);
     this.scrollChat();
+  },
+
+  /* 画像添付（Ultra 専用）：選ばれたファイルを縮小して保持し、
+     プレビューを出す。読み込めない画像はプレビュー欄に理由を出す。 */
+  async attachImageFile(file) {
+    if (this.modelId !== "ultra") return;
+    try {
+      pendingChatImage = await fileToResizedJpegDataUrl(file);
+    } catch {
+      pendingChatImage = null;
+      this.syncAttach("その画像は読み込めませんでした。別の画像で試してください。");
+      this.syncSend();
+      return;
+    }
+    this.syncAttach();
+    this.syncSend();
+  },
+
+  clearAttachedImage() {
+    pendingChatImage = null;
+    this.syncAttach();
+    this.syncSend();
+  },
+
+  /* 添付ボタンとプレビューの表示を、選択中モデルと添付状態に合わせる。
+     画像を見られるのは Ultra だけなので、他のモデルではボタンを
+     無効化し、理由を title に出す。 */
+  syncAttach(errorNote) {
+    const btn = el("attach-btn");
+    if (btn) {
+      const isUltra = this.modelId === "ultra";
+      btn.disabled = !isUltra;
+      btn.title = isUltra
+        ? "画像を添付する（Cube Ultra が見ます）"
+        : "画像は Cube Ultra で見られます";
+    }
+    const box = el("attach-preview");
+    if (!box) return;
+    const note = el("attach-note");
+    const thumb = el("attach-thumb");
+    if (errorNote) {
+      box.hidden = false;
+      if (thumb) {
+        thumb.hidden = true;
+        thumb.removeAttribute("src");
+      }
+      if (note) note.textContent = errorNote;
+      return;
+    }
+    if (pendingChatImage) {
+      box.hidden = false;
+      if (thumb) {
+        thumb.hidden = false;
+        thumb.src = pendingChatImage;
+      }
+      if (note) note.textContent = "画像を添付しました（Cube Ultra が見ます）";
+    } else {
+      box.hidden = true;
+    }
+  },
+
+  /* 画像つき質問の実行と表示（Ultra 専用レーンで完結させる）。
+     画像の内容はネットの裏づけ検証の対象にならないため、通常の
+     質問経路（レーン振り分け・検証ゲート・知識メモ帳）には入れない。
+     どの失敗でも通常経路には倒さず、理由を注記に出す（YouTube
+     レーンと同じ作法）。 */
+  async askWithImage(question, imageDataUrl) {
+    this.setPhase("thinking");
+    let text = "";
+    let errorNote = "";
+    try {
+      text = await generateUltraImage(
+        question,
+        imageDataUrl,
+        this.historyMessagesForUltra(),
+      );
+    } catch (e) {
+      errorNote = e instanceof Error ? e.message : String(e);
+    }
+    this.setPhase("idle");
+    if (text) {
+      this.pushAssistant({
+        text,
+        badge: "image",
+        note: "添付された画像を Cube Ultra が見て答えています。画像はサーバーに保存されません。",
+      });
+    } else {
+      this.pushAssistant({
+        text: "画像を見て答えられませんでした。",
+        badge: "unknown",
+        note: errorNote || "生成に失敗しました。少し待ってからもう一度試してください。",
+      });
+    }
   },
 
   pushAssistant(msg) {
@@ -16209,7 +16436,23 @@ const App = {
      3) モデル生成 → 対象記事の事実で照合 */
   async ask(rawQuestion) {
     const question = (rawQuestion || "").trim();
-    if (!question || this.phase !== "idle") return;
+    if (this.phase !== "idle") return;
+    // 画像添付つきの送信（Ultra 専用）：画像の内容はネットの裏づけ
+    // 検証の対象にならないため、通常の質問経路には入れず、画像
+    // レーン（askWithImage）で完結させる。文章が空なら既定の
+    // 聞き方で送る。
+    if (pendingChatImage && this.modelId === "ultra") {
+      const image = pendingChatImage;
+      const q = question || "この画像について教えてください。";
+      this.pushUser(q, image);
+      pendingChatImage = null;
+      this.syncAttach();
+      el("question-input").value = "";
+      this.syncSend();
+      await this.askWithImage(q, image);
+      return;
+    }
+    if (!question) return;
     this.pushUser(question);
     el("question-input").value = "";
     this.syncSend();

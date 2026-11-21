@@ -6,6 +6,53 @@
     <meta name="color-scheme" content="light dark" />
     <title>Cube</title>
     <link rel="stylesheet" href="style.css" />
+    <style>
+      /* 画像添付（Ultra 専用）：style.css は触らず、追加分だけここに置く */
+      .attach-btn {
+        flex: none;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--text);
+        font: inherit;
+        font-size: 14px;
+        border-radius: 999px;
+        padding: 8px 14px;
+        cursor: pointer;
+      }
+      .attach-btn:disabled { opacity: 0.4; cursor: default; }
+      .attach-preview {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 4px 2px;
+      }
+      .attach-preview[hidden] { display: none; }
+      .attach-preview img {
+        width: 56px;
+        height: 56px;
+        object-fit: cover;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+      }
+      .attach-note { font-size: 13px; color: var(--dim); }
+      .attach-remove {
+        border: 0;
+        background: transparent;
+        color: var(--dim);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+        text-decoration: underline;
+        padding: 4px;
+      }
+      .bubble .bubble-img {
+        display: block;
+        max-width: 240px;
+        width: 100%;
+        border-radius: 14px;
+        margin-bottom: 6px;
+      }
+    </style>
   </head>
   <body>
     <div class="app">
@@ -322,8 +369,15 @@
                 <button type="button" class="model-switch-btn" data-model="ultra" aria-pressed="false">Ultra</button>
                 <button type="button" class="model-switch-btn" data-model="chat" aria-pressed="false">会話</button>
               </div>
+              <div id="attach-preview" class="attach-preview" hidden>
+                <img id="attach-thumb" alt="添付した画像" />
+                <span id="attach-note" class="attach-note">画像を添付しました（Cube Ultra が見ます）</span>
+                <button id="attach-remove" type="button" class="attach-remove">取り消し</button>
+              </div>
               <div class="composer-row">
                 <label class="sr-only" for="question-input">質問を入力</label>
+                <button id="attach-btn" type="button" class="attach-btn" title="画像は Cube Ultra で見られます">画像</button>
+                <input id="image-file" type="file" accept="image/*" hidden />
                 <textarea id="question-input" rows="1" placeholder="Cubeに質問する…"></textarea>
                 <button id="send-btn" type="submit" class="send-btn" disabled>送信</button>
               </div>
