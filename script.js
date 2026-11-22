@@ -2503,10 +2503,11 @@ function evalArithmetic(question) {
  *
  * Port notes (behavior on the probe set is byte-identical to Python):
  * - Python's eval() for the restricted expression grammar is replaced by
- *   a two-pass evaluator (no eval): * and / bind tighter than + and -,
- *   left-associative, exactly like Python. Division by zero -> null
- *   (Python raises -> None). A numeric token with a leading zero such as
- *   "007" -> null (Python eval raises SyntaxError on such literals).
+ *   a recursive-descent evaluator (no eval): * and / bind tighter than
+ *   + and -, left-associative, exactly like Python, with decimals and
+ *   parentheses supported. Division by zero -> null (Python raises ->
+ *   None). A numeric token with a leading zero such as "007" -> null
+ *   (Python eval raises SyntaxError on such literals).
  * - Python's \d is Unicode-aware; JS \d is ASCII-only. All patterns run
  *   on norm()ed text (full-width digits are translated to ASCII first),
  *   except solve_sub's payment regex, which Python applies to the raw
@@ -2602,42 +2603,64 @@ const CalcLane = (() => {
     return null;
   }
 
-  // Two-pass evaluator for ^\d+(op\d+)+$ with Python eval semantics.
+  // Recursive-descent evaluator for expressions with decimals and
+  // parentheses, with Python eval semantics: a numeric literal with a
+  // leading zero ("007") -> null, division by zero -> null. Non-integer
+  // results are rounded to 10 decimal places to hide float noise.
   function evalExpr(expr) {
-    const tokens = expr.match(/\d+|[+\-×÷*/]/g);
-    if (!tokens) return null;
-    const values = [];
-    const ops = [];
-    for (let i = 0; i < tokens.length; i++) {
-      if (i % 2 === 0) {
-        if (/^0\d/.test(tokens[i])) return null; // Python: SyntaxError
-        values.push(parseInt(tokens[i], 10));
-      } else {
-        ops.push(tokens[i]);
+    const tokens = expr.match(/\d+(?:\.\d+)?|\.\d+|[+\-×÷*/()]/g);
+    if (!tokens || tokens.join("") !== expr) return null;
+    let pos = 0;
+    function parseExpr() {
+      let v = parseTerm();
+      if (v === null) return null;
+      while (tokens[pos] === "+" || tokens[pos] === "-") {
+        const op = tokens[pos++];
+        const rhs = parseTerm();
+        if (rhs === null) return null;
+        v = op === "+" ? v + rhs : v - rhs;
       }
+      return v;
     }
-    // pass 1: × ÷ (and their ASCII forms * /)
-    const v2 = [values[0]];
-    const o2 = [];
-    for (let i = 0; i < ops.length; i++) {
-      const op = ops[i];
-      const rhs = values[i + 1];
-      if (op === "×" || op === "*") {
-        v2[v2.length - 1] = v2[v2.length - 1] * rhs;
-      } else if (op === "÷" || op === "/") {
-        if (rhs === 0) return null; // Python: ZeroDivisionError
-        v2[v2.length - 1] = v2[v2.length - 1] / rhs;
-      } else {
-        o2.push(op);
-        v2.push(rhs);
+    function parseTerm() {
+      let v = parseFactor();
+      if (v === null) return null;
+      while (tokens[pos] === "×" || tokens[pos] === "÷" ||
+             tokens[pos] === "*" || tokens[pos] === "/") {
+        const op = tokens[pos++];
+        const rhs = parseFactor();
+        if (rhs === null) return null;
+        if (op === "×" || op === "*") v = v * rhs;
+        else {
+          if (rhs === 0) return null; // Python: ZeroDivisionError
+          v = v / rhs;
+        }
       }
+      return v;
     }
-    // pass 2: + -
-    let val = v2[0];
-    for (let i = 0; i < o2.length; i++) {
-      val = o2[i] === "+" ? val + v2[i + 1] : val - v2[i + 1];
+    function parseFactor() {
+      const t = tokens[pos++];
+      if (t === undefined) return null;
+      if (t === "(") {
+        const v = parseExpr();
+        if (v === null || tokens[pos++] !== ")") return null;
+        return v;
+      }
+      if (t === "-") {
+        const v = parseFactor();
+        return v === null ? null : -v;
+      }
+      if (t === "+") return parseFactor();
+      if (/^0\d/.test(t)) return null; // Python: SyntaxError on "007"
+      const n = Number(t);
+      return Number.isFinite(n) ? n : null;
     }
-    return val;
+    const val = parseExpr();
+    if (val === null || pos !== tokens.length || !Number.isFinite(val)) {
+      return null;
+    }
+    if (Number.isInteger(val) || Math.abs(val) >= 1e15) return val;
+    return Math.round(val * 1e10) / 1e10;
   }
 
   function fmtVal(val) {
@@ -2647,14 +2670,24 @@ const CalcLane = (() => {
 
   function solveExpression(text) {
     const t = norm(text);
-    const m = /(\d+(?:[+\-×÷*/]\d+)+)/.exec(t);
-    if (!m) return null;
-    const expr = m[1];
-    const val = evalExpr(expr);
-    if (val === null || !Number.isFinite(val)) return null;
-    const shown = expr.replace(/\*/g, "×").replace(/\//g, "÷");
-    const v = Number.isInteger(val) ? Math.trunc(val) : val;
-    return { answer: v, steps: `${shown}${FEQ}${fmtVal(val)}`, kind: "expr", expr: shown };
+    // Maximal runs of expression characters. Decimals and parentheses
+    // belong to the run, so "12.5×4" and "(3+5)×7" are evaluated as
+    // written instead of being truncated to an integer sub-expression
+    // (the old integer-only pattern answered 20 and 8 for those).
+    const runs = t.match(/[0-9.+\-×÷*/()]+/g) || [];
+    for (const raw of runs) {
+      const expr = raw.replace(/^[+×÷*/.]+/, "").replace(/[+×÷*/.]+$/, "");
+      if (!expr) continue;
+      const operands = expr.match(/\d+(?:\.\d+)?|\.\d+/g) || [];
+      const operators = expr.match(/[+\-×÷*/]/g) || [];
+      if (operands.length < 2 || operators.length < 1) continue;
+      const val = evalExpr(expr);
+      if (val === null || !Number.isFinite(val)) continue;
+      const shown = expr.replace(/\*/g, "×").replace(/\//g, "÷");
+      const v = Number.isInteger(val) ? Math.trunc(val) : val;
+      return { answer: v, steps: `${shown}${FEQ}${fmtVal(val)}`, kind: "expr", expr: shown };
+    }
+    return null;
   }
 
   function solveSub(text) {
@@ -4432,6 +4465,7 @@ const MARKET_TIMEOUT_MS = 15000;
 const MUSIC_TIMEOUT_MS = 15000;
 const PAPERS_TIMEOUT_MS = 30000;
 const TRANSLATE_TIMEOUT_MS = 30000;
+const WOLFRAM_TIMEOUT_MS = 90000;
 
 /* ISO 日時を JST の「M月D日 HH:MM」に整える（取得・発表時刻の表示用）。 */
 function jstDateTimeLabel(iso) {
@@ -5489,6 +5523,177 @@ function translateCardOf(d) {
     translatedText: d.translatedText,
     sourceLang: d.sourceLang,
     targetLang: d.targetLang,
+  };
+}
+
+/* ---- Wolfram 計算レーン（cube-server の /calc-wolfram） ---- */
+/* 計算の主軸（2026-11-22 本人決定）。式・方程式・単位・割合・
+   累乗はサーバー側で決定的に Wolfram クエリへ変換し、文章題は
+   サーバー側で Ultra に変換だけさせてから Wolfram|Alpha に
+   計算させる。失敗・未設定・解釈不能のときは従来の計算レーン
+   （CalcLane / evalArithmetic）へフォールバックする。
+   規約上の注意：結果はキャッシュしない（メモ帳に保存しない）、
+   答えには Wolfram|Alpha の結果ページへのリンクを必ず出す、
+   AppID はサーバー側だけに置く（ページには置かない）。
+   発動条件の正本はサーバー側 matchCalcWolfram
+   （wolfram_endpoint.js）で、以下はその移植。変換そのものは
+   サーバーが行うため、ここでは発火の形だけを判定する。 */
+
+const WOLFRAM_UNIT_ALT =
+  "平方センチメートル|平方メートル|キロメートル|センチメートル|" +
+  "ミリメートル|メートル|キログラム|グラム|デシリットル|" +
+  "ミリリットル|リットル|ポンド|フィート|インチ|マイル|ヤード|" +
+  "時間|分|秒";
+const WOLFRAM_UNIT_RE = new RegExp(
+  `[\\d.]+\\s*(?:${WOLFRAM_UNIT_ALT})\\s*(?:は|を)\\s*` +
+  `(?:何|なん|いくつ)?\\s*(?:${WOLFRAM_UNIT_ALT})`);
+const WOLFRAM_WORD_KEYWORDS =
+  /(全部で|合計|合わせて|おつり|残り|差は|時速|速さ|平均|単価|割り勘|等分|分けると|分けた|配る|配ると|払い|払う|買うと|買った|値段|金額|いくら|いくつ|何個|何本|何枚|何人|何リットル|何メートル|何キロ|何グラム|何時間|何分|何冊|何台|何匹|何組|何箱|何円)/;
+
+/* サーバー側 normCalc と同じ正規化（全角→半角）。 */
+function wolframNormCalc(s) {
+  return String(s || "")
+    .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    .replace(/＋/g, "+")
+    .replace(/[－−]/g, "-")
+    .replace(/×/g, "*")
+    .replace(/÷/g, "/")
+    .replace(/＝/g, "=")
+    .replace(/％/g, "%")
+    .replace(/（/g, "(")
+    .replace(/）/g, ")")
+    .replace(/．/g, ".")
+    .replace(/＾/g, "^")
+    .replace(/　/g, " ");
+}
+
+/* サーバー側 buildWolframQuery が変換できる形かどうか
+   （方程式・単位・割合・累乗・式のいずれか）。 */
+function hasWolframDeterministicShape(t) {
+  // 方程式: "=" を含み、文字と数字の両方がある断片
+  const s = t.replace(/([a-zA-Z])の(\d+)乗/g, "$1^$2");
+  const segments = s.match(/[0-9a-zA-Z.+\-*/^()= ]+/g) || [];
+  for (const seg of segments) {
+    const e = seg.trim();
+    if (e.includes("=") && /[a-zA-Z]/.test(e) && /\d/.test(e)) return true;
+  }
+  // 単位: 温度
+  if (/(摂氏|華氏)\s*[\d.]+\s*度?\s*は\s*(摂氏|華氏)\s*何度/.test(t)) {
+    return true;
+  }
+  // 単位: A <単位> は何 <単位>
+  if (WOLFRAM_UNIT_RE.test(t)) return true;
+  // 割合・百分率
+  if (/[\d.]+\s*は\s*[\d.]+\s*の\s*何\s*%/.test(t)) return true;
+  if (/[\d.]+\s*から\s*[\d.]+\s*(?:へ|に)\s*の?\s*(?:増加率|減少率)/.test(t)) {
+    return true;
+  }
+  if (/[\d.]+\s*(?:人|個|枚|本|冊|台)?\s*のうち\s*[\d.]+/.test(t)) return true;
+  if (/[\d.]+\s*を\s*百分率/.test(t)) return true;
+  if (/[\d.]+\s*円[^。]*?(?:消費税|税金|税)\s*[\d.]+\s*%/.test(t)) return true;
+  if (/[\d.]+\s*%\s*の\s*(?:消費税|税金|税)[^。]*?[\d.]+\s*円/.test(t)) {
+    return true;
+  }
+  if (/[\d.]+\s*円[^。]*?[\d.]+\s*%\s*(?:引き|割引)/.test(t)) return true;
+  if (/[\d.]+\s*%\s*(?:引き|割引)[^。]*?[\d.]+\s*円/.test(t)) return true;
+  if (/[\d.]+\s*の\s*[\d.]+\s*%/.test(t)) return true;
+  // 累乗・平方根
+  if (/[\d.]+\s*の\s*-?[\d.]+\s*乗/.test(t)) return true;
+  if (/[\d.]+\s*の\s*平方根/.test(t)) return true;
+  if (/(?:√|ルート)\s*[\d.]+/.test(t)) return true;
+  // 式: 小数・括弧を含む最大の式ラン（日付の形は除く）
+  if (!/\d{4}\s*[-/年]\s*\d{1,2}\s*[-/月]\s*\d{1,2}/.test(t)) {
+    const runs = t.match(/[0-9.+\-*/()]+/g) || [];
+    for (const run of runs) {
+      const e = run.replace(/^[+*/.]+/, "").replace(/[+*/.]+$/, "");
+      if (!e) continue;
+      const nums = e.match(/\d+(?:\.\d+)?|\.\d+/g) || [];
+      if (nums.length < 2) continue;
+      if (/[+\-*/]/.test(e.replace(/^[-+]/, ""))) return true;
+    }
+  }
+  return false;
+}
+
+/* サーバー側 isWordProblem と同じ文章題の形。 */
+function isWolframWordProblem(raw) {
+  const nums = String(raw || "").match(/\d+(?:\.\d+)?/g) || [];
+  if (!nums.length) return false;
+  if (!WOLFRAM_WORD_KEYWORDS.test(raw)) return false;
+  return /(？|\?|ですか|ますか|何|いくつ|いくら)/.test(raw);
+}
+
+/**
+ * 計算の質問かどうか（Wolfram レーンの発動判定）。
+ * 発火する場合は { query（元の質問） } を返す。
+ */
+function parseWolframQuery(question) {
+  const raw = String(question || "").trim();
+  if (!raw) return null;
+  if (/論文|arxiv|学術|査読/i.test(raw)) return null;
+  if (/(翻訳|英訳|和訳)して/.test(raw)) return null;
+  if (/計算(とは|の意味|って)|電卓/.test(raw)) return null;
+  if (/^\d{3}-\d{4}/.test(raw) && /(どこ|住所|場所)/.test(raw)) return null;
+  if (hasWolframDeterministicShape(wolframNormCalc(raw)) ||
+      isWolframWordProblem(raw)) {
+    return { query: raw };
+  }
+  return null;
+}
+
+/* /calc-wolfram に投げ、検証済みの形に整えて返す。
+   出典リンク（resultUrl）が無い成功応答は、リンク必須の
+   規約を守れないため失敗として扱う（従来レーンへ倒れる）。 */
+async function fetchWolfram(parsed) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/calc-wolfram`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: parsed.query }),
+      },
+      WOLFRAM_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  if (typeof data.resultText !== "string" || !data.resultText) return null;
+  const resultUrl = httpUrlOrEmpty(
+    typeof data.resultUrl === "string" ? data.resultUrl : "");
+  if (!resultUrl) return null;
+  return {
+    ok: true,
+    resultText: data.resultText,
+    interpretation: typeof data.interpretation === "string"
+      ? data.interpretation : "",
+    resultUrl,
+    wolframQuery: typeof data.wolframQuery === "string"
+      ? data.wolframQuery : "",
+    via: typeof data.via === "string" ? data.via : "",
+    source: typeof data.source === "string" && data.source
+      ? data.source : "Wolfram|Alpha",
+    fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+  };
+}
+
+/* Wolfram の計算結果を表示用カードにする。 */
+function wolframCardOf(d) {
+  return {
+    kind: "wolfram",
+    resultText: d.resultText,
+    interpretation: d.interpretation,
+    resultUrl: d.resultUrl,
+    wolframQuery: d.wolframQuery,
   };
 }
 
@@ -13097,6 +13302,10 @@ const BADGES = {
     label: "翻訳の結果（DeepL）",
     className: "badge-translate",
   },
+  wolfram: {
+    label: "計算の答え（Wolfram|Alpha）",
+    className: "badge-wolfram",
+  },
   gmail: {
     label: "Gmail（Google連携で実行）",
     className: "badge-gmail",
@@ -14541,6 +14750,30 @@ const App = {
     return true;
   },
 
+  /* ---- Wolfram 計算レーンの実行と表示 ----
+     計算の主軸。未設定・失敗・解釈不能（not_calc / no_query /
+     upstream 等）はすべて false を返し、従来の計算レーン
+     （0.75 の CalcLane と手順2の evalArithmetic）へ素通り
+     させる。結果は規約上キャッシュできないため、メモ帳には
+     保存しない。 */
+  async runWolframLane(parsed) {
+    this.setPhase("searching");
+    const data = await fetchWolfram(parsed);
+    this.setPhase("idle");
+    if (!data || !data.ok) return false;
+    let note = `出典：${data.source || "Wolfram|Alpha"}。`;
+    if (data.fetchedAt) {
+      note += `（${jstDateTimeLabel(data.fetchedAt)}取得）`;
+    }
+    this.pushAssistant({
+      text: `「${parsed.query}」を計算しました。`,
+      badge: "wolfram",
+      cards: [wolframCardOf(data)],
+      note,
+    });
+    return true;
+  },
+
   /* ---- Google連携レーンの実行と表示 ----
      本人の決定どおり全自動で実行する。送信・作成・変更・削除の
      前に確認は挟まない。失敗・未連携・未ログインは、この中で
@@ -15447,6 +15680,8 @@ const App = {
         wrap.appendChild(this.buildPaperCard(card));
       } else if (card.kind === "translate") {
         wrap.appendChild(this.buildTranslateCard(card));
+      } else if (card.kind === "wolfram") {
+        wrap.appendChild(this.buildWolframCard(card));
       } else if (card.kind === "shop") {
         wrap.appendChild(this.buildShopCard(card));
       } else if (card.kind === "suggest") {
@@ -15660,6 +15895,39 @@ const App = {
       m.className = "lane-card-meta";
       m.textContent = meta.join(" / ");
       div.appendChild(m);
+    }
+    return div;
+  },
+
+  /* Wolfram 計算カード。答えが主で、Wolfram が解釈した式と、
+     結果ページへのリンク（出典表示として必須）を添える。
+     リンクの URL は API の応答に含まれるものだけを使う。 */
+  buildWolframCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    title.textContent = card.resultText;
+    div.appendChild(title);
+    const meta = [];
+    if (card.interpretation) meta.push(`解釈：${card.interpretation}`);
+    else if (card.wolframQuery) meta.push(`式：${card.wolframQuery}`);
+    if (meta.length) {
+      const m = document.createElement("p");
+      m.className = "lane-card-meta";
+      m.textContent = meta.join(" / ");
+      div.appendChild(m);
+    }
+    if (card.resultUrl) {
+      const p = document.createElement("p");
+      p.className = "lane-card-meta";
+      const a = document.createElement("a");
+      a.href = card.resultUrl;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = "Wolfram|Alpha で詳しく見る";
+      p.appendChild(a);
+      div.appendChild(p);
     }
     return div;
   },
@@ -17125,6 +17393,19 @@ const App = {
     // （2026-11-20 実機バグ報告への対応）。
     const zipPlaceQ = isZipcodePlaceQuestion(question);
 
+    // 0.7) Wolfram 計算レーン：計算の主軸。式・方程式・単位・
+    // 割合・累乗・文章題の形に一致したら、サーバー経由で
+    // Wolfram|Alpha に計算させる。未設定・失敗・解釈不能の
+    // ときは false が返り、従来の計算レーン（0.75）に倒れる。
+    // 結果は規約上キャッシュしないためメモ帳には残さない。
+    if (!zipPlaceQ) {
+      const wolframParsed = parseWolframQuery(question);
+      if (wolframParsed) {
+        const handled = await this.runWolframLane(wolframParsed);
+        if (handled) return;
+      }
+    }
+
     // 0.75) 計算レーン：文章題を含む計算のパターンに一致したら、
     // モデル・メモ帳を素通りして、正確な計算結果（過程つき）を
     // そのまま答える。結果は従来の計算経路と同じ形でメモ帳に残す。
@@ -18283,6 +18564,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseMusicQuery, fetchMusic, musicCardOf,
     parsePapersQuery, fetchPapers, paperCardOf,
     parseTranslateQuery, fetchTranslate, translateCardOf, translateLangName,
+    parseWolframQuery, fetchWolfram, wolframCardOf, WOLFRAM_TIMEOUT_MS,
     fetchGoogleStatus, startGoogleLink, unlinkGoogle,
     parseGmailSendQuery, mergeGmailDraft, gmailSendAskBackText,
     parseGmailReadQuery, sendGmail, fetchGmailList, fetchGmailMessage,
