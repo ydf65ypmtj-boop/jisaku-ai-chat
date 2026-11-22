@@ -738,6 +738,12 @@ const MODELS = {
   // 事実の質問には答えず橋渡しする設計で、回答フロー側でも事実の
   // 質問は従来の証拠＋検証ゲート経路に倒す（ask の雑談分岐参照）。
   // 時間制メーターは他のサーバー側モデルと同じ扱い。
+  // 2026-11-22 本人決定で、モデル選択の一択ではなくルーティング
+  // 方式に移行した：どのモデルを選んでいても、入力が雑談と判定
+  // されたら自動でこの専門モデルに託す（判定は parseChatRoute、
+  // 分岐は ask の 2.6）。この定義は UI の選択肢ではなく、内部の
+  // 接続・生成・メーター判定のために残してある（選択ボタンは
+  // index.html から外し、保存済みの選択値も復元時に v1 へ戻す）。
   chat: {
     id: "chat",
     label: "Cube 会話",
@@ -3244,6 +3250,126 @@ function conversationAnswer(question, now) {
   }
   const kind = conversationKindOfKey(key);
   return kind ? resolve(kind) : null;
+}
+
+/* ================================================================== */
+/* 雑談ルーティング判定（parseChatRoute）                              */
+/*                                                                    */
+/* 雑談専門モデル（Cube 会話）は、モデル選択の一択ではなく、どの      */
+/* モデルを選んでいても「入力が雑談」と判定されたら自動で託す        */
+/* ルーティング方式になった（2026-11-22 本人決定）。この関数は        */
+/* その入口の判定だけを行う：雑談らしい発話にだけ印（{ via }）を      */
+/* 返し、それ以外は null を返す（選んだモデルと従来レーンが処理      */
+/* する）。分岐本体は ask の 2.6。                                    */
+/*                                                                    */
+/* 境界は保守的に引く（会話レーンと同じ原則）：                       */
+/* - 事実の質問（classifyQuestion が種類を返すもの）と、質問・依頼    */
+/*   の印を含む発話は絶対に拾わない。判定に迷うものは拾わない        */
+/*   （＝選んだモデルが答える側に倒す）。                             */
+/* - 天気・計算・翻訳・論文などの専用レーンは、この判定が走る         */
+/*   ask の 2.6 より前段で処理済み。ここで拾うのは「どのレーンにも    */
+/*   当たらなかった自由な雑談」だけになる。レーンの対象らしい語      */
+/*   （天気・ニュース等）は複合文に紛れても拾わないよう関門に入れる。 */
+/* - 直前のターンが雑談専門の返事だった場合（prevChat = true）は、   */
+/*   短い相づち・返事・続きの発話も雑談として扱う。                   */
+/* ================================================================== */
+
+/* 雑談として拾う発話の長さの上限（空白を除いた文字数）。長い発話は
+   質問・依頼・説明であることが多く、雑談とは判定しない。会話の
+   続き（prevChat）の短い返事はもっと短い上限で拾う。 */
+const CHAT_ROUTE_MAX_LEN = 100;
+const CHAT_ROUTE_CONT_MAX_LEN = 30;
+
+/* 事実の質問・依頼の印：これらを含む発話は雑談にしない。天気・
+   予報・ニュースは専用レーン（天気・話題）の対象なので、複合文で
+   紛れても守るためにここにも入れる。 */
+const CHAT_ROUTE_GUARDS =
+  /何|誰|いつ|どこ|なぜ|どうして|どうすれば|どうしたら|どれ|どの|いくつ|いくら|教えて|知りたい|聞きたい|とは|意味|調べて|検索して|送って|作って|書いて|消して|削除して|予約して|開いて|再生して|翻訳して|天気|予報|ニュース/;
+
+/* 丁寧な疑問形（〜ですか／ますか）は相手への質問として扱い、雑談に
+   しない（あいさつ等の定型は会話レーンが先に処理する）。 */
+const CHAT_ROUTE_POLITE_Q = /(です|ます)か[？?]?$/;
+
+/* 気持ち・状態・好みの表明：雑談の中心になる語。これを含む発話は、
+   関門を通れば雑談とみなす。 */
+const CHAT_ROUTE_FEELINGS =
+  /疲れた|疲れて|つかれた|眠い|眠く|ねむい|眠たい|眠れない|お腹すいた|おなかすいた|腹へった|喉かわいた|のどかわいた|暇だ|ひまだ|暇な|退屈|楽しい|楽しかった|たのしい|嬉しい|嬉しかった|うれしい|悲しい|かなしい|寂しい|さびしい|不安|心配だ|ドキドキ|ワクワク|イライラ|だるい|だるかった|しんどい|しんどかった|つらい|つらかった|きつい|最高|最悪|やばい|ヤバい|すごい|すごかった|すごーい|かわいい|面白い|面白かった|おもしろい|つまんない|つまらない|暑い|暑く|寒い|寒く|痛い|痛く|かゆい|苦しい|助かった|たすかった|好き|嫌い|苦手/;
+
+/* 呼びかけ・話し始めの印（発話の先頭）。「聞いて」は文中でも拾う。 */
+const CHAT_ROUTE_OPENERS =
+  /^(ねえ|ねぇ|あのさ|あのね|聞いて|きいて|実は|じつは|そういえば)/;
+
+/* 出来事の報告に出る動詞・形。くだけた文末と組み合わさったときだけ
+   雑談とみなす（事実の叙述と取り違えないため）。 */
+const CHAT_ROUTE_NARRATIVES =
+  /行った|来た|見た|食べた|買った|遊んだ|話した|会った|起きた|寝た|帰った|着いた|終わった|始まった|できた|勝った|負けた|転んだ|怒られた|褒められた|しちゃった/;
+
+/* くだけた文末：報告・感想の色が強い締め。 */
+const CHAT_ROUTE_CASUAL_END =
+  /(だよ|だね|よね|じゃん|なんだ|んだ|ちゃった|だなあ|なあ|笑|ｗ|草)$/;
+
+/* 同意・感想を求める締め（「〜だよね」「〜と思う？」等）。 */
+const CHAT_ROUTE_SEEK_END = /(だよね|でしょ|じゃない|思う)[？?]?$/;
+
+/* 短い反応・相づち（正規化した発話全体への一致）。単独でも、会話の
+   続きでも拾う。 */
+const CHAT_ROUTE_REACTIONS =
+  /^(やったー?|すごーい|かわいい|いいなあ?|そっか|そうか|なるほどね|まじか|マジか|まじで|うそ|ウソ|えー+|へー+|わー+|おー+|あー+|わかる|たしかに|ほんと|ほんとに|本当に|よかった|残念|ざんねん|つら|しんど|だる|ねむ|そうなんだ|そうだね|うんうん|うん|ううん|そう|そうそう|それで|それから|へえ|ふーん|ふんふん|まじ|本当|大丈夫|平気|もう寝る|寝る|助かった)$/;
+
+/* 雑談判定専用の正規化：前後の空白を除き、英字は小文字にし、空白を
+   詰める（会話レーンの conversationKey と同じ流儀。ただし文末の
+   「ね」「よ」は締めの判定に使うため、ここでは外さない）。 */
+function chatRouteText(question) {
+  let t = String(question ?? "").trim().toLowerCase();
+  t = t.replace(/[\s　]+/g, "");
+  return t;
+}
+
+/**
+ * 発話が雑談なら { via } を、そうでなければ null を返す。
+ * prevChat は「直前のターンが雑談専門の返事だった」かどうか
+ * （App が保持する印）。雑談の続きでは短い相づち・返事も拾う。
+ */
+function parseChatRoute(question, prevChat) {
+  const raw = String(question ?? "").trim();
+  if (!raw) return null;
+  // 『…』「…」で対象を名指しする発話は、翻訳・引用など対象のある
+  // 発話なので雑談にしない（会話レーンと同じ扱い）。
+  if (/[『「]/.test(raw)) return null;
+  // 事実の質問は専門モデルに渡さない（従来の雑談分岐と同じ関門）。
+  if (classifyQuestion(raw)) return null;
+  const t = chatRouteText(raw);
+  if (!t) return null;
+  // 事実・依頼の印を含むものは拾わない。
+  if (CHAT_ROUTE_GUARDS.test(t)) return null;
+  if (CHAT_ROUTE_POLITE_Q.test(t)) return null;
+  // 末尾の句読点・感嘆符を外した形（文末・全体一致の判定用）。
+  const end = t.replace(/[！!？?。、・…〜~]+$/u, "");
+
+  /* --- 会話の続き（直前が雑談専門の返事） --- */
+  if (prevChat && t.length <= CHAT_ROUTE_CONT_MAX_LEN) {
+    if (CHAT_ROUTE_REACTIONS.test(end)) return { via: "continuation" };
+    if (CHAT_ROUTE_FEELINGS.test(t)) return { via: "continuation" };
+    if (CHAT_ROUTE_CASUAL_END.test(end)) return { via: "continuation" };
+    // 「〜の？」「〜か？」の短い聞き返し・続きの質問。
+    if (/(の|か)[？?]$/.test(t)) return { via: "continuation" };
+    // 短い文で動詞・形容詞の締めなら、会話の続きの発話とみなす
+    // （名詞だけの発話＝話題の提示は、情報の質問かもしれないので
+    // 拾わない）。
+    if (/(た|い|だ|る|う)$/.test(end)) return { via: "continuation" };
+  }
+
+  /* --- 単独の雑談 --- */
+  if (t.length > CHAT_ROUTE_MAX_LEN) return null;
+  if (CHAT_ROUTE_FEELINGS.test(t)) return { via: "feeling" };
+  if (CHAT_ROUTE_OPENERS.test(t)) return { via: "opener" };
+  if (/聞いて|きいて/.test(t)) return { via: "opener" };
+  if (CHAT_ROUTE_REACTIONS.test(end)) return { via: "reaction" };
+  if (CHAT_ROUTE_NARRATIVES.test(t) && CHAT_ROUTE_CASUAL_END.test(end)) {
+    return { via: "narrative" };
+  }
+  if (CHAT_ROUTE_SEEK_END.test(t)) return { via: "seek" };
+  return null;
 }
 
 /**
@@ -13383,7 +13509,10 @@ const App = {
     // 選択中のモデルを復元する（初期値は v1）。ベースURLはモデルごとの
     // 上書きとして読み込む（v1 は従来キー、v2 / Twin / Pro / Max は専用キー）。
     const savedId = store.get(MODEL_ID_KEY);
-    this.modelId = MODELS[savedId] ? savedId : "v1";
+    // 雑談専門（chat）はモデル選択の一択ではなくなったため
+    // （2026-11-22 ルーティング方式へ移行）、保存値が chat の
+    // ときは v1 に戻す。雑談はどのモデルでも自動で託される。
+    this.modelId = MODELS[savedId] && savedId !== "chat" ? savedId : "v1";
     const def = modelDef(this.modelId);
     // Ultra とサーバーモデル（Twin / Pro / Max）と雑談専門（会話）
     // にはベースURLが無い（どれも iMac サーバーで動かす）。
@@ -16583,6 +16712,12 @@ const App = {
      自作モデルは直近のやり取りの抜粋）。 */
   historyResumed: false,
 
+  /* 直前のターンが雑談専門（Cube 会話）の返事だったかどうか。
+     雑談ルーティング（ask の 2.6）で、会話の続きの短い相づち・
+     返事も雑談として扱うために使う。雑談の返事で立て、それ以外の
+     回答・会話の切り替えで倒す。 */
+  _prevTurnWasChat: false,
+
   /* 履歴の復元中はキャプチャを止めるための印。 */
   historyRestoring: false,
 
@@ -17124,6 +17259,7 @@ const App = {
     if (!this.historyStore || this.phase !== "idle") return;
     this.historyCurrent = null;
     this.historyResumed = false;
+    this._prevTurnWasChat = false;
     this.clearMessages();
     const empty = el("empty-state");
     if (empty) empty.hidden = false;
@@ -17156,6 +17292,7 @@ const App = {
     }
     this.historyCurrent = conv;
     this.historyResumed = true;
+    this._prevTurnWasChat = false;
     const empty = el("empty-state");
     if (empty) empty.hidden = (conv.turns || []).length > 0;
     this.showTab("chat");
@@ -17173,6 +17310,7 @@ const App = {
     if (this.historyCurrent && this.historyCurrent.id === id) {
       this.historyCurrent = null;
       this.historyResumed = false;
+      this._prevTurnWasChat = false;
       this.clearMessages();
       const empty = el("empty-state");
       if (empty) empty.hidden = false;
@@ -17234,15 +17372,21 @@ const App = {
      0) 天気 → 気象庁の予報＋Open-Meteoの現在の状況（実データ）
      0.5) Cube自身の質問 → 固定情報
      0.6) 会話レーン → あいさつ・お礼・別れ・定番の雑談への即答
-       （Cube 会話が選択されているときは使わない：専門モデルが返す）
      0.75) 計算レーン → 正確な計算結果（過程つき）
      1) 知識メモ帳 → 即答＋裏で再確認
      2) 計算 → 検算 2.5) メーター関門
-     2.6) 雑談分岐 → Cube 会話選択時、事実でない会話は専門モデルへ
+     2.6) 雑談ルーティング → 雑談と判定された入力は、選択中の
+       モデルによらず雑談専門（Cube 会話）へ託す
      3) モデル生成 → 対象記事の事実で照合 */
   async ask(rawQuestion) {
     const question = (rawQuestion || "").trim();
     if (this.phase !== "idle") return;
+    // 雑談ルーティングの文脈：直前のターンが雑談専門の返事だったか
+    // を取り出し、印はここで倒しておく（このターンが雑談の返事で
+    // 終わったときだけ、分岐側で立て直す）。生成中で戻った場合は
+    // ターン自体が無いので印に触れない。
+    const prevTurnWasChat = this._prevTurnWasChat === true;
+    this._prevTurnWasChat = false;
     // 画像添付つきの送信（Ultra 専用）：画像の内容はネットの裏づけ
     // 検証の対象にならないため、通常の質問経路には入れず、画像
     // レーン（askWithImage）で完結させる。文章が空なら既定の
@@ -17371,13 +17515,11 @@ const App = {
     // 定番パターンに一致する場合だけに限られ、事実の質問や複合文は
     // conversationAnswer が拾わない（従来の経路に倒れる）。
     // 会話の返事は知識メモ帳にも保存しない。
-    // 雑談専門（Cube 会話）が選択されているときはこのレーンを使わ
-    // ない：あいさつ・相づちへの返事も専門モデル自身が会話として
-    // 返すのが配線の目的（2026-11-20 本人指示）。定型文で先回り
-    // すると専門モデルに会話が届かなくなるため、判定だけして
-    // 採用はしない（convAnswer の計算自体は従来どおり）。
+    // 定型のあいさつ・お礼・別れは、雑談ルーティング（2.6）より
+    // 前のこのレーンが全モデル共通で即答する。自由な雑談は 2.6 で
+    // 雑談専門に託される（2026-11-22 ルーティング方式）。
     const convAnswer = conversationAnswer(question);
-    if (convAnswer && this.modelId !== "chat") {
+    if (convAnswer) {
       this.pushAssistant({
         text: convAnswer,
         badge: "none",
@@ -17830,25 +17972,50 @@ const App = {
       }
     }
 
-    // 2.6) 雑談専門（Cube 会話）の分岐：事実の主張を含まない会話は
-    // 専門モデルが会話として返す。事実の質問（classifyQuestion が
-    // 種類を返すもの）は専門モデルに渡さず、このまま手順3の証拠＋
-    // 検証ゲート経路に倒す（専門モデルは事実に答えない設計で、
-    // 裏づけの無い生成文を出す経路も作らない）。天気・計算・住所・
-    // 買い物などの専用レーンはこの分岐より前で処理済み。
-    // 会話の返事は知識メモ帳にも保存しない（会話レーンと同じ）。
-    if (this.modelId === "chat" && modelReady && !classifyQuestion(question)) {
+    // 2.6) 雑談ルーティング：雑談専門（Cube 会話）はモデル選択の
+    // 一択ではなく、どのモデルを選んでいても、入力が雑談と判定
+    // されたら専門モデルに託す（2026-11-22 本人決定）。判定は
+    // parseChatRoute（保守的：気持ち・出来事の報告・呼びかけ等に
+    // だけ発火し、事実の質問やレーン対象は拾わない。直前が雑談の
+    // 返事なら短い相づち・続きも拾う）。事実の質問
+    // （classifyQuestion が種類を返すもの）は専門モデルに渡さず、
+    // このまま手順3の証拠＋検証ゲート経路に倒す（専門モデルは
+    // 事実に答えない設計で、裏づけの無い生成文を出す経路も作ら
+    // ない）。天気・計算・住所・買い物などの専用レーンはこの
+    // 分岐より前で処理済み。会話の返事は知識メモ帳にも保存し
+    // ない（会話レーンと同じ）。
+    // 接続は選択時ではなく、雑談が来たときにその場で行う
+    // （ChatModel.connect：サーバー側はオンデマンド起動で、初回は
+    // 数十秒かかることがある）。選択中モデルの接続状態には触れ
+    // ない。メーターは雑談専門も対象（サーバー側モデルと同じ
+    // 扱い）で、空なら接続を始める前に穏やかに止める
+    // （generateForModel 側にも同じ関門がある）。
+    const chatRoute = parseChatRoute(question, prevTurnWasChat);
+    if (chatRoute && !classifyQuestion(question)) {
+      const meter = getCubeMeter();
+      if (meter && !meter.canUse()) {
+        this.pushAssistant({
+          text: "サーバーモデルの時間メーターが0になりました。",
+          badge: "unknown",
+          note: "Cube Nano / Cube Flash はこの端末の中で動くため、メーターなしでそのまま使えます。モデルを切り替えてお試しください。ログイン中なら、ポイントでメーター時間を追加することもできます（サイドバーの「ポイントでメーター追加」）。メーターの無料分は日付が変わると戻ります。",
+        });
+        return;
+      }
       this.setPhase("thinking");
       try {
+        if (!ChatModel.readyFor("chat")) {
+          await ChatModel.connect();
+        }
         const chatText = await generateForModel("chat", question, {
           historyMessages: this.historyMessagesForChat(),
         });
         this.setPhase("idle");
         if (chatText) {
+          this._prevTurnWasChat = true;
           this.pushAssistant({
             text: chatText,
             badge: "none",
-            note: "Cube 会話（雑談専門モデル）の返事です。会話のためのモデルなので、事実の質問には答えません。事実を知りたいときは、他のモデルに切り替えるか、そのまま質問してください（裏づけ確認の経路で調べます）。",
+            note: "雑談と判定して、Cube 会話（雑談専門モデル）に託した返事です。会話のためのモデルなので、事実の質問には答えません。事実を知りたいときは、そのまま質問してください（裏づけ確認の経路で調べます）。",
           });
         } else {
           this.pushAssistant({
@@ -18565,6 +18732,7 @@ if (typeof module !== "undefined" && module.exports) {
     parsePapersQuery, fetchPapers, paperCardOf,
     parseTranslateQuery, fetchTranslate, translateCardOf, translateLangName,
     parseWolframQuery, fetchWolfram, wolframCardOf, WOLFRAM_TIMEOUT_MS,
+    parseChatRoute,
     fetchGoogleStatus, startGoogleLink, unlinkGoogle,
     parseGmailSendQuery, mergeGmailDraft, gmailSendAskBackText,
     parseGmailReadQuery, sendGmail, fetchGmailList, fetchGmailMessage,
