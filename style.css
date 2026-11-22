@@ -559,6 +559,7 @@ a { color: var(--accent); }
 .badge-market { background: #1e8449; color: #ffffff; }
 .badge-music { background: #a9328f; color: #ffffff; }
 .badge-papers { background: #2f5d8a; color: #ffffff; }
+.badge-translate { background: #0e7a5f; color: #ffffff; }
 .badge-gmail { background: #b3261e; color: #ffffff; }
 .badge-gcal { background: #1a73e8; color: #ffffff; }
 @media (prefers-color-scheme: dark) {
@@ -575,6 +576,7 @@ a { color: var(--accent); }
   .badge-market { background: #82d19b; color: #1d1a15; }
   .badge-music { background: #e58bd0; color: #1d1a15; }
   .badge-papers { background: #a8c6e0; color: #1d1a15; }
+  .badge-translate { background: #7fd8bd; color: #1d1a15; }
   .badge-gmail { background: #f2b8b5; color: #601410; }
   .badge-gcal { background: #a8c7fa; color: #0b3050; }
 }

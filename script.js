@@ -4431,6 +4431,7 @@ const HOLIDAY_TIMEOUT_MS = 15000;
 const MARKET_TIMEOUT_MS = 15000;
 const MUSIC_TIMEOUT_MS = 15000;
 const PAPERS_TIMEOUT_MS = 30000;
+const TRANSLATE_TIMEOUT_MS = 30000;
 
 /* ISO 日時を JST の「M月D日 HH:MM」に整える（取得・発表時刻の表示用）。 */
 function jstDateTimeLabel(iso) {
@@ -5254,6 +5255,240 @@ function paperCardOf(r) {
     summary: r.summary,
     link: r.url,
     source: r.source,
+  };
+}
+
+/* ---- 翻訳レーン（cube-server の /translate、DeepL） ---- */
+/* 発動条件の正本はサーバー側 deepl_endpoint.js の matchTranslateLane。
+   ここはその忠実な移植で、翻訳の意図が明示的な質問だけを拾う。
+   翻訳の話題・相談（翻訳アプリのおすすめ、翻訳の仕事など）は
+   発火しない。原文の取り出しは引用符の中身が最優先で、無ければ
+   命令部分を取り除いた残り。指示語だけ（「この文章を翻訳して」）
+   の場合は原文なしのまま発火させ、サーバー側の no_source_text
+   の正直な案内に委ねる。DeepL の無料枠は通算100万字の一回きり
+   （リセットなし）なので、成功表示には残量（usage）を必ず添える。
+   結果は変わる情報なので知識メモ帳には保存しない（他のデータ
+   レーンと同じ）。 */
+
+/* 言語名 -> DeepL の target_lang コード（サーバー側と同一）。 */
+const TRANSLATE_LANG_CODES = {
+  "英語": "EN-US", "英": "EN-US",
+  "日本語": "JA",
+  "中国語": "ZH",
+  "韓国語": "KO",
+  "フランス語": "FR",
+  "ドイツ語": "DE",
+  "スペイン語": "ES",
+  "イタリア語": "IT",
+  "ポルトガル語": "PT-PT",
+  "ロシア語": "RU",
+  "オランダ語": "NL",
+};
+const TRANSLATE_LANG_CODES_EN = {
+  english: "EN-US", japanese: "JA", chinese: "ZH", korean: "KO",
+  french: "FR", german: "DE", spanish: "ES", italian: "IT",
+  portuguese: "PT-PT", russian: "RU", dutch: "NL",
+};
+const TRANSLATE_LANG_WORDS = Object.keys(TRANSLATE_LANG_CODES).join("|");
+
+/* DeepL の言語コード -> 表示用の日本語名。原文の言語は DeepL の
+   検出結果（"JA" や "EN" のような基底コード）で返るため、訳先の
+   地域つきコードと両方を引けるようにしてある。 */
+const TRANSLATE_LANG_NAMES = {
+  "EN-US": "英語", "EN": "英語",
+  "JA": "日本語",
+  "ZH": "中国語",
+  "KO": "韓国語",
+  "FR": "フランス語",
+  "DE": "ドイツ語",
+  "ES": "スペイン語",
+  "IT": "イタリア語",
+  "PT-PT": "ポルトガル語", "PT": "ポルトガル語",
+  "RU": "ロシア語",
+  "NL": "オランダ語",
+};
+
+function translateLangName(code) {
+  return TRANSLATE_LANG_NAMES[code] || "";
+}
+
+/* 原文が指示語だけ（「この文章を翻訳して」）なら訳す文が無い。 */
+const TRANSLATE_REFER_ONLY =
+  /^(この文章|この文|これ|それ|あれ|次の文|次の文章|以下|上記)$/;
+const TRANSLATE_HAS_JA = /[\u3040-\u30ff\u4e00-\u9faf]/;
+
+function cleanTranslateSource(s) {
+  return String(s || "")
+    .replace(/^[「『"“\s]+/, "")
+    .replace(/[」』"”\s]+$/, "")
+    .replace(/^[をがはのにでへとも、。\s]+/, "")
+    .replace(/[、。！？!?\s]+$/, "")
+    .trim();
+}
+
+/* 言語名が無いときの訳先：日本語の文なら英語、それ以外は日本語。 */
+function defaultTranslateTarget(sourceText) {
+  return TRANSLATE_HAS_JA.test(sourceText) ? "EN-US" : "JA";
+}
+
+/* マッチャーの共通の締め（サーバー側 finish の移植）。発火しない
+   ときは null、発火するときは { sourceText, targetLang } を返す。
+   原文が取れない場合は sourceText を空にして発火させる。 */
+function finishTranslate(raw, sourceRaw, targetLang, aboutTopic, quotedText) {
+  /* 引用符の原文があれば、分解した原文より優先する（サーバー側と同一）。 */
+  const sourceText = cleanTranslateSource(quotedText || sourceRaw);
+  if (aboutTopic && !quotedText) return null;
+  if (!sourceText || TRANSLATE_REFER_ONLY.test(sourceText)) {
+    return {
+      sourceText: "",
+      targetLang: targetLang || defaultTranslateTarget(raw),
+    };
+  }
+  return {
+    sourceText,
+    targetLang: targetLang || defaultTranslateTarget(sourceText),
+  };
+}
+
+/* サーバー側 matchTranslateLane の本体の移植。最初に一致した
+   パターンが判定を決める（サーバー側の早期 return と同じ）。
+   発火しないときは null、発火するときは
+   { sourceText, targetLang } を返す。 */
+function matchTranslateIntent(raw) {
+  /* 引用符つきの原文は最も確実な信号。 */
+  const quoted = raw.match(/[「『]([^」』]+)[」』]/) || raw.match(/"([^"]+)"/);
+  const quotedText = quoted ? quoted[1].trim() : "";
+
+  /* --- 誤爆ガード：翻訳の「話題」は発火しない（引用符つき原文と
+     命令形が両方ある場合だけ例外的に発火する） --- */
+  const aboutTopic =
+    /(翻訳アプリ|翻訳ソフト|翻訳サイト|翻訳サービス|翻訳ツール|翻訳機|翻訳者|翻訳の仕事|翻訳会社|翻訳料金|翻訳精度|機械翻訳|翻訳とは|翻訳って)/.test(raw);
+  let m;
+
+  /* --- 日本語の命令形 --- */
+  /* Xを<言語名>に翻訳して / Xを<言語名>に訳して */
+  if ((m = raw.match(new RegExp(`^(.+?)を(${TRANSLATE_LANG_WORDS})に(?:翻訳|訳)(?:して|する|してほしい|してください)?`)))) {
+    return finishTranslate(raw, m[1], TRANSLATE_LANG_CODES[m[2]], aboutTopic, quotedText);
+  }
+  /* Xを英訳して / Xを和訳して / Xを翻訳して */
+  if ((m = raw.match(/^(.+?)を(英訳|和訳|翻訳)(?:して|する|してほしい|してください)?/))) {
+    const target = m[2] === "英訳" ? "EN-US" : m[2] === "和訳" ? "JA" : "";
+    return finishTranslate(raw, m[1], target, aboutTopic, quotedText);
+  }
+  /* Xを<言語名>にして（言語名が必須なので「赤にして」は発火しない） */
+  if ((m = raw.match(new RegExp(`^(.+?)を(${TRANSLATE_LANG_WORDS})にして`)))) {
+    return finishTranslate(raw, m[1], TRANSLATE_LANG_CODES[m[2]], aboutTopic, quotedText);
+  }
+  /* Xは<言語名>で何と言う / Xを<言語名>で言うと / Xって<言語名>で何 */
+  if ((m = raw.match(new RegExp(`^(.+?)(?:は|を|って)(${TRANSLATE_LANG_WORDS})で(?:何と|なんて|どう)?(?:言|いう|いえば)`)))) {
+    return finishTranslate(raw, m[1], TRANSLATE_LANG_CODES[m[2]], aboutTopic, quotedText);
+  }
+  /* 翻訳して：X / 英訳して: X（命令が先・コロン・原文） */
+  if ((m = raw.match(/^(翻訳|英訳|和訳)(?:して)?[：:]\s*(.+)$/))) {
+    const target = m[1] === "英訳" ? "EN-US" : m[1] === "和訳" ? "JA" : "";
+    return finishTranslate(raw, m[2], target, aboutTopic, quotedText);
+  }
+  /* 引用符つき原文＋裸の命令形（「Hello」を翻訳して） */
+  if (quotedText && /(翻訳して|英訳して|和訳して|訳して)/.test(raw)) {
+    let target = "";
+    const lm = raw.match(new RegExp(`(${TRANSLATE_LANG_WORDS})に(?:翻訳|訳)`));
+    if (lm) target = TRANSLATE_LANG_CODES[lm[1]];
+    else if (/英訳/.test(raw)) target = "EN-US";
+    else if (/和訳/.test(raw)) target = "JA";
+    return finishTranslate(raw, quotedText, target, aboutTopic, quotedText);
+  }
+
+  /* --- 英語の命令形（原文の大文字小文字は保つ） --- */
+  if ((m = raw.match(/^translate\s+(.+?)\s+(?:in)?to\s+([a-zA-Z]+)\s*$/i))) {
+    const target = TRANSLATE_LANG_CODES_EN[m[2].toLowerCase()] || "";
+    if (target) return finishTranslate(raw, m[1], target, aboutTopic, quotedText);
+  }
+  if ((m = raw.match(/^how do you say\s+(.+?)\s+in\s+([a-zA-Z]+)\s*\??\s*$/i))) {
+    const target = TRANSLATE_LANG_CODES_EN[m[2].toLowerCase()] || "";
+    if (target) return finishTranslate(raw, m[1], target, aboutTopic, quotedText);
+  }
+  if ((m = raw.match(/^translate\s+(.+?)\s*$/i))) {
+    return finishTranslate(raw, m[1], "", aboutTopic, quotedText);
+  }
+
+  return null;
+}
+
+/**
+ * 翻訳の質問かどうか。翻訳の意図が明示的なときだけ発火し、
+ * { query（元の質問）, sourceText（取り出した原文）,
+ *   targetLang（DeepL の言語コード） } を返す。
+ */
+function parseTranslateQuery(question) {
+  const raw = String(question || "").trim();
+  if (!raw) return null;
+  const hit = matchTranslateIntent(raw);
+  if (!hit) return null;
+  return { query: raw, sourceText: hit.sourceText, targetLang: hit.targetLang };
+}
+
+/* /translate に投げ、検証済みの形に整えて返す。usage（DeepL の
+   残量）は表示のために必ず保持する。 */
+async function fetchTranslate(parsed) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/translate`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: parsed.query }),
+      },
+      TRANSLATE_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  if (typeof data.translatedText !== "string" || !data.translatedText) {
+    return null;
+  }
+  const usage = data.usage && typeof data.usage === "object" ? {
+    character_count: typeof data.usage.character_count === "number"
+      ? data.usage.character_count : null,
+    character_limit: typeof data.usage.character_limit === "number"
+      ? data.usage.character_limit : null,
+    character_remaining: typeof data.usage.character_remaining === "number"
+      ? data.usage.character_remaining : null,
+  } : null;
+  return {
+    ok: true,
+    sourceText: typeof data.sourceText === "string" && data.sourceText
+      ? data.sourceText : parsed.sourceText,
+    translatedText: data.translatedText,
+    sourceLang: typeof data.sourceLang === "string" ? data.sourceLang : "",
+    targetLang: typeof data.targetLang === "string" && data.targetLang
+      ? data.targetLang : parsed.targetLang,
+    chars: typeof data.chars === "number" ? data.chars : 0,
+    usage,
+    localTotalChars: typeof data.localTotalChars === "number"
+      ? data.localTotalChars : null,
+    source: typeof data.source === "string" && data.source
+      ? data.source : "DeepL",
+    fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+  };
+}
+
+/* 翻訳結果を表示用カードにする。 */
+function translateCardOf(d) {
+  return {
+    kind: "translate",
+    sourceText: d.sourceText,
+    translatedText: d.translatedText,
+    sourceLang: d.sourceLang,
+    targetLang: d.targetLang,
   };
 }
 
@@ -12858,6 +13093,10 @@ const BADGES = {
     label: "論文の検索結果（arXiv / Semantic Scholar）",
     className: "badge-papers",
   },
+  translate: {
+    label: "翻訳の結果（DeepL）",
+    className: "badge-translate",
+  },
   gmail: {
     label: "Gmail（Google連携で実行）",
     className: "badge-gmail",
@@ -14241,6 +14480,67 @@ const App = {
     return true;
   },
 
+  /* ---- 翻訳レーンの実行と表示 ---- */
+  async runTranslateLane(parsed) {
+    this.setPhase("searching");
+    const data = await fetchTranslate(parsed);
+    this.setPhase("idle");
+    if (!data) return false;
+    if (!data.ok) {
+      /* サーバー側で翻訳の意図でないと判定されたら従来の手順に
+         倒す（ページ側とサーバー側で判定がずれた場合の逃げ道。
+         それ以外の失敗はこのレーンの中で正直に案内して完結）。 */
+      if (data.error === "not_translation") return false;
+      if (data.error === "no_source_text") {
+        this.pushAssistant({
+          text: "翻訳したい文が質問の中に見つかりませんでした。",
+          badge: "translate",
+          note: "「『ありがとう』を英語に翻訳して」のように、訳したい文を一緒に入れて聞いてください。",
+        });
+      } else if (data.error === "quota_exceeded") {
+        this.pushAssistant({
+          text: "翻訳の無料分を使い切りました。",
+          badge: "translate",
+          note: "DeepL の無料枠は通算100万字の一回きりで、リセットされません。使い切ったため、この翻訳機能はここまでです。",
+        });
+      } else if (data.error === "not_configured") {
+        this.pushAssistant({
+          text: "翻訳機能はまだ使える状態になっていません。",
+          badge: "translate",
+          note: "サーバー側の設定が済んでいないため翻訳できませんでした。時間をおいてもう一度試してください。",
+        });
+      } else if (data.error === "source_too_long") {
+        this.pushAssistant({
+          text: "文が長すぎて翻訳できませんでした。",
+          badge: "translate",
+          note: "原文は1,200字までです。短く分けて試してください。",
+        });
+      } else {
+        this.pushAssistant({
+          text: "翻訳を取得できませんでした。",
+          badge: "translate",
+          note: "時間をおいてもう一度試してください。",
+        });
+      }
+      return true;
+    }
+    const targetName = translateLangName(data.targetLang) || data.targetLang;
+    let note = `出典：${data.source || "DeepL"}。`;
+    if (data.usage && typeof data.usage.character_remaining === "number") {
+      note += `無料分の残りは約${data.usage.character_remaining.toLocaleString("ja-JP")}字です。`;
+    }
+    if (data.fetchedAt) {
+      note += `（${jstDateTimeLabel(data.fetchedAt)}取得）`;
+    }
+    this.pushAssistant({
+      text: `『${data.sourceText}』を${targetName}に翻訳しました。`,
+      badge: "translate",
+      cards: [translateCardOf(data)],
+      note,
+    });
+    return true;
+  },
+
   /* ---- Google連携レーンの実行と表示 ----
      本人の決定どおり全自動で実行する。送信・作成・変更・削除の
      前に確認は挟まない。失敗・未連携・未ログインは、この中で
@@ -15145,6 +15445,8 @@ const App = {
         wrap.appendChild(this.buildMusicCard(card));
       } else if (card.kind === "paper") {
         wrap.appendChild(this.buildPaperCard(card));
+      } else if (card.kind === "translate") {
+        wrap.appendChild(this.buildTranslateCard(card));
       } else if (card.kind === "shop") {
         wrap.appendChild(this.buildShopCard(card));
       } else if (card.kind === "suggest") {
@@ -15335,6 +15637,29 @@ const App = {
       s.className = "lane-card-meta";
       s.textContent = card.summary;
       div.appendChild(s);
+    }
+    return div;
+  },
+
+  /* 翻訳カード。訳文が主で、原文と変換方向（言語名）は API の
+     値とコード対応表からだけ作る（文章は作らない）。 */
+  buildTranslateCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    title.textContent = card.translatedText;
+    div.appendChild(title);
+    const meta = [];
+    if (card.sourceText) meta.push(`原文：${card.sourceText}`);
+    const srcName = translateLangName(card.sourceLang) || card.sourceLang;
+    const tgtName = translateLangName(card.targetLang) || card.targetLang;
+    if (srcName && tgtName) meta.push(`${srcName} → ${tgtName}`);
+    if (meta.length) {
+      const m = document.createElement("p");
+      m.className = "lane-card-meta";
+      m.textContent = meta.join(" / ");
+      div.appendChild(m);
     }
     return div;
   },
@@ -17195,6 +17520,17 @@ const App = {
       if (handled) return;
     }
 
+    // 翻訳：DeepL の実データで答える。翻訳の意図が明示的な
+    // 質問だけが発火する（発動条件の正本はサーバー側の
+    // matchTranslateLane）。サーバーに届かない場合と、
+    // サーバー側で翻訳でないと判定された場合だけ従来の
+    // 手順に倒れる。
+    const translateParsed = parseTranslateQuery(question);
+    if (translateParsed) {
+      const handled = await this.runTranslateLane(translateParsed);
+      if (handled) return;
+    }
+
     // 2.5) 時間制メーターの関門：サーバー側モデル（Twin / Pro /
     // Max / Ultra）が選択され、接続済みで、残量が0なら、生成も
     // 検索照合も始めずに穏やかに止める。端末内モデルへの案内と、
@@ -17946,6 +18282,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseMarketQuery, fetchMarket, marketFxText, marketStockText,
     parseMusicQuery, fetchMusic, musicCardOf,
     parsePapersQuery, fetchPapers, paperCardOf,
+    parseTranslateQuery, fetchTranslate, translateCardOf, translateLangName,
     fetchGoogleStatus, startGoogleLink, unlinkGoogle,
     parseGmailSendQuery, mergeGmailDraft, gmailSendAskBackText,
     parseGmailReadQuery, sendGmail, fetchGmailList, fetchGmailMessage,
