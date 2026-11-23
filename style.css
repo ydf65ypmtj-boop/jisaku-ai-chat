@@ -983,3 +983,24 @@ a { color: var(--accent); }
 }
 .doctor-send { flex-shrink: 0; }
 .doctor-error { color: #d9534f; font-weight: 700; }
+
+/* Cube Code の生成コード表示（ファイルブロック＋コピー＋プレビュー） */
+.code-answer { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
+.code-file { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.code-file-head {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--surface); padding: 6px 10px; border-bottom: 1px solid var(--border);
+}
+.code-file-name { font-size: 0.85em; }
+.code-copy-btn, .code-preview-btn {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); color: var(--text); cursor: pointer;
+  font-size: 0.85em; padding: 4px 12px;
+}
+.code-body {
+  margin: 0; padding: 10px 12px; overflow-x: auto;
+  background: #1e1e2e; color: #e6e6e6;
+  font-size: 0.82em; line-height: 1.55;
+}
+.code-body code { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre; }
+.code-preview-btn { align-self: flex-start; }

@@ -746,11 +746,32 @@ const MODELS = {
   // モデルが直接担当する（ルーティング分岐は通らない）。
   chat: {
     id: "chat",
-    label: "Cube 会話",
+    label: "Cube Speak",
     engine: "chat",
     defaultBaseUrl: "",
     urlKey: "",
     maxNew: 256,
+    expect: null,
+  },
+  // Cube Code：プログラミング専門モデル（2026-11-23 本人決定で
+  // モデル選択に追加）。土台は Qwen2.5-Coder-7B-Instruct ＋
+  // コード専門 LoRA（自作の手本データで学習）。iMac の
+  // llama-server（8098 番・オンデマンド起動）で動かし、ページは
+  // cube-server の /code に依頼文と会話列を渡す。システム
+  // プロンプトは学習・ハーネス時固定のためサーバー側が差し込む
+  // （ページは送らない）。普通〜軽い Web アプリ（1ファイル〜
+  // 数ファイル・合計500行以内）を作るのが担当で、答えは
+  // ```file:〜 のファイルブロック形式で返る。時間制メーターは
+  // 他のサーバー側モデルと同じ扱い。
+  // /code の接続先は CODE_SERVER_BASE_URL（本番では
+  // CUBE_SERVER_BASE_URL と同一）。
+  code: {
+    id: "code",
+    label: "Cube Code",
+    engine: "code",
+    defaultBaseUrl: "",
+    urlKey: "",
+    maxNew: 3072,
     expect: null,
   },
 };
@@ -1085,10 +1106,11 @@ function getCubeMeter() {
 
 /* このモデルIDがメーター対象（サーバー側）かどうか。Ultra は
    iMac サーバー固定、Twin / Pro / Max は engine "server"、
-   Cube 会話は engine "chat"（iMac のオンデマンド起動）。
+   Cube 会話は engine "chat"、Cube Code は engine "code"
+   （どちらも iMac のオンデマンド起動）。
    端末内モデル（Nano / Flash）は対象外。 */
 function meterAppliesTo(id) {
-  return id === "ultra" || modelDef(id).engine === "server" || modelDef(id).engine === "chat";
+  return id === "ultra" || modelDef(id).engine === "server" || modelDef(id).engine === "chat" || modelDef(id).engine === "code";
 }
 
 /* メーター切れの例外。生成経路が残量0を検知したときに投げる。 */
@@ -1646,6 +1668,9 @@ const UltraImacModel = {
 /* ================================================================== */
 
 const CUBE_SERVER_BASE_URL = "https://imac.tail9ed76a.ts.net:8443";
+/* Cube Code の接続先は本番の cube-server（CUBE_SERVER_BASE_URL の
+   /code 系エンドポイント）。 */
+const CODE_SERVER_BASE_URL = CUBE_SERVER_BASE_URL;
 const CUBE_SERVER_HEALTH_TIMEOUT_MS = 15000;
 const CUBE_SERVER_GENERATE_TIMEOUT_MS = 300000;
 const CUBE_SERVER_POLL_INTERVAL_MS = 3000;
@@ -1812,7 +1837,7 @@ const ChatModel = {
      状態を忘れ、素直な文面の例外にする（他のサーバーエンジンと同
      じ流儀）。 */
   async generate(question, historyMessages) {
-    if (!this.connected) throw new Error("Cube 会話（iMacサーバー）が接続されていません");
+    if (!this.connected) throw new Error("Cube Speak（iMacサーバー）が接続されていません");
     const messages = [
       ...(Array.isArray(historyMessages) ? historyMessages : []),
       { role: "user", content: question },
@@ -1848,6 +1873,107 @@ const ChatModel = {
     this.connected = false;
   },
 };
+
+/* ================================================================== */
+/* プログラミング専門モデルエンジン（Cube Code）                       */
+/*                                                                    */
+/* コード専門（Qwen2.5-Coder-7B-Instruct ＋ コード LoRA）は iMac の   */
+/* llama-server（8098 番）で動かし、cube-server の /code が窓口。     */
+/* 会話モデルと同じくオンデマンド起動（初回はモデルの読み込みで       */
+/* 数十秒〜数分かかる）で、10分無通信で自動停止する。システム         */
+/* プロンプトは学習・ハーネス時固定のためサーバー側が差し込む——     */
+/* ページは user / assistant の会話列だけを送り、system は絶対に      */
+/* 送らない。生成はコード本体が長いため、接続・生成とも会話モデル     */
+/* より長いタイムアウトを持つ。答えは ```file:〜 のファイル          */
+/* ブロック形式（末尾に DONE）で返る。                               */
+/* ================================================================== */
+
+const CODE_CONNECT_TIMEOUT_MS = 300000;
+const CODE_GENERATE_TIMEOUT_MS = 900000;
+const CODE_PARAM_COUNT = 7615616512;
+
+const CodeModel = {
+  connected: false,
+  get ready() { return this.connected; },
+  readyFor(id) { return id === "code" && this.connected; },
+  paramCountFor() { return CODE_PARAM_COUNT; },
+  /* 接続：サーバー側の /code/start がモデルの起動完了まで待って
+     から返す（オンデマンド起動）。 */
+  async connect(onPolling) {
+    if (this.connected) return;
+    if (onPolling) onPolling();
+    let res;
+    try {
+      res = await fetchWithTimeout(
+        `${CODE_SERVER_BASE_URL}/code/start`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+        CODE_CONNECT_TIMEOUT_MS,
+      );
+    } catch {
+      throw new Error(CUBE_SERVER_UNREACHABLE);
+    }
+    const data = res ? await res.json().catch(() => null) : null;
+    if (!res || !res.ok || !data || data.state !== "ready") {
+      const detail = data && typeof data.error === "string" ? data.error : "";
+      throw new Error(
+        detail ? `${CUBE_SERVER_UNREACHABLE}（サーバーの応答: ${detail}）` : CUBE_SERVER_UNREACHABLE,
+      );
+    }
+    this.connected = true;
+  },
+  /* 生成：会話列（履歴＋今回の依頼）をそのまま渡す。履歴には前回
+     出したコード全文が入りうる（「直して」への対応のため）。 */
+  async generate(question, historyMessages) {
+    if (!this.connected) throw new Error("Cube Code（iMacサーバー）が接続されていません");
+    const messages = [
+      ...(Array.isArray(historyMessages) ? historyMessages : []),
+      { role: "user", content: question },
+    ];
+    let res;
+    try {
+      res = await fetchWithTimeout(
+        `${CODE_SERVER_BASE_URL}/code`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages, max_tokens: modelDef("code").maxNew }),
+        },
+        CODE_GENERATE_TIMEOUT_MS,
+      );
+    } catch {
+      this.connected = false;
+      throw new Error(CUBE_SERVER_UNREACHABLE);
+    }
+    const data = res ? await res.json().catch(() => null) : null;
+    if (!res || !res.ok || !data || typeof data.text !== "string") {
+      this.connected = false;
+      const detail = data && typeof data.error === "string" ? data.error : "";
+      throw new Error(
+        detail ? `${CUBE_SERVER_UNREACHABLE}（サーバーの応答: ${detail}）` : CUBE_SERVER_UNREACHABLE,
+      );
+    }
+    return data.text.trim();
+  },
+  /* 接続状態を忘れる（他のモデルが選択されたとき）。サーバー側の
+     常駐には触れない（無通信10分で自動停止する）。 */
+  dispose() {
+    this.connected = false;
+  },
+};
+
+/* モデルの生出力から ```file:名前 ブロックを取り出す。取り出せ
+   なければ null（呼び出し側は生テキストをそのまま出す）。 */
+function parseCodeFiles(text) {
+  const files = [];
+  const re = /```file:([^\n`]+)\n([\s\S]*?)(?:```|$)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const name = m[1].trim();
+    const content = m[2].replace(/\n+$/, "");
+    if (name && content) files.push({ name, content });
+  }
+  return files.length ? files : null;
+}
 
 async function loadUltra(onProgress) {
   return UltraModel.load(onProgress);
@@ -2030,6 +2156,18 @@ async function generateForModel(id, question, opts) {
         () => ChatModel.generate(question, opts && opts.historyMessages));
     }
     return ChatModel.generate(question, opts && opts.historyMessages);
+  }
+  if (modelDef(id).engine === "code") {
+    /* プログラミング専門（Cube Code）も時間制メーターの対象
+       （サーバー側モデルと同じ扱い）。会話列は opts.historyMessages
+       で受け取る（前回出したコード全文が入りうる）。 */
+    const meter = getCubeMeter();
+    if (meter) {
+      if (!meter.canUse()) throw meterEmptyError();
+      return meter.consumeAround(
+        () => CodeModel.generate(question, opts && opts.historyMessages));
+    }
+    return CodeModel.generate(question, opts && opts.historyMessages);
   }
   if (modelDef(id).engine === "server") {
     /* サーバーモデル（Twin / Pro / Max）は時間制メーターの対象。
@@ -2399,6 +2537,7 @@ function modelReadyFor(id) {
     return UltraModel.readyFor(id) || UltraGgufModel.readyFor(id) || UltraImacModel.readyFor(id);
   }
   if (modelDef(id).engine === "chat") return ChatModel.readyFor(id);
+  if (modelDef(id).engine === "code") return CodeModel.readyFor(id);
   if (modelDef(id).engine === "server") return ServerModel.readyFor(id);
   return LocalModel.readyFor(id);
 }
@@ -14183,8 +14322,9 @@ const App = {
     this.modelId = MODELS[savedId] ? savedId : "v1";
     const def = modelDef(this.modelId);
     // Ultra とサーバーモデル（Twin / Pro / Max）と雑談専門（会話）
-    // にはベースURLが無い（どれも iMac サーバーで動かす）。
-    this.baseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat"
+    // とコード専門（Code）にはベースURLが無い（どれも iMac
+    // サーバーで動かす）。
+    this.baseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code"
       ? ""
       : store.get(def.urlKey) || def.defaultBaseUrl;
     el("base-url").value = this.baseUrl;
@@ -14362,7 +14502,7 @@ const App = {
     this.modelId = id;
     store.set(MODEL_ID_KEY, id);
     const def = modelDef(id);
-    this.baseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat"
+    this.baseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code"
       ? ""
       : store.get(def.urlKey) || def.defaultBaseUrl;
     el("base-url").value = this.baseUrl;
@@ -14373,10 +14513,10 @@ const App = {
     if (id !== "ultra" && pendingChatImage) pendingChatImage = null;
     this.syncAttach();
     this.syncSend();
-    // iMac で動かすモデル（Twin / Pro / Max / Ultra / 会話）は、
-    // 選ばれた時点でそのまま接続する（待機表示で止めない）。端末内
-    // モデルは従来どおり loadModel で読み込む。
-    if (def.engine === "ultra" || def.engine === "server" || def.engine === "chat") {
+    // iMac で動かすモデル（Twin / Pro / Max / Ultra / 会話 /
+    // Code）は、選ばれた時点でそのまま接続する（待機表示で
+    // 止めない）。端末内モデルは従来どおり loadModel で読み込む。
+    if (def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code") {
       await this.connectServerModel();
     } else {
       await this.loadModel(this.baseUrl);
@@ -14422,7 +14562,7 @@ const App = {
     // ベースURL欄にはその旨を表示する。未接続（standby）・接続
     // エラー（error）のときは、接続／再試行のボタンも出す。
     const def = modelDef(this.modelId);
-    const noBaseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat";
+    const noBaseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code";
     const baseInput = el("base-url");
     if (baseInput) baseInput.disabled = noBaseUrl;
     const loadBtn = el("load-model-btn");
@@ -14533,6 +14673,7 @@ const App = {
     const def = modelDef(this.modelId);
     if (def.engine === "ultra") return this.loadUltraImac();
     if (def.engine === "chat") return this.connectChatModel();
+    if (def.engine === "code") return this.connectCodeModel();
     if (def.engine !== "server") return;
     if (ServerModel.readyFor(def.id)) {
       this.setModelStatus({
@@ -14546,6 +14687,7 @@ const App = {
     // エンジンは常に1つだけ）。
     disposeUltra();
     ChatModel.dispose();
+    CodeModel.dispose();
     this.setUltraGgufNotice(null);
     this.setUltraEngineChoice(false);
     this.modelBusy = true;
@@ -14596,6 +14738,7 @@ const App = {
     const seq = ++this.serverLoadSeq;
     disposeUltra();
     ServerModel.dispose();
+    CodeModel.dispose();
     this.setUltraGgufNotice(null);
     this.setUltraEngineChoice(false);
     this.modelBusy = true;
@@ -14630,6 +14773,55 @@ const App = {
     }
   },
 
+  /* プログラミング専門（Cube Code）の接続：サーバー側は
+     オンデマンド起動で、初回はモデルの読み込みに時間がかかる
+     （/code/start が起動完了まで待って返す）。開始時に他の
+     エンジンの接続状態は破棄する（アクティブなエンジンは
+     常に1つだけ）。 */
+  async connectCodeModel() {
+    const def = modelDef(this.modelId);
+    if (CodeModel.readyFor(def.id)) {
+      this.setModelStatus({ kind: "ready", paramCount: CodeModel.paramCountFor() });
+      return;
+    }
+    const seq = ++this.serverLoadSeq;
+    disposeUltra();
+    ServerModel.dispose();
+    ChatModel.dispose();
+    this.setUltraGgufNotice(null);
+    this.setUltraEngineChoice(false);
+    this.modelBusy = true;
+    this.renderModelSwitch();
+    this.setModelStatus({
+      kind: "loading",
+      loadedBytes: 0,
+      totalBytes: 0,
+      label: `${def.label}（iMacサーバーに接続しています）`,
+    });
+    try {
+      await CodeModel.connect(() => {
+        if (seq !== this.serverLoadSeq) return;
+        this.setModelStatus({
+          kind: "loading",
+          loadedBytes: 0,
+          totalBytes: 0,
+          label: `${def.label}（iMac側でモデルを起動中です。初回は少し時間がかかります）`,
+        });
+      });
+      if (seq !== this.serverLoadSeq) return;
+      this.setModelStatus({ kind: "ready", paramCount: CodeModel.paramCountFor() });
+    } catch (e) {
+      if (seq !== this.serverLoadSeq) return;
+      const message = e instanceof Error ? e.message : String(e);
+      this.setModelStatus({ kind: "error", message });
+    } finally {
+      if (seq === this.serverLoadSeq) {
+        this.modelBusy = false;
+        this.renderModelSwitch();
+      }
+    }
+  },
+
   async loadModel(url) {
     const def = modelDef(this.modelId);
     if (def.engine === "ultra") {
@@ -14646,6 +14838,7 @@ const App = {
       this.setUltraEngineChoice(false);
       ServerModel.dispose();
       ChatModel.dispose();
+      CodeModel.dispose();
       if (UltraImacModel.ready) {
         this.setModelStatus({ kind: "ready", paramCount: ULTRA_PARAM_COUNT });
         return;
@@ -14667,6 +14860,7 @@ const App = {
       this.setUltraEngineChoice(false);
       disposeUltra();
       ChatModel.dispose();
+      CodeModel.dispose();
       if (ServerModel.readyFor(def.id)) {
         this.setModelStatus({
           kind: "ready",
@@ -14690,8 +14884,31 @@ const App = {
       this.setUltraEngineChoice(false);
       disposeUltra();
       ServerModel.dispose();
+      CodeModel.dispose();
       if (ChatModel.readyFor(def.id)) {
         this.setModelStatus({ kind: "ready", paramCount: ChatModel.paramCountFor() });
+        return;
+      }
+      this.setModelStatus({
+        kind: "standby",
+        message: `${def.label} は未接続です。iMacサーバーに接続してください`,
+      });
+      return;
+    }
+    if (def.engine === "code") {
+      // プログラミング専門（Cube Code）：端末には読み込まない。
+      // ここ（ページ表示時・選択の復元時）は自動では接続せず、
+      // 未接続の待機表示にする。接続はモデルが選ばれたとき
+      // （switchModel）と接続ボタンから、connectServerModel
+      // 経由で行う。
+      this.ultraLoadSeq++;
+      this.setUltraGgufNotice(null);
+      this.setUltraEngineChoice(false);
+      disposeUltra();
+      ServerModel.dispose();
+      ChatModel.dispose();
+      if (CodeModel.readyFor(def.id)) {
+        this.setModelStatus({ kind: "ready", paramCount: CodeModel.paramCountFor() });
         return;
       }
       this.setModelStatus({
@@ -14710,6 +14927,7 @@ const App = {
     disposeUltra();
     ServerModel.dispose();
     ChatModel.dispose();
+    CodeModel.dispose();
     // ベースURLの上書きは選択中モデルごとのキーに保存する
     // （Nano は従来の jisaku-ai-model-base-url、Flash は専用キー）。
     store.set(def.urlKey, url);
@@ -14852,6 +15070,7 @@ const App = {
     UltraGgufModel.dispose();
     ServerModel.dispose();
     ChatModel.dispose();
+    CodeModel.dispose();
     this.setUltraEngineChoice(false);
     this.setUltraGgufNotice(null);
     this.modelBusy = true;
@@ -15046,6 +15265,15 @@ const App = {
         /* カード描画の失敗は会話を妨げない */
       }
     }
+    // Cube Code の生成コード：ファイルごとにコードブロック＋
+    // コピーボタンで出し、index.html があればプレビューも付ける。
+    if (Array.isArray(msg.codeFiles) && msg.codeFiles.length) {
+      try {
+        li.appendChild(this.buildCodeBlocks(msg.codeFiles));
+      } catch {
+        /* コード描画の失敗は会話を妨げない */
+      }
+    }
     if (msg.evidence) {
       const ev = document.createElement("p");
       ev.className = "evidence";
@@ -15103,6 +15331,83 @@ const App = {
     el("msg-list").appendChild(li);
     this.historyCaptureAssistant(msg);
     this.scrollChat();
+  },
+
+  /* Cube Code の生成コードの表示部品：ファイルごとのブロック
+     （ファイル名＋コピーボタン＋コード本文）と、index.html が
+     ある場合のプレビューボタン。プレビューは css / js ファイル
+     への参照を中身に差し替えた単一 HTML を Blob で開く。 */
+  buildCodeBlocks(files) {
+    const wrap = document.createElement("div");
+    wrap.className = "code-answer";
+    for (const f of files) {
+      const block = document.createElement("div");
+      block.className = "code-file";
+      const head = document.createElement("div");
+      head.className = "code-file-head";
+      const name = document.createElement("span");
+      name.className = "code-file-name mono";
+      name.textContent = f.name;
+      head.appendChild(name);
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "code-copy-btn";
+      copyBtn.textContent = "コピー";
+      copyBtn.addEventListener("click", () => {
+        const done = () => { copyBtn.textContent = "コピーしました"; };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(f.content).then(done, done);
+        } else {
+          const ta = document.createElement("textarea");
+          ta.value = f.content;
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand("copy"); } catch { /* 失敗しても表示は続ける */ }
+          ta.remove();
+          done();
+        }
+        setTimeout(() => { copyBtn.textContent = "コピー"; }, 2000);
+      });
+      head.appendChild(copyBtn);
+      block.appendChild(head);
+      const pre = document.createElement("pre");
+      pre.className = "code-body";
+      const code = document.createElement("code");
+      code.textContent = f.content;
+      pre.appendChild(code);
+      block.appendChild(pre);
+      wrap.appendChild(block);
+    }
+    const indexFile = files.find((f) => /(^|\/)index\.html$/i.test(f.name));
+    if (indexFile) {
+      const previewBtn = document.createElement("button");
+      previewBtn.type = "button";
+      previewBtn.className = "code-preview-btn";
+      previewBtn.textContent = "プレビューを開く";
+      previewBtn.addEventListener("click", () => {
+        let html = indexFile.content;
+        for (const f of files) {
+          if (f === indexFile) continue;
+          const base = f.name.split("/").pop();
+          if (/\.css$/i.test(f.name)) {
+            html = html.replace(
+              new RegExp(`<link[^>]*href=["'](?:[^"']*/)?${base.replace(/\./g, "\\.")}["'][^>]*>`, "i"),
+              () => `<style>\n${f.content}\n</style>`,
+            );
+          } else if (/\.js$/i.test(f.name)) {
+            html = html.replace(
+              new RegExp(`<script[^>]*src=["'](?:[^"']*/)?${base.replace(/\./g, "\\.")}["'][^>]*>\\s*</script>`, "i"),
+              () => `<script>\n${f.content}\n</script>`,
+            );
+          }
+        }
+        const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+        window.open(url, "_blank");
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+      });
+      wrap.appendChild(previewBtn);
+    }
+    return wrap;
   },
 
   /* ---- YouTube要約レーンの実行と表示 ----
@@ -17770,6 +18075,17 @@ const App = {
           /* カードが残せなくても会話履歴は守る */
         }
       }
+      // Cube Code の生成コード（ファイル名と中身）も一緒に残し、
+      // 履歴から復元したときも同じ形で出し直す。あわせて、
+      // 続きの依頼（「直して」）でモデルが前回のコードを見られる
+      // ようにする（historyMessagesForCode が組み立て直す）。
+      if (msg && Array.isArray(msg.codeFiles) && msg.codeFiles.length) {
+        try {
+          turn.codeFiles = JSON.parse(JSON.stringify(msg.codeFiles));
+        } catch {
+          /* コードが残せなくても会話履歴は守る */
+        }
+      }
       this.historyCurrent.turns.push(turn);
       this.historyCurrent.updated_at = new Date().toISOString();
       this.persistCurrentConversation();
@@ -17878,6 +18194,48 @@ const App = {
       if (picked.length > 0 && used + text.length > 1600) break;
       picked.unshift({
         role: usable[i].role === "user" ? "user" : "assistant",
+        content: text,
+      });
+      used += text.length;
+    }
+    return picked.length ? picked : null;
+  },
+
+  /* プログラミング専門（Cube Code）用：現在の会話の直近の
+     やり取りを user / assistant のメッセージ列にする。雑談用と
+     違い、AI ターンはコード全文（保存された codeFiles から
+     学習時と同じ ```file: 形式に組み立て直したもの）を渡す
+     ——「直して」「〜を追加して」という続きの依頼で、モデルが
+     自分の前回のコードを見て直すために必要（ハーネスの修正
+     ラウンドと同じ考え方）。上限は直近6ターン・AI ターン
+     1件 12000字・合計 24000字（サーバー側の上限とも整合）。 */
+  historyMessagesForCode() {
+    if (!this.historyCurrent) return null;
+    const turns = this.historyCurrent.turns || [];
+    const prior =
+      turns.length && turns[turns.length - 1].role === "user"
+        ? turns.slice(0, -1)
+        : turns.slice();
+    const usable = prior.filter(
+      (t) => t.role === "user" || (t.role === "ai" && !t.memnote),
+    );
+    if (!usable.length) return null;
+    const picked = [];
+    let used = 0;
+    for (let i = usable.length - 1; i >= 0 && picked.length < 6; i--) {
+      const t = usable[i];
+      let text;
+      if (t.role === "ai" && Array.isArray(t.codeFiles) && t.codeFiles.length) {
+        text = t.codeFiles
+          .map((f) => "```file:" + f.name + "\n" + f.content + "\n```")
+          .join("\n\n") + "\nDONE";
+      } else {
+        text = String(t.text || "");
+      }
+      if (text.length > 12000) text = text.slice(0, 12000) + "…";
+      if (picked.length > 0 && used + text.length > 24000) break;
+      picked.unshift({
+        role: t.role === "user" ? "user" : "assistant",
         content: text,
       });
       used += text.length;
@@ -18693,13 +19051,13 @@ const App = {
           this.pushAssistant({
             text: chatText,
             badge: "none",
-            note: "雑談と判定して、Cube 会話（雑談専門モデル）に託した返事です。会話のためのモデルなので、事実の質問には答えません。事実を知りたいときは、そのまま質問してください（裏づけ確認の経路で調べます）。",
+            note: "雑談と判定して、Cube Speak（雑談専門モデル）に託した返事です。会話のためのモデルなので、事実の質問には答えません。事実を知りたいときは、そのまま質問してください（裏づけ確認の経路で調べます）。",
           });
         } else {
           this.pushAssistant({
             text: "うまく返事を作れませんでした。もう一度送ってみてください。",
             badge: "unknown",
-            note: "Cube 会話（雑談専門モデル）が空の返事を返しました。",
+            note: "Cube Speak（雑談専門モデル）が空の返事を返しました。",
           });
         }
       } catch (e) {
@@ -18715,7 +19073,76 @@ const App = {
           this.pushAssistant({
             text: "雑談専門モデルでエラーが起きました。",
             badge: "unknown",
-            note: `Cube 会話（iMacサーバー）への接続で問題が起きました: ${message}`,
+            note: `Cube Speak（iMacサーバー）への接続で問題が起きました: ${message}`,
+          });
+        }
+      }
+      return;
+    }
+
+    // 2.7) Cube Code が選ばれているときは、プログラミング専門
+    // モデルが直接担当する（雑談専門を選んだときと同じ考え方）。
+    // コードは事実の裏づけで測る対象ではないため、検証ゲートには
+    // 通さず、生成されたファイルをそのまま出す。接続は選択時にも
+    // 行うが、未接続ならここでも行う。生成には前回までのコード
+    // 全文を含む会話列を渡し、「直して」「〜を追加して」という
+    // 続きの依頼でモデルが自分のコードを見て直せるようにする。
+    // 知識メモ帳には保存しない（コードは事実の答えではない）。
+    if (modelDef(this.modelId).engine === "code") {
+      const meter = getCubeMeter();
+      if (meter && !meter.canUse()) {
+        this.pushAssistant({
+          text: "サーバーモデルの時間メーターが0になりました。",
+          badge: "unknown",
+          note: "Cube Nano / Cube Flash はこの端末の中で動くため、メーターなしでそのまま使えます。モデルを切り替えてお試しください。ログイン中なら、ポイントでメーター時間を追加することもできます（サイドバーの「ポイントでメーター追加」）。メーターの無料分は日付が変わると戻ります。",
+        });
+        return;
+      }
+      this.setPhase("thinking");
+      try {
+        if (!CodeModel.readyFor("code")) {
+          await CodeModel.connect();
+        }
+        const raw = await generateForModel("code", question, {
+          historyMessages: this.historyMessagesForCode(),
+        });
+        this.setPhase("idle");
+        const files = raw ? parseCodeFiles(raw) : null;
+        if (files) {
+          const lead = raw.slice(0, raw.indexOf("```file:")).trim();
+          this.pushAssistant({
+            text: lead || "アプリを作りました。",
+            codeFiles: files,
+            badge: "none",
+            note: "Cube Code（プログラミング専門モデル）が作ったコードです。プレビューで動きを確認できます。「ボタンを大きくして」のように続けて頼むと、前回のコードを見て直します。",
+          });
+        } else if (raw) {
+          this.pushAssistant({
+            text: raw,
+            badge: "none",
+            note: "Cube Code（プログラミング専門モデル）の返事です。",
+          });
+        } else {
+          this.pushAssistant({
+            text: "うまくコードを作れませんでした。もう一度送ってみてください。",
+            badge: "unknown",
+            note: "Cube Code（プログラミング専門モデル）が空の返事を返しました。",
+          });
+        }
+      } catch (e) {
+        this.setPhase("idle");
+        if (e && e.code === "METER_EMPTY") {
+          this.pushAssistant({
+            text: "サーバーモデルの時間メーターが0になりました。",
+            badge: "unknown",
+            note: "Cube Nano / Cube Flash はこの端末の中で動くため、メーターなしでそのまま使えます。モデルを切り替えてお試しください。ログイン中なら、ポイントでメーター時間を追加することもできます（サイドバーの「ポイントでメーター追加」）。メーターの無料分は日付が変わると戻ります。",
+          });
+        } else {
+          const message = e instanceof Error ? e.message : String(e);
+          this.pushAssistant({
+            text: "プログラミング専門モデルでエラーが起きました。",
+            badge: "unknown",
+            note: `Cube Code（iMacサーバー）への接続で問題が起きました: ${message}`,
           });
         }
       }
@@ -19387,7 +19814,7 @@ if (typeof module !== "undefined" && module.exports) {
     pointsJstDateKey, pointsDailyLoginKey, pointsNewTopupKey,
     POINTS_TOPUP_MENU, POINTS_BONUS_KEY,
     getCubeMeter, meterAppliesTo, meterEmptyError,
-    ServerModel, ChatModel, CHAT_PARAM_COUNT, generateForModel, CUBE_SERVER_BASE_URL, CUBE_SERVER_UNREACHABLE,
+    ServerModel, ChatModel, CHAT_PARAM_COUNT, CodeModel, CODE_PARAM_COUNT, CODE_SERVER_BASE_URL, parseCodeFiles, generateForModel, CUBE_SERVER_BASE_URL, CUBE_SERVER_UNREACHABLE,
     readUltraStage, writeUltraStage,
     ULTRA_REPO, ULTRA_PARAM_COUNT, ULTRA_MAX_NEW_TOKENS,
     ULTRA_GGUF_URL, WLLAMA_ESM_URL, WLLAMA_WASM_FROM_CDN_URL,
