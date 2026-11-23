@@ -1532,6 +1532,11 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 
 const UltraImacModel = {
   connected: false,
+  /* このセッションで一度でも接続できたか。接続復旧（tryRecoverUltraImac）
+     は「以前つながっていたのに切れた」場合にだけ試すための印。端末内
+     エンジン（ONNX / GGUF）を使う利用者では常に false で、復旧試行は
+     一切走らない。 */
+  everConnected: false,
   get ready() { return this.connected; },
   readyFor(id) { return id === "ultra" && this.connected; },
   /* 「読み込み」は iMac への到達確認だけ（端末へのダウンロードは無い）。
@@ -1551,6 +1556,32 @@ const UltraImacModel = {
     }
     if (!res || !res.ok) throw new Error(ULTRA_IMAC_UNREACHABLE);
     this.connected = true;
+    this.everConnected = true;
+  },
+  /* /health だけで接続の生死を確かめる軽い確認（生成失敗時の切断判定
+     と、質問開始時の復旧判定に使う）。 */
+  async probeConnected(timeoutMs) {
+    try {
+      const res = await fetchWithTimeout(
+        `${ULTRA_IMAC_BASE_URL}/health`,
+        { method: "GET" },
+        timeoutMs ?? 5000,
+      );
+      return !!(res && res.ok);
+    } catch {
+      return false;
+    }
+  },
+  /* 生成が1回失敗しただけでは接続を切らない。/health が応答するなら
+     一過性の失敗（生成のタイムアウト等）として接続を維持し、health
+     も落ちているときだけ切断を確定する。以前は生成の失敗1回で
+     connected=false になり、そのセッションの以後すべての質問で
+     生成・検証ゲート・Web検索フォールバックが「読み込まれていない」
+     扱いで黙って死んでいた（2026-11-22 実測：Ultra の抑制29件中
+     28件がこの型で、原因内訳も「抽出失敗」に誤分類されていた）。 */
+  async disconnectUnlessAlive() {
+    this.connected = await this.probeConnected(5000);
+    if (this.connected) this.everConnected = true;
   },
   /* アプリがモデルへ渡すプロンプト文字列から、iMac 上の llama-server
      （OpenAI 互換 /v1/chat/completions）で答えを生成する。メッセージと
@@ -1580,11 +1611,11 @@ const UltraImacModel = {
         ULTRA_IMAC_GENERATE_TIMEOUT_MS,
       );
     } catch {
-      this.connected = false;
+      await this.disconnectUnlessAlive();
       throw new Error(ULTRA_IMAC_UNREACHABLE);
     }
     if (!res || !res.ok) {
-      this.connected = false;
+      await this.disconnectUnlessAlive();
       throw new Error(ULTRA_IMAC_UNREACHABLE);
     }
     const data = await res.json().catch(() => null);
@@ -1860,6 +1891,27 @@ function disposeUltra() {
   UltraModel.dispose();
   UltraGgufModel.dispose();
   UltraImacModel.dispose();
+}
+
+/* Ultra（iMac）の接続復旧：接続が切れたままのセッションでは、生成・
+   検証ゲート・Web検索フォールバックの全経路が「モデルの答えなし」に
+   潰れてしまうため、質問の開始時と Web フォールバックの直前に、1回
+   だけ /health で復旧を試す。一度も接続したことのないセッション
+   （端末内エンジン利用時など）では何もしない。試行は30秒に1回まで
+   に絞る（iMac が落ちているときに質問のたびに待たせないため）。 */
+let lastUltraImacRecoverTryMs = 0;
+async function tryRecoverUltraImac() {
+  if (UltraImacModel.connected) return true;
+  if (!UltraImacModel.everConnected) return false;
+  const now = Date.now();
+  if (now - lastUltraImacRecoverTryMs < 30000) return false;
+  lastUltraImacRecoverTryMs = now;
+  try {
+    await UltraImacModel.load(() => {});
+  } catch {
+    /* まだ届かない：従来どおり未接続として進む */
+  }
+  return UltraImacModel.connected;
 }
 
 /* ================================================================== */
@@ -7022,7 +7074,7 @@ function superlativeWinnerSource(sentence, results, question) {
         const d = superlativeDirection(ls);
         if (qDir !== 0 && d !== 0 && d !== qDir) continue;
         const asserts =
-          titleEq ||
+          (titleEq && !sentenceSubjectBlocksWinner(ls, winner, question)) ||
           ls.includes(`${winner}が最も`) ||
           ls.includes(`${winner}が一番`) ||
           ls.includes(`${winner}は最も`) ||
@@ -7031,7 +7083,9 @@ function superlativeWinnerSource(sentence, results, question) {
           ls.includes(`のは${winner}`) ||
           ls.includes(`は${winner}である`);
         if (!asserts) continue;
-        if (/ではなく|でなく|誤り|間違い/.test(ls)) continue;
+        if (/ではなく|でなく|誤り|間違い|と思われがち|という誤解/.test(ls)) {
+          continue;
+        }
         return r;
       }
     }
@@ -7072,8 +7126,15 @@ function superlativeClaimWinner(sentence) {
  * 琵琶湖」（面積の主張）が「日本で一番深い湖」（深さの質問）の
  * 裏づけになってしまう（第2回実測 a15 の誤確認）。属性の系統が
  * 質問から読み取れない場合は、その項目は判定しない。
+ * 2026-11-23 強化：勝者の名前が文に「現れている」だけでは足りず、
+ * その文が勝者を順位の持ち主として「主張」していることまで求める
+ * （sentenceAssertsWinner）。「富士山に次ぐ日本で二番目に高い山は
+ * 北岳です」の文は、富士山の名を含むが、二番目の持ち主として
+ * 主張しているのは北岳であり、富士山の答えの裏づけにはならない
+ * （第5回実測 c13 の穴）。result は裏づけ候補の記事（タイトルが
+ * 勝者自身の記事かどうかの判定に使う）。
  */
-function superlativeSentenceAgrees(ls, question, claimSentence) {
+function superlativeSentenceAgrees(ls, question, claimSentence, result) {
   const qRank = superlativeRank(question);
   if (qRank) {
     const rankOk =
@@ -7087,8 +7148,14 @@ function superlativeSentenceAgrees(ls, question, claimSentence) {
   const d = superlativeDirection(ls);
   if (qDir !== 0 && d !== 0 && d !== qDir) return false;
   const winner = superlativeClaimWinner(claimSentence);
-  if (winner && !normalizeJa(ls).includes(normalizeJa(winner))) {
-    return false;
+  if (winner) {
+    const titleEq =
+      !!result &&
+      (titleMatchesSubject(result.title ?? "", winner) ||
+        normalizeJa(
+          (result.title ?? "").replace(/[（(][^（）()]*[）)]\s*$/, ""),
+        ) === normalizeJa(winner));
+    if (!sentenceAssertsWinner(ls, winner, question, titleEq)) return false;
   }
   return true;
 }
@@ -7149,7 +7216,7 @@ function definitionSentenceSource(sentence, results, question) {
         if (qRank) {
           if (superlativeRank(ls) !== qRank) continue;
           if (headNoun && !ls.includes(headNoun)) continue;
-          if (!superlativeSentenceAgrees(ls, question, sentence)) continue;
+          if (!superlativeSentenceAgrees(ls, question, sentence, r)) continue;
         }
         const w = normalizeUnits(normalizeJa(`${r.title}\n${ls}`));
         if (content.length === 1 && !/^\d/.test(content[0]) && ne) {
@@ -7360,7 +7427,7 @@ function rankWindowSupports(result, sentence, question, qRank) {
       ) {
         continue;
       }
-      if (!superlativeSentenceAgrees(ws, question, sentence)) continue;
+      if (!superlativeSentenceAgrees(ws, question, sentence, result)) continue;
       return true;
     }
   }
@@ -7442,6 +7509,56 @@ const SUPERLATIVE_ATTR_FORMS = [
   [/深さ|深い|浅い/, ["深さ", "深い", "水深", "最大"]],
 ];
 
+/* 属性そのものを主題にする文（「標高は…」）の主題の末尾語。 */
+const WINNER_SUBJECT_ATTR_TAILS = new Set([
+  "標高", "高さ", "面積", "長さ", "全長", "深さ", "人口", "重さ", "重量",
+  "速さ", "速度", "所在地", "水深",
+]);
+
+/**
+ * 証拠文の主題が、勝者とは別の対象を指しているか。勝者自身の記事の
+ * 中にも「北岳 - 現在の日本で2番目に高い山」のような、別対象を主題
+ * にして順位を述べる文がある（関連項目・列挙）。そういう文は、記事
+ * のタイトルが勝者と一致しても、勝者の順位の主張にはならない。
+ * 属性そのものを主題にする文（「標高は3,776メートルで日本一」）は
+ * 記事の主題についての文なので、別対象とはみなさない。主題の中に
+ * 勝者の名を含む文（「富士山に次ぐ…山は」等）は、この点検では
+ * 判断せず、主張の形の点検に任せる。
+ */
+function sentenceSubjectBlocksWinner(ls, winner, question) {
+  const subj = sentenceHeadSubject(ls);
+  if (!subj) return false;
+  if (!headSubjectsConflict(subj, winner)) return false;
+  if (subj.includes(winner)) return false;
+  // 主題そのものが順位の説明句（「富士山に次ぐ日本で二番目に高い山は
+  // 北岳です」の主題）の場合は、別対象の名ではなく順位の言い換え
+  // なので、主張の形の点検に任せる。
+  if (/一番|最も|二番目|2番目|第二|三番目|3番目|第三|最大|最高|最長|日本一|世界一/.test(subj)) {
+    return false;
+  }
+  const tail = subj.split("の").pop() ?? subj;
+  if (WINNER_SUBJECT_ATTR_TAILS.has(tail)) return false;
+  // 文の後半で勝者自身が主題として（質問と同じ順位を担って）現れる
+  // 場合は、別対象の文とはみなさない（「河川法上は…ため、信濃川は
+  // 日本で一番長い川となっている」のように、従属節の主題が先に
+  // 来る文があるため）。
+  const w = normalizeJa(winner);
+  const s = normalizeJa(ls);
+  const idx = s.indexOf(`${w}は`);
+  if (idx >= 0) {
+    const clause = s.slice(idx, idx + 60).split(/[、。]/)[0] ?? "";
+    const qRank = superlativeRank(question ?? "");
+    const rankPat =
+      qRank === 2
+        ? /二番目|2番目|第二/
+        : qRank === 3
+          ? /三番目|3番目|第三/
+          : /一番|最も|第1位|世界一|日本一|首位|最[長短高低大小速重広狭深浅新古多]/;
+    if (rankPat.test(clause)) return false;
+  }
+  return true;
+}
+
 /**
  * 証拠側の1文が、勝者を「その順位の持ち主」として主張しているか。
  * 勝者の名前が文に出ているだけ（候補の列挙・別対象の文への出現）
@@ -7451,12 +7568,21 @@ const SUPERLATIVE_ATTR_FORMS = [
  * 向き（大きい側／小さい側）も質問と矛盾しないこと。最X形
  * （最長・最高など）も順位の印として数える（superlativeRank は
  * 最X形を見ないため、ここでは印の集合を広げてある）。
+ * 2026-11-23 強化：タイトル一致でも、文の主題が別対象なら主張とは
+ * みなさない（sentenceSubjectBlocksWinner）。「は勝者だと思われ
+ * がち」のような誤解への言及も主張とはみなさない。
  */
 function sentenceAssertsWinner(ls, winner, question, titleEq) {
   const w = normalizeJa(winner);
   const s = normalizeJa(ls);
   if (!w) return false;
-  if (/ではなく|でなく|誤り|間違い/.test(ls)) return false;
+  if (
+    /ではなく|でなく|誤り|間違い|と思われがち|という誤解|と思っている人も/.test(
+      ls,
+    )
+  ) {
+    return false;
+  }
   const attr = SUPERLATIVE_ATTR_FORMS.find(([re]) => re.test(question));
   if (attr && !attr[1].some((x) => ls.includes(x))) return false;
   const qRank = superlativeRank(question);
@@ -7468,6 +7594,7 @@ function sentenceAssertsWinner(ls, winner, question, titleEq) {
   const qDir = superlativeDirection(question);
   const d = superlativeDirection(ls);
   if (qDir !== 0 && d !== 0 && d !== qDir) return false;
+  if (sentenceSubjectBlocksWinner(ls, winner, question)) return false;
   if (titleEq) return true;
   if (!s.includes(w)) return false;
   const we = escapeRegExp(w);
@@ -7478,14 +7605,16 @@ function sentenceAssertsWinner(ls, winner, question, titleEq) {
     return true;
   }
   if (s.includes(`のは${w}`)) return true;
-  if (new RegExp(`は${we}(?:である|です|だ)(?!という)`).test(s)) {
+  if (new RegExp(`は${we}(?:である|です|だ)(?!という|と思|と考|と言)`).test(s)) {
     return true;
   }
   const idx = s.indexOf(`${w}は`);
   if (idx >= 0) {
     const clause = s.slice(idx, idx + 60).split(/[、。]/)[0] ?? "";
     if (
-      /最|一番|第1位|世界一|日本一/.test(clause) &&
+      /最|一番|第1位|世界一|日本一|二番目|2番目|第二|三番目|3番目|第三/.test(
+        clause,
+      ) &&
       !/と言われ|という説|という主張|という意見|こともある/.test(clause)
     ) {
       return true;
@@ -7536,6 +7665,153 @@ function superlativeWinnerGrounded(sentence, question, ctx) {
         }
       }
     }
+  }
+  return false;
+}
+
+/**
+ * 「XはYです／でした」型の主張文から、結びつき（主題 X と値 Y）を
+ * 取り出す。断定形で終わらない文・主題が読み取れない文では null。
+ */
+function claimCopulaBinding(sentence) {
+  const s = String(sentence ?? "").trim();
+  const m =
+    /^(.{2,60}?)は[、,]?\s*「?(.{1,48}?)」?(?:です|でした|である|だった|だ)[。！]?$/.exec(
+      s,
+    );
+  if (!m) return null;
+  const subject = (m[1] ?? "").replace(/^[「『]/, "").trim();
+  const value = (m[2] ?? "").replace(/^(約|およそ)/, "").trim();
+  if (!subject || !value) return null;
+  if (/^(そう|これ|それ|はい|いいえ)$/.test(value)) return null;
+  return { subject, value };
+}
+
+/** 主題を「の」で割った断片（日付だけの断片は除く）。長い順。 */
+function subjectSegmentsOf(subject) {
+  return String(subject ?? "")
+    .split(/の/)
+    .map((x) => x.trim())
+    .filter(
+      (x) =>
+        x.length >= 2 &&
+        !/^\d{2,4}年$/.test(x) &&
+        !/^\d{1,2}月$/.test(x) &&
+        !/^\d{1,2}日$/.test(x),
+    )
+    .sort((a, b) => b.length - a.length);
+}
+
+/**
+ * 証拠側の1文が、主張の主題と結びついているか：
+ * (a) 文の主題が主張の主題と矛盾しない（一致・包含・属性形）
+ * (b) 文の主題が主張の「値」そのもので、主題の断片が文に残る
+ *     （「チャールズ3世はイギリスの国王である」型）
+ * (c) 主題の最長断片が文に現れ、文の主題がそれと矛盾しないか、
+ *     裏づけ記事のタイトルがその断片を指している
+ * (d) 主題の断片（の／から／まで で割った語）が2つ以上文に現れる
+ */
+function subjectLinkedInSentence(ls, binding, src) {
+  const nls = normalizeJa(ls);
+  const subj = binding.subject;
+  const lsSubj = sentenceHeadSubject(ls);
+  if (lsSubj && !headSubjectsConflict(lsSubj, subj)) return true;
+  const segs = subjectSegmentsOf(subj);
+  if (
+    lsSubj &&
+    binding.value &&
+    !headSubjectsConflict(lsSubj, binding.value)
+  ) {
+    if (segs.some((g) => nls.includes(normalizeJa(g)))) return true;
+  }
+  const longest = segs[0];
+  if (longest && nls.includes(normalizeJa(longest))) {
+    if (!lsSubj) return true;
+    if (!headSubjectsConflict(lsSubj, longest)) return true;
+    if (src && titleNamesSubject(src.title ?? "", longest)) return true;
+  }
+  const wide = String(subj)
+    .split(/の|から|まで/)
+    .map((x) => x.trim())
+    .filter((x) => x.length >= 2 && !/^\d{2,4}年$/.test(x));
+  const hits = wide.filter((g) => nls.includes(normalizeJa(g)));
+  if (hits.length >= 2) {
+    if (!lsSubj) return true;
+    if (hits.some((g) => !headSubjectsConflict(lsSubj, g))) return true;
+    const tail = lsSubj.split("の").pop() ?? lsSubj;
+    if (WINNER_SUBJECT_ATTR_TAILS.has(tail)) return true;
+  }
+  return false;
+}
+
+/**
+ * 窓照合（経路B）の追加条件：結びつきの一致（2026-11-23）。
+ * 窓照合は「主張の語と数字が同じ窓にそろう」ことしか見ておらず、
+ * 冒頭1600字の大きな窓では、別々の文に散らばった語の寄せ集めでも
+ * 通ってしまっていた（第5回実測 b3：東京オリンピックの話と開会式の
+ * 話と8月2日の話が別々の文にあるだけの証拠で、誤った日付の主張が
+ * 通過）。そこで、数値を含む文と「XはYです」型の文については、
+ * 裏づけ記事の中の「1つの文」が、主張の値（数字または名前）を含み、
+ * かつ主張の主題と結びついていることを追加で求める。
+ * 対象外：主題も数字も読み取れない文（従来どおり）、順位の質問
+ * （順位側の結びつき点検が担う）、年だけを答える日付の質問
+ * （年＋質問語3つ以上の窓照合が既にある）。種類つき事実の経路
+ * （経路A）は、抽出そのものが記事と値を結びつけているため対象に
+ * しない——m/s から換算した fact のように、根拠文の字面と値が
+ * 一致しない正しい事実を、字面の結びつきで落とさないためでもある。
+ */
+function windowClaimBindingOk(sentence, question, src, ctx) {
+  const binding = claimCopulaBinding(sentence);
+  const claimNums = numbersIn(sentence);
+  if (!binding && claimNums.length === 0) return true;
+  const valueNums = binding ? numbersIn(binding.value) : [];
+  const numsToCheck = valueNums.length > 0 ? valueNums : claimNums;
+  if (
+    numsToCheck.length === 1 &&
+    /^\d{4}$/.test(numsToCheck[0]) &&
+    Number(numsToCheck[0]) >= 1800 &&
+    Number(numsToCheck[0]) <= 2100 &&
+    classifyQuestion(question) === "date"
+  ) {
+    return true;
+  }
+  const sentences = [];
+  const pushText = (t) => {
+    for (const part of String(t ?? "").split(/(?<=[。！？\n])|…|\.\.\./)) {
+      const x = part.trim();
+      if (x) sentences.push(x);
+    }
+  };
+  if (src) {
+    if (src.title) sentences.push(src.title);
+    pushText(src.snippet);
+    pushText(src.text);
+  }
+  if (ctx?.article?.lead && ctx.article.title === src?.title) {
+    pushText(ctx.article.lead);
+  }
+  const terms = !binding
+    ? gateContentTerms(sentence, question).filter((t) => !/^\d/.test(t))
+    : [];
+  for (const ls of sentences) {
+    if (numsToCheck.length > 0) {
+      const evNums = numbersIn(normalizeUnits(normalizeJa(ls)));
+      if (
+        !numsToCheck.every((n) => evNums.some((e) => numbersMatchLoose(n, e)))
+      ) {
+        continue;
+      }
+    } else if (binding) {
+      if (!normalizeJa(ls).includes(normalizeJa(binding.value))) continue;
+    }
+    if (!binding) {
+      if (terms.length === 0) return true;
+      if (terms.some((t) => normalizeJa(ls).includes(normalizeJa(t)))) {
+        return true;
+      }
+      continue;
+    }
+    if (subjectLinkedInSentence(ls, binding, src)) return true;
   }
   return false;
 }
@@ -7599,6 +7875,13 @@ function verifySentence(sentence, question, ctx) {
     // この経路は不成立として、定義経路の順位つき窓を探し直す。
     const qRank = superlativeRank(question);
     if (qRank && !rankWindowSupports(src, sentence, question, qRank)) {
+      // fall through
+    } else if (
+      !qRank &&
+      !windowClaimBindingOk(sentence, question, src, ctx)
+    ) {
+      // 語と数字が窓にそろっていても、主題と値の結びつきが1つの文で
+      // 確認できない窓照合は裏づけにしない（下の経路で探し直す）。
       // fall through
     } else {
       return { source: src, via: "window" };
@@ -7918,6 +8201,17 @@ function classifyQuestion(q) {
     // 「〜の社長は？」のように「誰」が無くても、役職そのものを
     // 尋ねる文なら人物の質問として扱う（本社の裸形と同じ扱い）。
     /(社長|会長|創業者|創立者|代表)は[？?]/.test(q)
+  ) {
+    return "person";
+  }
+  // 国家の現職者（国王・女王・大統領・天皇・皇帝）：総理大臣・知事と
+  // 同じ現職者の質問だが、以前は分類に無く未分類のまま事実を取りに
+  // 行けなかった（「イギリスの国王は誰ですか」「アメリカ合衆国の
+  // 現在の大統領は誰ですか」が素通りしていた）。
+  if (
+    /国王|女王|大統領|天皇|皇帝/.test(q) &&
+    (/(誰|だれ|名前|現職|今|現在|教えて|教え|知りたい|聞きたい)/.test(q) ||
+      /(国王|女王|大統領|天皇|皇帝)は[？?]/.test(q))
   ) {
     return "person";
   }
@@ -8330,6 +8624,38 @@ function extractPlace(question, article, label) {
       );
     }
   }
+  // 開催地：「フランスの首都パリを中心として開催された」の形は、
+  // 所在地の形（〜にある）では取り出せなかった。開催の質問に限って、
+  // 開催を述べる文の「〜を中心として開催された／〜で開催された」の
+  // 直前にある場所の語を取り出す（日付や期間の語は場所にしない）。
+  if (/開催/.test(question)) {
+    const venueHit = findSentence(
+      article.lead,
+      (s) => /を中心として開催され|で開催され/.test(s),
+      12,
+    );
+    if (venueHit) {
+      const m =
+        /([^、。]{2,48}?)を中心として開催され/.exec(venueHit) ??
+        /([^、。]{2,32}?)で開催され/.exec(venueHit);
+      let place = (m?.[1] ?? "").split(/[、,]/).pop()?.trim() ?? "";
+      place = place.replace(/^.*?の首都/, "").replace(/^.*?の/, "");
+      if (
+        place.length >= 2 &&
+        place.length <= 12 &&
+        !/\d/.test(place) &&
+        !/(から|まで|日間|大会|オリンピック|イベント)$/.test(place)
+      ) {
+        return makeFact(
+          article,
+          "place",
+          place,
+          `${label}は${place}で開催されました。`,
+          venueHit,
+        );
+      }
+    }
+  }
   return null;
 }
 
@@ -8550,6 +8876,32 @@ function extractMeasure(question, article, label) {
     for (const m of (article.lead ?? "").matchAll(/(\d+)\s*人制/g)) {
       values.add(m[1]);
     }
+    if (values.size !== 1) {
+      // 複数の人数制が併記される記事（例：ラグビーユニオンの記事に
+      // 7人制への言及がある）では決められないのが従来の扱いだった。
+      // ただし冒頭の定義文に現れる人数制が1種類だけなら、その競技
+      // 自体の人数は定義文が名指す方だと読めるため、それに限って使う。
+      const first = splitSentences(article.lead)[0] ?? "";
+      const firstValues = new Set();
+      for (const m of first.matchAll(/(\d+)\s*人制/g)) {
+        firstValues.add(m[1]);
+      }
+      for (const m of first.matchAll(
+        /1チーム(?:は|が|の)?[^。]{0,10}?(\d+)\s*人/g,
+      )) {
+        firstValues.add(m[1]);
+      }
+      if (firstValues.size === 1) {
+        const n = [...firstValues][0];
+        return makeFact(
+          article,
+          "measure",
+          `${n}人`,
+          `${label}の1チームの人数は${n}人です。`,
+          first,
+        );
+      }
+    }
     if (values.size === 1) {
       const n = [...values][0];
       const hit =
@@ -8564,8 +8916,59 @@ function extractMeasure(question, article, label) {
       );
     }
   }
+  // 個数を聞く質問（「全部でいくつ」）：数え上げの対象が「現在はN＋
+  // 数詞」の形で冒頭に明示される場合だけ取り出す。対象の語（都道府県
+  // など）は数詞の直後の助数詞つき名詞で確認する。
+  if (/いくつ|全部で|何つ/.test(question) && !/チーム/.test(question)) {
+    const hit = findSentence(
+      article.lead,
+      (s) => /(現在は|全部で|合計)\s*\d+/.test(s),
+      40,
+    );
+    if (hit) {
+      const m =
+        /(?:現在は|全部で|合計)\s*(\d+)\s*(都道府県|か国|カ国|ヶ国|国|県|市|区|町|村|人|個|つ|本|枚|件|種)/.exec(
+          hit,
+        );
+      if (m) {
+        return makeFact(
+          article,
+          "measure",
+          m[1],
+          `${label}の数は全部で${m[1]}です。`,
+          hit,
+        );
+      }
+    }
+  }
   const spec = MEASURE_SPECS.find((s) => s.test.test(question));
   if (!spec) return null;
+  // 速さをキロメートルで聞かれた場合の m/s 表記：「正確に299792458 m/s」
+  // の形は専用パターン（秒速Nメートル）に当たらず取りこぼしていた。
+  // m/s の値は定義どおりの数値なので、km/s への換算（÷1000）は
+  // 計算として明示して行う。
+  if (spec.name === "速さ" && /キロメートル|km/.test(question)) {
+    const hitMs = findSentence(
+      article.lead,
+      (s) => /[\d,]{4,}\s*m\/s/.test(s),
+      120,
+    );
+    if (hitMs) {
+      const m = /([\d,]+)\s*m\/s/.exec(hitMs);
+      const perSec = parseFloat((m?.[1] ?? "").replace(/,/g, ""));
+      if (Number.isFinite(perSec) && perSec >= 1000) {
+        const km = Math.round(perSec / 1000);
+        const value = `秒速${withCommas(String(km))}キロメートル`;
+        return makeFact(
+          article,
+          "measure",
+          value,
+          `${label}の速さは${value}です。`,
+          hitMs,
+        );
+      }
+    }
+  }
   for (const name of spec.fields) {
     const fromField = article.fields[name];
     if (!fromField) continue;
@@ -8758,22 +9161,194 @@ function extractGovernor(question, article) {
  * 記事中の肖像が1人だけのときに限って取り出す（旧券と新券の肖像が
  * 併記される記事で、どちらか分からない肖像は出さない）。
  */
+/**
+ * 文中に出てくる元号の年（令和六年・平成26年など）を全て西暦に直して
+ * 返す。1つの区画に告示の年（令和5年）と発行開始の年（令和六年）の
+ * ように複数の年が並ぶことがあるため、最初の1件だけでは判定しない。
+ */
+function eraYearsIn(text) {
+  const kanjiNum = {
+    一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+  };
+  const parseNum = (s) => {
+    if (/^\d+$/.test(s)) return parseInt(s, 10);
+    if (s === "元") return 1;
+    let v = 0;
+    let rest = s;
+    const ten = rest.indexOf("十");
+    if (ten >= 0) {
+      const head = rest.slice(0, ten);
+      v += (head ? (kanjiNum[head] ?? 0) : 1) * 10;
+      rest = rest.slice(ten + 1);
+    }
+    if (rest) v += kanjiNum[rest] ?? 0;
+    return v > 0 ? v : null;
+  };
+  const years = new Set();
+  for (const m of String(text).matchAll(
+    /(令和|平成)([一二三四五六七八九十\d]+|元)年/g,
+  )) {
+    const n = parseNum(m[2]);
+    if (n) years.add(m[1] === "令和" ? 2018 + n : 1988 + n);
+  }
+  return years;
+}
+
+/**
+ * 紙幣の仕様表（「表面 渋沢栄一」の並び）から肖像を読む経路。
+ * 号券ごとの仕様表は記事の後半にあり、文章形のパターンでは届かない
+ * ための読み取り経路。扱うのは次の3形だけに限る：
+ * - 逆向き（「福沢諭吉の肖像が使われていた紙幣はどれ」）：仕様表の
+ *   表面の人物が質問の人物と一致すれば、その紙幣自身が答え。
+ * - 不在の明言（「表面に人物肖像が用いられなかった」等の文が記事に
+ *   ある場合だけ）：肖像は無いことが記事の明言であり、表面の図柄と
+ *   セットで事実にする。明言が無ければ推測しない。
+ * - 前向き（新しい／発行年つき）：仕様表の表面から、発行年に合う
+ *   号券、無ければ「新しい」指定で最後の号券の表面の人物を取る。
+ */
+function extractPortraitFromSpecTable(question, article, label) {
+  const text = article.lead ?? "";
+  const entries = [];
+  for (const m of text.matchAll(/(?:^|\n)\s*表面\s+(\S{2,40})/g)) {
+    const name = (m[1] ?? "").split(/[（(]/)[0].trim();
+    if (
+      name.length >= 2 &&
+      name.length <= 8 &&
+      !/[のはがをにへとや、。・]/.test(name)
+    ) {
+      entries.push({ name, index: m.index ?? 0 });
+    }
+  }
+  if (entries.length === 0) return null;
+  const evidenceAt = (idx) => {
+    const lineStart = text.lastIndexOf("\n", idx) + 1;
+    const lineEnd = text.indexOf("\n", idx);
+    const line = text
+      .slice(lineStart, lineEnd < 0 ? idx + 120 : lineEnd)
+      .trim();
+    return line.length > 0 ? line : text.slice(Math.max(0, idx - 60), idx + 80);
+  };
+  // 逆向き：人物から紙幣を聞く形。仕様表の周辺に質問の人物名が
+  // 現れる表面だけを根拠にする。
+  const inv = /(.{2,10}?)の肖像が使われていた/.exec(question);
+  if (inv && /紙幣|お札/.test(question)) {
+    const person = inv[1].trim();
+    for (const e of entries) {
+      const window = text.slice(Math.max(0, e.index - 200), e.index + 200);
+      if (window.includes(person)) {
+        const noteName = (article.title ?? "").replace(/紙幣$/, "札");
+        return makeFact(
+          article,
+          "person",
+          noteName,
+          `${person}の肖像が使われていたのは${noteName}です。`,
+          evidenceAt(e.index),
+        );
+      }
+    }
+    return null;
+  }
+  // 不在の明言がある場合だけ、「肖像は無い」を事実にする。
+  const absence = findSentence(
+    text,
+    (s) =>
+      /表面に人物肖像が用いられなかった/.test(s) ||
+      /表面のデザインが人物肖像でない/.test(s),
+    60,
+  );
+  if (absence) {
+    const design = entries[entries.length - 1];
+    return makeFact(
+      article,
+      "person",
+      design.name,
+      `${label}の表面に人物の肖像は使われていません。表面の図柄は${design.name}です。`,
+      absence,
+    );
+  }
+  // 表面の直前にある号券の見出しから、その表面までの区画だけを
+  // その号券の説明とみなす（記事の序文に新券の年号が書かれていても、
+  // 旧い号券の表面と結びつけないため）。
+  const sectionOf = (idx) => {
+    const head = text.slice(Math.max(0, idx - 1600), idx);
+    const headers = [...head.matchAll(/[A-ZＡ-Ｚ]号券/g)];
+    if (headers.length === 0) return head;
+    return head.slice(headers[headers.length - 1].index);
+  };
+  // 前向き：発行年の指定があれば、その年の号券の区画にある表面。
+  const qYear = /(\d{4})年/.exec(question)?.[1];
+  if (qYear) {
+    const y = parseInt(qYear, 10);
+    for (const e of entries) {
+      const block = sectionOf(e.index);
+      if (block.includes(qYear) || eraYearsIn(block).has(y)) {
+        return makeFact(
+          article,
+          "person",
+          e.name,
+          `${label}の肖像は${e.name}です。`,
+          evidenceAt(e.index),
+        );
+      }
+    }
+    return null;
+  }
+  // 「新しい／最新」の指定があれば、最後（最新）の号券の表面。
+  // ただし最後の区画に「発行を開始」等の新券の印がある場合に限る
+  // （記事の途中で切れた範囲の最後を最新と誤認しないため）。
+  if (/新しい|最新|新札|新紙幣/.test(question)) {
+    const e = entries[entries.length - 1];
+    if (/発行を開始|新しい/.test(sectionOf(e.index))) {
+      return makeFact(
+        article,
+        "person",
+        e.name,
+        `${label}の肖像は${e.name}です。`,
+        evidenceAt(e.index),
+      );
+    }
+    return null;
+  }
+  if (entries.length === 1) {
+    const e = entries[0];
+    return makeFact(
+      article,
+      "person",
+      e.name,
+      `${label}の肖像は${e.name}です。`,
+      evidenceAt(e.index),
+    );
+  }
+  return null;
+}
+
 function extractPortrait(question, article, label) {
+  // 逆向き（人物→紙幣）は文章形のパターンより先に仕様表で判定する
+  // （人物名を答えとして返す誤りを防ぐため）。
+  if (/の肖像が使われていた/.test(question)) {
+    return extractPortraitFromSpecTable(question, article, label);
+  }
   const re =
     /(\d{4})年[^。]{0,32}?から発行されている([^、。\s]{2,12})の肖像/g;
   const found = [];
   for (const m of (article.lead ?? "").matchAll(re)) {
     found.push({ year: m[1], name: (m[2] ?? "").trim() });
   }
-  if (found.length === 0) return null;
+  if (found.length === 0) {
+    return extractPortraitFromSpecTable(question, article, label);
+  }
   const qYear = /(\d{4})年/.exec(question)?.[1];
   let pick = null;
   if (qYear) {
     pick = found.find((f) => f.year === qYear) ?? null;
-    if (!pick) return null;
+    // 文章形で年の合う肖像が無くても、仕様表の側に在る場合がある
+    // （新しい号券は仕様表の形でしか書かれていないことが多い）。
+    if (!pick) return extractPortraitFromSpecTable(question, article, label);
   } else {
     const names = [...new Set(found.map((f) => f.name))];
-    if (names.length !== 1) return null;
+    if (names.length !== 1) {
+      return extractPortraitFromSpecTable(question, article, label);
+    }
     pick = found[0];
   }
   if (!pick.name || pick.name.length < 2) return null;
@@ -8792,6 +9367,52 @@ function extractPortrait(question, article, label) {
   );
 }
 
+/**
+ * 国家の現職者（国王・大統領など）：役職の記事に現職者欄があればそれを
+ * 使い、人物自身の記事では、冒頭の文が「第N代〜大統領（…現職）」の
+ * ように現職であることを明言している場合に限って、その人物（記事の
+ * 題名）を答えにする。明言が無ければ取り出さない（在任が終わった
+ * 人物の記事を現職と誤認しないための関門）。
+ */
+function extractIncumbent(question, article, label) {
+  const office = /(国王|女王|大統領|天皇|皇帝)/.exec(question)?.[1];
+  if (!office) return null;
+  for (const name of ["現職者", "現職"]) {
+    const fromField = article.fields[name];
+    if (fromField && fromField.length <= 30 && !/[。]/.test(fromField)) {
+      const value = cleanPersonName(fromField);
+      if (value) {
+        return makeFact(
+          article,
+          "person",
+          value,
+          `${label}の${office}は${value}です。`,
+          fieldEvidence(article, name, fromField, value.slice(0, 4)),
+        );
+      }
+    }
+  }
+  const baseTitle = (article.title ?? "")
+    .replace(/[（(][^（）()]*[）)]\s*$/, "")
+    .trim();
+  // 役職そのものの記事（「アメリカ合衆国大統領」など）は人物ではない
+  // ので、題名に役職の語を含む記事は人物経路に使わない。
+  if (!baseTitle || baseTitle.includes(office)) return null;
+  const sentences = splitSentences(article.lead).slice(0, 4);
+  for (const s of sentences) {
+    if (s.includes(office) && /(現職|在位|在任)/.test(s)) {
+      return makeFact(
+        article,
+        "person",
+        baseTitle,
+        `${label}の${office}は${baseTitle}です。`,
+        s,
+      );
+    }
+  }
+  return null;
+}
+
 function extractPerson(question, article, label) {
   if (/肖像/.test(question)) {
     return extractPortrait(question, article, label);
@@ -8802,6 +9423,9 @@ function extractPerson(question, article, label) {
   if (/内閣総理大臣|総理大臣|首相/.test(question)) {
     const leaderLabel = question.includes("日本") ? "日本" : label;
     return extractPrimeMinister(article, leaderLabel);
+  }
+  if (/国王|女王|大統領|天皇|皇帝/.test(question)) {
+    return extractIncumbent(question, article, label);
   }
   let role = "";
   let fieldNames = [];
@@ -8992,6 +9616,44 @@ function extractAttribute(question, article, label) {
 
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * 「日本の国技は何ですか」型：聞かれているのはカテゴリの定義では
+ * なく、そのカテゴリに属する日本の実例。カテゴリ自身の記事が
+ * 「日本では相撲が…」と実例を明言している場合に限って取り出す。
+ * 記事タイトルが質問のカテゴリ語と一致しない場合は使わない。
+ */
+function extractCategoryInstance(question, article, label) {
+  const m = /^日本の(.{1,10}?)は(?:何|なん)ですか/.exec(question);
+  if (!m) return null;
+  const category = m[1].trim();
+  const baseTitle = (article.title ?? "")
+    .replace(/[（(][^（）()]*[）)]\s*$/, "")
+    .trim();
+  if (!category || category !== baseTitle) return null;
+  const hit = findSentence(
+    article.lead,
+    (s) => /日本では/.test(s),
+    30,
+  );
+  if (!hit) return null;
+  const mm = /日本では([^、。]{2,12}?)(?:が|は)/.exec(hit);
+  const value = (mm?.[1] ?? "").trim();
+  if (
+    !value ||
+    /の|こと|ため|よう/.test(value) ||
+    value.includes(category)
+  ) {
+    return null;
+  }
+  return makeFact(
+    article,
+    "definition",
+    value,
+    `日本の${category}は${value}です。`,
+    hit,
+  );
 }
 
 function extractDefinition(article) {
@@ -9187,7 +9849,10 @@ function extractFact(question, article) {
     case "attribute":
       return extractAttribute(question, article, label);
     case "definition":
-      return extractDefinition(article);
+      return (
+        extractCategoryInstance(question, article, label) ??
+        extractDefinition(article)
+      );
     default:
       return null;
   }
@@ -11096,7 +11761,7 @@ function parseWeatherQuery(q) {
         return {
           title: t,
           url: deps.wikiUrl(t),
-          lead: body.slice(0, 5000),
+          lead: body.slice(0, 20000),
           fields: {},
           disambiguation:
             templateMark ||
@@ -12020,7 +12685,7 @@ async function wikiArticleSourceWeb(title) {
   return {
     title: wt.title,
     url: wikiUrl(wt.title),
-    lead: (extract?.text ?? "").slice(0, 5000),
+    lead: (extract?.text ?? "").slice(0, 20000),
     fields,
     disambiguation:
       templateMark ||
@@ -17418,7 +18083,12 @@ const App = {
     // 「回答可能」は、読み込み済みのモデルIDと選択中のIDが一致する
     // ときだけ真。切り替え先の読み込みに失敗した状態では、前のモデル
     // のエンジンで（新しいモデルの名前で）回答することはない。
-    const modelReady = modelReadyFor(this.modelId);
+    let modelReady = modelReadyFor(this.modelId);
+    // Ultra（iMac）の接続が過去の生成失敗で切れたままなら、ここで
+    // 1回だけ復旧を試す（復旧できればこの質問から通常経路に戻る）。
+    if (!modelReady && this.modelId === "ultra") {
+      modelReady = await tryRecoverUltraImac();
+    }
     const normalized = normalizeQuestion(question);
     // 今回の検索の失敗理由はここから集める（前の質問の理由を持ち越さない）。
     WikiNet.lastError = "";
@@ -18345,9 +19015,15 @@ const App = {
     // 検索結果を読むのは Ultra のみ。書けた答えも検証ゲートを通った
     // ものだけを出し、通らなければ従来の棄権表示に落とす。生成の間は
     // フェーズを「検索中」のままにして、二重の送信を防ぐ。
+    // 質問の途中で接続が切れた場合（生成の失敗など）に備え、ここでも
+    // 1回だけ復旧を試す（開始時の復旧と同じヘルパー・同じ間引き）。
+    let ultraReadyNow = modelReady;
+    if (this.modelId === "ultra" && !ultraReadyNow) {
+      ultraReadyNow = await tryRecoverUltraImac();
+    }
     if (
       this.modelId === "ultra" &&
-      modelReady &&
+      ultraReadyNow &&
       (!gate || gate.status === "none" || gate.status === "abstain")
     ) {
       const web = await webSearchAnswer(question).catch(() => null);
@@ -18706,7 +19382,7 @@ if (typeof module !== "undefined" && module.exports) {
     EVIDENCE_WAIT_MS,
     normalizeUltraWrittenStyle,
     UltraGgufModel, loadUltraGguf,
-    UltraImacModel, loadUltraImac, ULTRA_IMAC_BASE_URL, ULTRA_IMAC_UNREACHABLE,
+    UltraImacModel, loadUltraImac, tryRecoverUltraImac, ULTRA_IMAC_BASE_URL, ULTRA_IMAC_UNREACHABLE,
     buildBriefingMaterial, trimBriefingTail, localDateKey, BRIEFING_DATE_KEY,
     pointsJstDateKey, pointsDailyLoginKey, pointsNewTopupKey,
     POINTS_TOPUP_MENU, POINTS_BONUS_KEY,
