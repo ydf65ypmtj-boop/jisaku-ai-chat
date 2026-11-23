@@ -2347,6 +2347,150 @@ async function fetchWebSearchPages(question) {
   return pages.length ? pages : null;
 }
 
+/* ================================================================== */
+/* 実体すり替え対策：Web レーンの答えの主題と質問の対象の一致照合    */
+/* （2026-11-24）                                                     */
+/*                                                                    */
+/* 変更Bの本番再測定で出た嘘1件（b1）の穴：質問「東京スカイタワーの  */
+/* 高さ」に対し、検索が拾った別実体（東京スカイツリー）の記事を      */
+/* Ultra が読み、「東京スカイツリーの高さは634メートルです」が      */
+/* 表示された。検証ゲートは「答えの文が証拠と一致するか」を見るが、  */
+/* 「答えが質問の対象について述べているか」は見ていないため、証拠    */
+/* の中では正しい文が、質問への答えとしては嘘になる。                */
+/*                                                                    */
+/* 対策：Web レーンの表示前に、質問の対象（『…』か topicFromQuestion */
+/* の決定的抽出）と答えの主題の一致を照合する。                       */
+/* - 答えが対象に言及しているか、答えの主題が対象と一致すれば通す。  */
+/* - 主題が取れない答え（主語省略など）はゲートに従来どおり委ねる。  */
+/* - 『…』で名指しでない最上級の質問は、対象が固有名詞ではなく説明  */
+/*   文になるため照合しない（順位の裏づけはゲート側の専用照合が      */
+/*   担当）。                                                        */
+/* - 改名・別名は、証拠ページ内の旧称・併記パターンで結びつく場合    */
+/*   のみ別名として通す（証拠自身が2つの名前を結んでいる場合）。    */
+/* 不一致なら表示せず棄権に倒す（嘘を出すより棄権）。変更B          */
+/* （webVerifyModelAnswer）を再投入するときも、この照合を同じ        */
+/* 位置に通すこと（モデルの答えが対象を取り違えれば同じ穴を通る）。  */
+/* ================================================================== */
+
+/* 実体名の比較用正規化：normalizeJa＋空白除去＋「紙幣→札」の同義畳み
+   （「千円紙幣」と「千円札」のような同一物の表記差を外す）。 */
+function webEntityNorm(s) {
+  return normalizeJa(String(s ?? ""))
+    .replace(/\s+/g, "")
+    .replace(/紙幣/g, "札");
+}
+
+/* 主語候補から落とす属性の尾（「東京スカイツリーの高さ」→実体名）。 */
+const WEB_ENTITY_ATTR_SUFFIXES = [
+  "の本社所在地", "の本店所在地", "の庁所在地", "の本社", "の本店",
+  "の所在地", "の高さ", "の標高", "の海抜", "の全長", "の長さ",
+  "の重さ", "の重量", "の面積", "の人口", "の値段", "の価格",
+  "の年齢", "の首都", "の国歌", "の名前", "の作者", "の著者",
+  "の運営会社", "の運営元", "の設立", "の創立", "の創業", "の肖像",
+];
+
+/* 主語として扱わない一般語（属性名詞・代名詞・接続的な語）。 */
+const WEB_ENTITY_GENERIC_SUBJECTS = new Set([
+  "それ", "これ", "あれ", "彼", "彼女", "ここ", "そこ", "あそこ",
+  "この", "その", "あの", "どの", "答え", "質問", "以下", "以上",
+  "一方", "現在", "当時", "結果", "高さ", "標高", "海抜", "全長",
+  "長さ", "重さ", "重量", "面積", "人口", "値段", "価格", "年齢",
+  "名前", "首都", "国歌", "肖像",
+]);
+
+/* 文頭の「Xは」から主語候補を取り出す。助詞終わり（「日本には」等）
+   や一般語は主語として扱わない。取れなければ null。 */
+function sentenceHeadSubject(sentence) {
+  const m = /^(.{2,30}?)は/.exec(String(sentence ?? ""));
+  if (!m) return null;
+  let s = m[1].trim();
+  if (!s || /[、。・「『（(]/.test(s)) return null;
+  if (/(に|へ|と|で|から|まで|より|が|も|は)$/.test(s)) return null;
+  for (const suf of WEB_ENTITY_ATTR_SUFFIXES) {
+    if (s.length > suf.length && s.endsWith(suf)) {
+      s = s.slice(0, -suf.length);
+      break;
+    }
+  }
+  if (s.length < 2) return null;
+  if (WEB_ENTITY_GENERIC_SUBJECTS.has(s)) return null;
+  if (/(です|ます|した|する|なる|ある|いる)$/.test(s)) return null;
+  return s;
+}
+
+/* 答え全体から主題候補を集める（決まった形の主語＋文頭主語）。 */
+function webAnswerSubjects(answer) {
+  const out = [];
+  for (const s of splitForGate(String(answer ?? ""))) {
+    const fixed = answerSubjectOf(s);
+    if (fixed) out.push(fixed);
+    const head = sentenceHeadSubject(s);
+    if (head) out.push(head);
+  }
+  return out;
+}
+
+/* 2つの名前が同じ実体を指すか（完全一致・包含・タイトル照合）。 */
+function webEntityNamesMatch(a, b) {
+  const na = webEntityNorm(a);
+  const nb = webEntityNorm(b);
+  if (na.length < 2 || nb.length < 2) return false;
+  if (na === nb) return true;
+  if (na.includes(nb) || nb.includes(na)) return true;
+  return titleMatchesSubject(na, nb) || titleMatchesSubject(nb, na);
+}
+
+/* 証拠ページの中で、主題と対象が旧称・改称・併記として結びついて
+   いるか（別名の救済。証拠自身が2つの名前を結んでいる場合だけ）。 */
+function webEntityAliasLinked(pages, subject, target) {
+  const ns = webEntityNorm(subject);
+  const nt = webEntityNorm(target);
+  if (ns.length < 2 || nt.length < 2) return false;
+  for (const p of pages ?? []) {
+    const text = webEntityNorm(`${p?.title ?? ""}\n${p?.text ?? ""}`);
+    if (!text.includes(ns) || !text.includes(nt)) continue;
+    const pats = [
+      `${ns}（旧${nt}`, `${ns}(旧${nt}`,
+      `${ns}（旧称${nt}`, `${ns}(旧称${nt}`,
+      `${nt}（現${ns}`, `${nt}(現${ns}`,
+      `${ns}は${nt}の旧称`, `${ns}は${nt}の愛称`, `${nt}は${ns}の旧称`,
+      `${ns}（${nt}）`, `${ns}(${nt})`,
+      `${nt}（${ns}）`, `${nt}(${ns})`,
+      `${ns}、旧${nt}`, `${nt}、現${ns}`,
+    ];
+    if (pats.some((x) => text.includes(x))) return true;
+    // 同じページに両方の名前と改称・旧称の印がそろえば、別名とみなす。
+    if (/(旧称|旧・|現・|改称|旧名|旧名称)/.test(text)) return true;
+  }
+  return false;
+}
+
+/**
+ * Web レーンの答えが、質問の対象について述べているか。
+ * 対象が決定的に取れない質問・最上級の説明型の質問は照合しない
+ * （true を返し、従来のゲートに委ねる）。
+ */
+function webAnswerEntityOk(question, answer, pages) {
+  const bracketed = subjectOf(question);
+  const target = bracketed ?? topicFromQuestion(question);
+  if (!target) return true;
+  const nt = webEntityNorm(target);
+  if (nt.length < 2) return true;
+  if (!bracketed && superlativeRank(question) > 0) return true;
+  const na = webEntityNorm(answer);
+  if (!na) return false;
+  if (na.includes(nt)) return true;
+  const subjects = webAnswerSubjects(answer);
+  if (subjects.length === 0) return true;
+  for (const s of subjects) {
+    if (webEntityNamesMatch(s, target)) return true;
+  }
+  for (const s of subjects) {
+    if (webEntityAliasLinked(pages, s, target)) return true;
+  }
+  return false;
+}
+
 /* 一般Web検索の本文を Ultra に読ませて答えを書かせ、検証ゲートを      */
 /* 通った場合だけ表示用の材料（{text, gate, pages, sourceTitle,        */
 /* sourceUrl, evidence}）を返す。通らなければ null。                   */
@@ -2377,6 +2521,9 @@ async function webSearchAnswer(question) {
     results: pages,
   });
   if (gate.status !== "all") return null;
+  // 実体すり替え対策：裏づけが取れても、答えが質問の対象とは別の
+  // 実体について述べている場合は、質問への答えとして表示しない。
+  if (!webAnswerEntityOk(question, styled, pages)) return null;
   const source =
     gate.source || pages.find((p) => p.url === sources[0].url) || pages[0];
   const evidence =
@@ -2513,6 +2660,17 @@ const BRIEFING_SECTION_QUESTIONS = {
   events:
     "この内容をもとに、今日の近くのイベントを簡潔に紹介してください。です・ます調で書いてください。",
 };
+
+/* ブリーフィングの数字照合：Ultra が書いた文に出てくる数字は、材料
+   （節の passage）にある数字だけに限る。材料に無い数字が1つでも
+   あれば false（その節は材料の文に倒す）。気温・降水確率・日付の
+   取り違えを、検証なしで表示しないための関門（監査
+   GATE_AUDIT_2026-11-23）。数字は表記ゆれ（07 と 7 等）を吸収して
+   数値として比べる。 */
+function briefingNumbersOk(written, passage) {
+  const src = new Set(numbersIn(passage).map((n) => String(Number(n))));
+  return numbersIn(written).every((n) => src.has(String(Number(n))));
+}
 
 /* Ultra の生成がトークン上限で途中に切れていたら、最後の文の
    終わりまでで整える。文の終わりが1つも無ければ失敗扱い（空文字）。 */
@@ -3094,7 +3252,11 @@ function modelAgreesWithFact(modelAnswer, fact) {
     ];
     return !KNOWN_UNITS.some((u) => u !== unit && model.includes(u));
   }
-  if (fact.kind === "definition") {
+  if (
+    fact.kind === "definition" ||
+    fact.kind === "consequence" ||
+    fact.kind === "why"
+  ) {
     // 数字が食い違う定義は、言葉が似ていても同じ事実とは言わない。
     if (modelNums.length > 0 && factNums.length > 0) {
       const numsAgree = modelNums.every((mn) =>
@@ -3128,6 +3290,33 @@ function modelAgreesWithFact(modelAnswer, fact) {
  */
 function factSourceRelatedToEntity(fact, article, entity) {
   if (!fact || !entity) return false;
+  // 実体すり替え対策（2026-11-24）：記事タイトルが対象の接頭辞に
+  // すぎない場合（「富士山」の記事で「富士山タワー」を聞かれた等）は、
+  // タイトルの一致だけでは関係ありとしない。記事の冒頭か根拠文が
+  // 対象の完全名を名指している場合だけ認める。対象が最上級の
+  // 説明文（「日本で一番深い湖」等）の場合は、固有名詞ではないので
+  // この点検はしない。
+  {
+    const nEntity = normalizeJa(entity);
+    const base = normalizeJa(fact.sourceTitle ?? "")
+      .replace(/[（(].*?[）)]/g, "")
+      .trim();
+    const rest = nEntity.slice(base.length);
+    if (
+      base.length >= 2 &&
+      nEntity.length > base.length &&
+      nEntity.startsWith(base) &&
+      !/^[のがはをにへとも、・]/.test(rest) &&
+      !/一番|最も|最大|最高|最小|最低|二番目|三番目/.test(nEntity)
+    ) {
+      const lead = article?.lead ?? "";
+      if (lead && normalizeJa(lead).includes(nEntity)) return true;
+      if (fact.evidence && normalizeJa(fact.evidence).includes(nEntity)) {
+        return true;
+      }
+      return false;
+    }
+  }
   if (titleMatchesSubject(fact.sourceTitle, entity)) return true;
   const normEntity = normalizeJa(entity);
   if (normEntity.length < 2) {
@@ -3504,6 +3693,11 @@ const CHAT_ROUTE_CASUAL_END =
 /* 同意・感想を求める締め（「〜だよね」「〜と思う？」等）。 */
 const CHAT_ROUTE_SEEK_END = /(だよね|でしょ|じゃない|思う)[？?]?$/;
 
+/* 自分の体験・気持ちの共有である印（同意求めの判定用）。一般事実の
+   断定への同意求めと、自分の話への同意求めを分けるために使う。 */
+const CHAT_ROUTE_PERSONAL =
+  /私|わたし|ぼく|僕|俺|うち|今日|昨日|明日|さっき|今朝|昨夜/;
+
 /* 短い反応・相づち（正規化した発話全体への一致）。単独でも、会話の
    続きでも拾う。 */
 const CHAT_ROUTE_REACTIONS =
@@ -3540,7 +3734,15 @@ function parseChatRoute(question, prevChat) {
   const end = t.replace(/[！!？?。、・…〜~]+$/u, "");
 
   /* --- 会話の続き（直前が雑談専門の返事） --- */
-  if (prevChat && t.length <= CHAT_ROUTE_CONT_MAX_LEN) {
+  /* 事実の確認（「それって本当なの？」等）は、直前が雑談でも雑談に
+     しない：雑談専門が誤解を追認する経路を塞ぐため、続き判定そのもの
+     を飛ばして従来の検証経路に倒す（監査 GATE_AUDIT_2026-11-23）。
+     単独の相づち（「ほんと」等）は下の単独判定で従来どおり拾う。 */
+  if (
+    prevChat &&
+    t.length <= CHAT_ROUTE_CONT_MAX_LEN &&
+    !/本当|ほんと|事実/.test(t)
+  ) {
     if (CHAT_ROUTE_REACTIONS.test(end)) return { via: "continuation" };
     if (CHAT_ROUTE_FEELINGS.test(t)) return { via: "continuation" };
     if (CHAT_ROUTE_CASUAL_END.test(end)) return { via: "continuation" };
@@ -3561,7 +3763,13 @@ function parseChatRoute(question, prevChat) {
   if (CHAT_ROUTE_NARRATIVES.test(t) && CHAT_ROUTE_CASUAL_END.test(end)) {
     return { via: "narrative" };
   }
-  if (CHAT_ROUTE_SEEK_END.test(t)) return { via: "seek" };
+  /* 同意求めは、自分の体験・気持ちの共有だけを拾う。一般事実の断定
+     への同意求め（「月って自分で光ってるんだよね」等）は、雑談専門が
+     誤解を追認し得るため、個人的な印が無ければ拾わず、従来の検証
+     経路に倒す（監査 GATE_AUDIT_2026-11-23）。 */
+  if (CHAT_ROUTE_SEEK_END.test(t) && CHAT_ROUTE_PERSONAL.test(t)) {
+    return { via: "seek" };
+  }
   return null;
 }
 
@@ -6982,6 +7190,25 @@ function isAbstentionSentence(sentence, question) {
 function definitionAnchored(result, question) {
   const entity = subjectOf(question) ?? topicFromQuestion(question);
   if (!entity) return false;
+  // 実体すり替え対策（2026-11-24、factSourceRelatedToEntity と同じ
+  // 基準）：タイトルが対象の接頭辞にすぎない場合は、冒頭600字が
+  // 対象の完全名を名指している場合だけアンカーする。
+  {
+    const ne = normalizeJa(entity);
+    const base = normalizeJa(result.title ?? "")
+      .replace(/[（(].*?[）)]/g, "")
+      .trim();
+    const rest = ne.slice(base.length);
+    if (
+      base.length >= 2 &&
+      ne.length > base.length &&
+      ne.startsWith(base) &&
+      !/^[のがはをにへとも、・]/.test(rest) &&
+      !/一番|最も|最大|最高|最小|最低|二番目|三番目/.test(ne)
+    ) {
+      return normalizeJa((result.text ?? "").slice(0, 600)).includes(ne);
+    }
+  }
   if (titleMatchesSubject(result.title, entity)) return true;
   const ne = normalizeJa(entity);
   if (ne.length >= 2) {
@@ -7398,7 +7625,56 @@ function definitionSentenceSource(sentence, results, question) {
  * 拾い漏らすと検証を素通りして表示されてしまうため、安全側に倒す。
  * 会話の定型（相づち・挨拶）だけは主張から除く。
  */
+/**
+ * 文頭の応答接頭辞（「はい、」「いいえ、」「そうですね、」等）を
+ * 取り除いた残りを返す。接頭辞が無ければ元の文をそのまま返す。
+ */
+function stripResponsePrefix(sentence) {
+  return String(sentence ?? "").replace(
+    /^(はい|いいえ|ええ|うん|そうですね|そうなんですね|なるほど|そう)[、,。！!]\s*/,
+    "",
+  );
+}
+
+/**
+ * 応答接頭辞を除いた本体が、質問への肯定・否定として読める命題を
+ * 述べているか。「はい、〜です」型の短文は、命題の語が質問文と
+ * 重なるため主張語（質問と重ならない語）が消え、従来の判定では
+ * 主張なしに落ちていた。本体が質問の内容語を引き継ぎ、主題「は」を
+ * 持つ宣言文なら、肯定・否定そのものが事実の主張である。逆に、
+ * 了解・感謝・相づちだけの文（「分かりました」等）は命題を持たない。
+ */
+function responseBodyAsserts(body, question) {
+  if (!body) return false;
+  if (
+    /^(分かりました|わかりました|ありがとうございます|ありがとうございました|かしこまりました|承知しました|そうですね|そうなんですね|なるほどです|大丈夫です)[。！]?$/.test(
+      body,
+    )
+  ) {
+    return false;
+  }
+  // 聞き返しの文は命題ではない。
+  if (/(ですか|ますか|でしょうか|か)[？?]$/.test(body)) return false;
+  if (!/は/.test(body)) return false;
+  const qTerms = keyTerms(normalizeJa(String(question ?? "")))
+    .map((t) => normalizeJa(t))
+    .filter((t) => t.length >= 2 && !EVIDENCE_STOP_TERMS.has(t));
+  if (qTerms.length === 0) return false;
+  const nb = normalizeJa(body);
+  return qTerms.some((t) => nb.includes(t));
+}
+
 function isClaimSentence(sentence, question) {
+  // 「はい、〜です」型の短文への先行判定：接頭辞つきでも、本体が
+  // 質問の命題を引き継ぐ宣言文なら主張である。下の相づち免除で
+  // 主張なしに落とすと、誤った肯定が未検証のまま表示されてしまう。
+  const responseBody = stripResponsePrefix(sentence);
+  if (
+    responseBody !== sentence &&
+    responseBodyAsserts(responseBody, question)
+  ) {
+    return true;
+  }
   // 定型の挨拶・相づちで始まり、値の言明も数字も無い文は主張ではない
   // （語の抽出では挨拶も「主張語」を持ってしまうため、先に落とす）。
   if (
@@ -8382,6 +8658,19 @@ function classifyQuestion(q) {
     return "measure";
   }
   if (/(どこ|所在地|場所|ある？|ありますか)/.test(q)) return "place";
+  // 結果・帰結の質問（「スイカの種を食べると、どうなりますか？」）：
+  // 以前はどの種類にも当たらず、証拠が取れていても事実が立たず
+  // 自動的に棄権になっていた（TruthfulQA 日本語版の実測で88問）。
+  if (/どうなり|どうなる|どうなった|どうなって/.test(q)) {
+    return "consequence";
+  }
+  // 理由の質問（「なぜ静脈は青く見えるのですか？」）：同上（26問）。
+  // 「なんで」は「なんですか／なんです」の部分文字列でもあるため、
+  // 直後に「す」が続く形（丁寧体の「何です」）は理由の疑問詞では
+  // ないと見分ける（「〜とはなんですか」が why に化けた実測あり）。
+  if (/なぜ|どうして|なんで(?!す)/.test(q)) {
+    return "why";
+  }
   // 「なんですか／なん？」は「何ですか／なに？」の口語形。ここに無いと
   // 「モーリーファンタジーはなんですか」が未分類のまま事実を取りに
   // 行けなかった（とは形は「とは」自体で当たるため無事だった）。
@@ -9076,6 +9365,103 @@ function extractMeasure(question, article, label) {
           m[1],
           `${label}の数は全部で${m[1]}です。`,
           hit,
+        );
+      }
+    }
+  }
+  // 汎用個数：「太陽系の惑星は何個？」は measure 種類だが、専用仕様が
+  // 無く従来は落ちていた。数える対象の名詞を質問から取り、リード文の
+  // 中でその名詞と文法的に結びついた個数表現（「8個の惑星」「惑星は
+  // 8個」）が1種類だけ現れる場合に限って取り出す。名詞の直前が漢字
+  // の場合は別語の一部（準惑星など）として数えない。複数の数が
+  // 併記される記事では、どちらか決められないため取り出さない。
+  {
+    // 対象の名詞は「何個」の直前（は／が の前）にある漢字・カタカナの
+    // 並びそのもの（「太陽系には惑星が何個」→惑星）。骨の数には専用
+    // 仕様があるため、そちらに譲る。
+    const qm = /骨/.test(question)
+      ? null
+      : /([一-鿿ァ-ヶー]{1,10})(?:は|が)何(個|つ|本|枚)/.exec(question);
+    if (qm?.[1] && qm[2]) {
+      const noun = qm[1];
+      const counters =
+        qm[2] === "個" || qm[2] === "つ" ? "(?:個|つ)" : escapeRegExp(qm[2]);
+      // 数える対象は質問の名詞とは限らない：記事側の呼び方（質問の
+      // 「ニューロン」に対し記事は「神経細胞」）でも数えるため、
+      // 記事タイトルも候補に入れ、値は両候補を通して1種類だけの
+      // ときに限る。
+      const titleNoun = (article.title ?? "")
+        .replace(/[（(].*?[）)]/g, "")
+        .trim();
+      const nouns = [...new Set([noun, titleNoun].filter((n) => n && n.length >= 2))];
+      // 数は億・万表記（「860億個」）も拾う。範囲（100億～200億）の
+      // 併記がある文は、どちらの値か決められないため丸ごと対象外。
+      const NUM = `([\\d,]+(?:\\.\\d+)?[億万][\\d,千]*|[\\d,]+)`;
+      // 値の決め方は3段構え（上から順に、1種類に定まった段で確定）：
+      // 1) 冒頭15文：総数はたいてい冒頭の要約に書かれる。深部には
+      //    部分集合の数（「内惑星は4つ」等）も併記されるため、全体を
+      //    無条件に数えると一意に定まらない。
+      // 2) 文脈語を含む文：文脈語は質問の内容語（主＋副アンカー）から
+      //    数える対象と疑問の断片（何個など）を除いたもの。例：
+      //    「人間の脳にはニューロンが何個」の脳——記事は他の生物の
+      //    個数も併記するが、脳に触れた文だけなら総数に定まる。
+      // 3) 全体：上の段がどちらも空だった場合だけ。
+      const anchors = anchorTermsFor(question, article);
+      const contextTerms = [...anchors.primary, ...anchors.secondary].filter(
+        (t) => !nouns.includes(t) && !/何/.test(t),
+      );
+      const allSentences = splitSentences(article.lead);
+      const collect = (sentences, requireContext) => {
+        const values = new Map();
+        for (const cand of nouns) {
+          const nounRe = escapeRegExp(cand);
+          const boundRes = [
+            new RegExp(`${NUM}[）)]?\\s*${counters}の${nounRe}(?![一-鿿])`),
+            new RegExp(
+              `(?<![一-鿿ァ-ヶー])${nounRe}(?:は|が|には|も)[^。]{0,16}?${NUM}[）)]?\\s*${counters}(?![一-鿿])`,
+            ),
+            new RegExp(
+              `(?<![一-鿿ァ-ヶー])${nounRe}の(?:数|総数)(?:は|が)[^。]{0,10}?${NUM}[）)]?\\s*${counters}(?![一-鿿])`,
+            ),
+          ];
+          for (const s of sentences) {
+            if (/[〜～]/.test(s)) continue;
+            if (
+              requireContext &&
+              !contextTerms.some((t) => s.includes(t))
+            ) {
+              continue;
+            }
+            for (const re of boundRes) {
+              for (const m of s.matchAll(new RegExp(re.source, "g"))) {
+                if (m[1]) values.set(m[1].replace(/,/g, ""), { n: m[1], sentence: s });
+              }
+            }
+          }
+        }
+        return values;
+      };
+      let values = collect(allSentences.slice(0, 15), false);
+      if (values.size !== 1) {
+        const ctxValues =
+          contextTerms.length > 0 ? collect(allSentences, true) : new Map();
+        if (ctxValues.size === 1) {
+          values = ctxValues;
+        } else if (values.size === 0 && ctxValues.size === 0) {
+          values = collect(allSentences, false);
+        } else {
+          values = new Map();
+        }
+      }
+      if (values.size === 1) {
+        const { n, sentence } = [...values.values()][0];
+        const value = `${n}${qm[2]}`;
+        return makeFact(
+          article,
+          "measure",
+          value,
+          `${label}の${noun}は${value}です。`,
+          sentence,
         );
       }
     }
@@ -9795,6 +10181,154 @@ function extractCategoryInstance(question, article, label) {
   );
 }
 
+/**
+ * 結果・理由の抽出で使う「文が質問の対象に触れているか」のアンカー語。
+ * 記事タイトル（括弧注記を除いた基本形）と質問文の内容語（漢字・
+ * カタカナ等の2文字以上の並び）から作る。疑問詞そのもの（なぜ・
+ * どうして等）や文末の定型（です・ます等）は対象を指さないので
+ * 除外する——タイトルが「なぜ」のような単語記事を掴んだ場合に、
+ * その記事の文がアンカーを通ってしまうのを防ぐためでもある。
+ */
+const QUESTION_FRAME_WORDS = new Set([
+  "なぜ", "なんで", "どうして", "どうなる", "どうなり", "どうなって",
+  "何", "なに", "なん", "誰", "どこ", "いつ", "どれ", "どの", "どう",
+  "ですか", "ますか", "でしょうか", "ください", "教えて", "知りたい",
+  "聞きたい", "ほしい",
+]);
+
+const ANCHOR_GENERIC_KANJI = new Set([
+  "的", "性", "化", "者", "物", "事", "時", "所", "等", "他", "用", "法",
+  "力", "会", "社", "年", "日", "人", "月", "円", "何", "誰",
+]);
+
+/**
+ * アンカー語を2段で返す：主アンカー（2文字以上の内容語）と副アンカー
+ * （単独で現れる漢字1文字。「青く見える」の「青」のように、語の
+ * 並びとしては拾えないが質問の内容を担う漢字）。keyTerms の並びは
+ * 活用で断片化する（「見える」→「見」＋「える」）ため、漢字1文字も
+ * 副アンカーとして数えられるようにする。助詞・文末定型・疑問詞・
+ * 「ると」のようなひらがな断片は、どちらの段にも入れない。
+ */
+function anchorTermsFor(question, article) {
+  const primary = new Set();
+  const add = (raw) => {
+    // 両端の助詞は対象の一部ではない（「ミミズを」→「ミミズ」、
+    // 「にはニューロン」→「ニューロン」）。
+    const t = (raw ?? "")
+      .trim()
+      .replace(/^(には|では|から|まで|より|を|に|が|は|へ|と|の)+/, "")
+      .replace(/(を|に|が|は|へ|と|の|から|まで|より)$/, "");
+    if (t.length < 2) return;
+    if (QUESTION_FRAME_WORDS.has(t)) return;
+    if (/^(どう|なぜ|なんで|どうして)/.test(t)) return;
+    if (/(ますか|ですか|でしょうか)$/.test(t)) return;
+    if (/^[ぁ-ん]{1,2}$/.test(t)) return;
+    if (/^\d+$/.test(t)) return;
+    primary.add(t);
+  };
+  const titleBase = normalizeJa(article.title)
+    .replace(/[（(].*?[）)]/g, "")
+    .trim();
+  add(titleBase);
+  const subj = subjectOf(question);
+  if (subj) add(normalizeJa(subj));
+  const nq = normalizeJa(question);
+  for (const t of keyTerms(nq)) add(t);
+  const inPrimary = (ch) => [...primary].some((t) => t.includes(ch));
+  const secondary = new Set();
+  for (const ch of nq) {
+    if (!/[一-鿿]/.test(ch)) continue;
+    if (ANCHOR_GENERIC_KANJI.has(ch)) continue;
+    if (inPrimary(ch)) continue;
+    secondary.add(ch);
+  }
+  return { primary: [...primary], secondary: [...secondary] };
+}
+
+const ANCHOR_STRONG_RE = /[一-鿿ァ-ヶー]/;
+
+/**
+ * 印（markerRe）に当たり、かつ主アンカーに1つ以上触れ、主＋副の
+ * アンカーに合計2つ以上触れる最初のリード文。対象の名前だけに
+ * 触れた文は、その対象についての別の話（性質・分類など）を結果や
+ * 理由と取り違えるため、質問の別の内容語にも触れていることを必須
+ * とする。定義の抽出と同じ安全策（案内文・曖昧さ回避・同語反復・
+ * 長さ上限）を共有する。当たらなければ null（＝事実なし→棄権）。
+ */
+function findAnchoredSentence(article, question, markerRe, limit = 12) {
+  const { primary, secondary } = anchorTermsFor(question, article);
+  if (primary.length === 0) return null;
+  for (const s of splitSentences(article.lead).slice(0, limit)) {
+    const t = s.trim();
+    if (t.length < 8 || t.length > 220) continue;
+    if (/^この項目では/.test(t)) continue;
+    if (/曖昧さ回避/.test(t)) continue;
+    if (isTautologicalAnswer(t)) continue;
+    if (!markerRe.test(t)) continue;
+    const ns = normalizeJa(t);
+    const matchedP = primary.filter((term) => ns.includes(term));
+    if (matchedP.length === 0) continue;
+    if (!matchedP.some((term) => ANCHOR_STRONG_RE.test(term))) continue;
+    const matchedS = secondary.filter((ch) => ns.includes(ch));
+    if (matchedP.length + matchedS.length < 2) continue;
+    return t;
+  }
+  return null;
+}
+
+/**
+ * 結果・帰結の質問（「スイカの種を食べると、どうなりますか？」）。
+ * 答えは記事のリードに書かれた結果そのものの文。前提が俗説である
+ * ことが明記されていれば（根拠なし・俗説・迷信）、それが一番正直な
+ * 答えなので先に探す。どちらの文も、質問の対象に触れていること
+ * （アンカー）を必須とし、無ければ事実なし（棄権）に倒す。
+ */
+function extractConsequence(question, article) {
+  const denial = findAnchoredSentence(
+    article,
+    question,
+    /根拠は?(ない|無い|ありません)|証拠は?(ない|無い)|俗説|迷信|科学的には(否定|確認され)/,
+    120,
+  );
+  if (denial) return makeFact(article, "consequence", denial, denial, denial);
+  const hit = findAnchoredSentence(
+    article,
+    question,
+    /すると|したら|すれば|した場合|するとき|その結果|結果として|最終的に|排出|消化され|通過|吸収され|起こら|何も起き|害は(ない|無い)|影響は(ない|無い)|中毒|生じる|発生する/,
+    120,
+  );
+  if (!hit) return null;
+  return makeFact(article, "consequence", hit, hit, hit);
+}
+
+/**
+ * 理由の質問（「なぜ静脈は青く見えるのですか？」）。
+ * 答えは理由（ため・から・による等）を述べるリード文そのもの。
+ * 結果の質問と同じく、前提が俗説だと明記された文を先に探す。
+ */
+function extractWhy(question, article) {
+  const denial = findAnchoredSentence(
+    article,
+    question,
+    /根拠は?(ない|無い|ありません)|証拠は?(ない|無い)|俗説|迷信/,
+    120,
+  );
+  if (denial) return makeFact(article, "why", denial, denial, denial);
+  // 「ため」は理由（〜ため、）と目的（〜するために使われる）を見分ける：
+  // 目的の形は理由の答えにならないため、使・用の直前形は除く。
+  // 「による／によって」は「位置によって分類」のような単なる条件・
+  // 手段の用法が多く、理由でない文を拾うため印に入れない。代わりに
+  // 「理由」の語そのものと「原因は」を強い印とする。
+  const hit = findAnchoredSentence(
+    article,
+    question,
+    /ため[、。]|ためである|ためと|ために(?!使|用)|からである|からだ|からです|理由|原因は|おかげで|せいで/,
+    120,
+  );
+  if (!hit) return null;
+  return makeFact(article, "why", hit, hit, hit);
+}
+
 function extractDefinition(article) {
   const titleNorm = normalizeJa(article.title);
   const baseNorm = titleNorm.replace(/[（(].*?[）)]/g, "").trim();
@@ -9992,6 +10526,10 @@ function extractFact(question, article) {
         extractCategoryInstance(question, article, label) ??
         extractDefinition(article)
       );
+    case "consequence":
+      return extractConsequence(question, article);
+    case "why":
+      return extractWhy(question, article);
     default:
       return null;
   }
@@ -17247,7 +17785,11 @@ const App = {
             );
             const t = (out || "").trim();
             if (t && !isUltraAbstention(t)) {
-              written = trimBriefingTail(normalizeUltraWrittenStyle(t));
+              const w = trimBriefingTail(normalizeUltraWrittenStyle(t));
+              /* 数字照合を通った文だけを採用する。通らなければ
+                 written は空のままで、その節は材料の文（prose）に
+                 倒れる。 */
+              if (w && briefingNumbersOk(w, section.passage)) written = w;
             }
           } catch {
             written = "";
@@ -19804,13 +20346,13 @@ if (typeof module !== "undefined" && module.exports) {
     MODELS, modelDef, validateManifest,
     UltraModel, loadUltra, generateUltra, disposeUltra, modelReadyFor,
     assembleUltraPassage, isUltraAbstention, ultraWriteFactAnswer, ULTRA_PASSAGE_CAP,
-    fetchWebSearchPages, webSearchAnswer, GSEARCH_TIMEOUT_MS,
+    fetchWebSearchPages, webSearchAnswer, webAnswerEntityOk, GSEARCH_TIMEOUT_MS,
     fetchServerEvidence, startEvidencePromises, EVIDENCE_SERVER_TIMEOUT_MS,
     EVIDENCE_WAIT_MS,
     normalizeUltraWrittenStyle,
     UltraGgufModel, loadUltraGguf,
     UltraImacModel, loadUltraImac, tryRecoverUltraImac, ULTRA_IMAC_BASE_URL, ULTRA_IMAC_UNREACHABLE,
-    buildBriefingMaterial, trimBriefingTail, localDateKey, BRIEFING_DATE_KEY,
+    buildBriefingMaterial, trimBriefingTail, briefingNumbersOk, localDateKey, BRIEFING_DATE_KEY,
     pointsJstDateKey, pointsDailyLoginKey, pointsNewTopupKey,
     POINTS_TOPUP_MENU, POINTS_BONUS_KEY,
     getCubeMeter, meterAppliesTo, meterEmptyError,
