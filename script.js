@@ -774,6 +774,23 @@ const MODELS = {
     maxNew: 3072,
     expect: null,
   },
+  // Cube Wonder：エージェント専門モデル（2026-11-25 本人決定で
+  // 採用し、モデル選択に追加）。土台は Qwen3.5-9B ＋ 蒸留 LoRA
+  // （Cube Bot の頭脳と同一構成。頭脳テスト 44/45 で土台の
+  // 40/45 を上回った）。iMac の llama-server（8099 番・
+  // オンデマンド起動）で動かし、ページは cube-server の /wonder
+  // に会話列を渡す。システムプロンプトは蒸留学習時の標準形の
+  // ためサーバー側が差し込む（ページは送らない）。時間制
+  // メーターは他のサーバー側モデルと同じ扱い。
+  wonder: {
+    id: "wonder",
+    label: "Cube Wonder",
+    engine: "wonder",
+    defaultBaseUrl: "",
+    urlKey: "",
+    maxNew: 1024,
+    expect: null,
+  },
 };
 
 function modelDef(id) {
@@ -1110,7 +1127,7 @@ function getCubeMeter() {
    （どちらも iMac のオンデマンド起動）。
    端末内モデル（Nano / Flash）は対象外。 */
 function meterAppliesTo(id) {
-  return id === "ultra" || modelDef(id).engine === "server" || modelDef(id).engine === "chat" || modelDef(id).engine === "code";
+  return id === "ultra" || modelDef(id).engine === "server" || modelDef(id).engine === "chat" || modelDef(id).engine === "code" || modelDef(id).engine === "wonder";
 }
 
 /* メーター切れの例外。生成経路が残量0を検知したときに投げる。 */
@@ -1961,6 +1978,108 @@ const CodeModel = {
   },
 };
 
+/* ================================================================== */
+/* エージェント専門モデルエンジン（Cube Wonder）                        */
+/*                                                                    */
+/* Cube Wonder（Qwen3.5-9B ＋ 蒸留 LoRA）は iMac の llama-server     */
+/* （8099 番）で動かし、cube-server の /wonder が窓口。Bot の頭脳     */
+/* （8102）と同じ土台＋LoRA を通常チャットでも使うためのエンジン。   */
+/* オンデマンド起動（初回はモデルの読み込みで数十秒〜数分かかる）で、 */
+/* 10分無通信で自動停止する。システムプロンプトは蒸留学習時の標準形   */
+/* のためサーバー側が差し込む——ページは user / assistant の会話列    */
+/* だけを送り、system は絶対に送らない。thinking の無効化もサーバー   */
+/* 側（chat_template_kwargs）が担う。                                 */
+/* ================================================================== */
+
+const WONDER_CONNECT_TIMEOUT_MS = 300000;
+const WONDER_GENERATE_TIMEOUT_MS = 600000;
+const WONDER_PARAM_COUNT = 8953803264;
+
+const WonderModel = {
+  connected: false,
+  get ready() { return this.connected; },
+  readyFor(id) { return id === "wonder" && this.connected; },
+  paramCountFor() { return WONDER_PARAM_COUNT; },
+  /* 接続：サーバー側の /wonder/start がモデルの起動完了まで待って
+     から返す（オンデマンド起動）。 */
+  async connect(onPolling) {
+    if (this.connected) return;
+    if (onPolling) onPolling();
+    let res;
+    try {
+      res = await fetchWithTimeout(
+        `${CUBE_SERVER_BASE_URL}/wonder/start`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+        WONDER_CONNECT_TIMEOUT_MS,
+      );
+    } catch {
+      throw new Error(CUBE_SERVER_UNREACHABLE);
+    }
+    const data = res ? await res.json().catch(() => null) : null;
+    if (!res || !res.ok || !data || data.state !== "ready") {
+      const detail = data && typeof data.error === "string" ? data.error : "";
+      throw new Error(
+        detail ? `${CUBE_SERVER_UNREACHABLE}（サーバーの応答: ${detail}）` : CUBE_SERVER_UNREACHABLE,
+      );
+    }
+    this.connected = true;
+  },
+  /* 生成：会話列（履歴＋今回の発話）をそのまま渡す。失敗したら接続
+     状態を忘れ、素直な文面の例外にする（他のサーバーエンジンと
+     同じ流儀）。 */
+  async generate(question, historyMessages) {
+    if (!this.connected) throw new Error("Cube Wonder（iMacサーバー）が接続されていません");
+    const messages = [
+      ...(Array.isArray(historyMessages) ? historyMessages : []),
+      { role: "user", content: question },
+    ];
+    let res;
+    try {
+      res = await fetchWithTimeout(
+        `${CUBE_SERVER_BASE_URL}/wonder`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages, max_tokens: modelDef("wonder").maxNew }),
+        },
+        WONDER_GENERATE_TIMEOUT_MS,
+      );
+    } catch {
+      this.connected = false;
+      throw new Error(CUBE_SERVER_UNREACHABLE);
+    }
+    const data = res ? await res.json().catch(() => null) : null;
+    if (!res || !res.ok || !data || typeof data.text !== "string") {
+      this.connected = false;
+      const detail = data && typeof data.error === "string" ? data.error : "";
+      throw new Error(
+        detail ? `${CUBE_SERVER_UNREACHABLE}（サーバーの応答: ${detail}）` : CUBE_SERVER_UNREACHABLE,
+      );
+    }
+    return data.text.trim();
+  },
+  /* 接続状態を忘れる（他のモデルが選択されたとき）。サーバー側の
+     常駐には触れない（無通信10分で自動停止する）。 */
+  dispose() {
+    this.connected = false;
+  },
+};
+
+/* Cube Wonder 選択時に「事実質問」と判定する条件（ask の 2.8a 用）。
+   判定の物差しは既存の保守的な分類器 classifyQuestion（種類つき
+   事実の質問にだけ種類を返す。2.6 の雑談ルーティングが事実質問を
+   雑談専門へ渡さない根拠にも使われている）。ただし長い貼り付け文
+   （要約・作文の材料）は、文中の語が分類に引っかかっても事実質問
+   として扱わない（雑談ルーティングの長さ上限 CHAT_ROUTE_MAX_LEN
+   と同じ考え方で、空白を除いた文字数で数える）。判定に迷う入力は
+   事実質問に倒さない（＝Wonder の直接担当に残す）。 */
+const WONDER_FACT_MAX_LEN = 100;
+function isWonderFactQuestion(q) {
+  if (typeof q !== "string" || !q) return false;
+  if (q.replace(/\s/g, "").length > WONDER_FACT_MAX_LEN) return false;
+  return !!classifyQuestion(q);
+}
+
 /* モデルの生出力から ```file:名前 ブロックを取り出す。取り出せ
    なければ null（呼び出し側は生テキストをそのまま出す）。 */
 function parseCodeFiles(text) {
@@ -2168,6 +2287,17 @@ async function generateForModel(id, question, opts) {
         () => CodeModel.generate(question, opts && opts.historyMessages));
     }
     return CodeModel.generate(question, opts && opts.historyMessages);
+  }
+  if (modelDef(id).engine === "wonder") {
+    /* Cube Wonder も時間制メーターの対象（サーバー側モデルと
+       同じ扱い）。会話列は opts.historyMessages で受け取る。 */
+    const meter = getCubeMeter();
+    if (meter) {
+      if (!meter.canUse()) throw meterEmptyError();
+      return meter.consumeAround(
+        () => WonderModel.generate(question, opts && opts.historyMessages));
+    }
+    return WonderModel.generate(question, opts && opts.historyMessages);
   }
   if (modelDef(id).engine === "server") {
     /* サーバーモデル（Twin / Pro / Max）は時間制メーターの対象。
@@ -3033,6 +3163,7 @@ function modelReadyFor(id) {
   }
   if (modelDef(id).engine === "chat") return ChatModel.readyFor(id);
   if (modelDef(id).engine === "code") return CodeModel.readyFor(id);
+  if (modelDef(id).engine === "wonder") return WonderModel.readyFor(id);
   if (modelDef(id).engine === "server") return ServerModel.readyFor(id);
   return LocalModel.readyFor(id);
 }
@@ -15577,6 +15708,7 @@ const App = {
     if (def.engine === "ultra") return this.loadUltraImac();
     if (def.engine === "chat") return this.connectChatModel();
     if (def.engine === "code") return this.connectCodeModel();
+    if (def.engine === "wonder") return this.connectWonderModel();
     if (def.engine !== "server") return;
     if (ServerModel.readyFor(def.id)) {
       this.setModelStatus({
@@ -15591,6 +15723,7 @@ const App = {
     disposeUltra();
     ChatModel.dispose();
     CodeModel.dispose();
+    WonderModel.dispose();
     this.setUltraGgufNotice(null);
     this.setUltraEngineChoice(false);
     this.modelBusy = true;
@@ -15642,6 +15775,7 @@ const App = {
     disposeUltra();
     ServerModel.dispose();
     CodeModel.dispose();
+    WonderModel.dispose();
     this.setUltraGgufNotice(null);
     this.setUltraEngineChoice(false);
     this.modelBusy = true;
@@ -15725,6 +15859,56 @@ const App = {
     }
   },
 
+  /* エージェント専門（Cube Wonder）の接続：サーバー側は
+     オンデマンド起動で、初回はモデルの読み込みに時間がかかる
+     （/wonder/start が起動完了まで待って返す）。開始時に他の
+     エンジンの接続状態は破棄する（アクティブなエンジンは
+     常に1つだけ）。 */
+  async connectWonderModel() {
+    const def = modelDef(this.modelId);
+    if (WonderModel.readyFor(def.id)) {
+      this.setModelStatus({ kind: "ready", paramCount: WonderModel.paramCountFor() });
+      return;
+    }
+    const seq = ++this.serverLoadSeq;
+    disposeUltra();
+    ServerModel.dispose();
+    ChatModel.dispose();
+    CodeModel.dispose();
+    this.setUltraGgufNotice(null);
+    this.setUltraEngineChoice(false);
+    this.modelBusy = true;
+    this.renderModelSwitch();
+    this.setModelStatus({
+      kind: "loading",
+      loadedBytes: 0,
+      totalBytes: 0,
+      label: `${def.label}（iMacサーバーに接続しています）`,
+    });
+    try {
+      await WonderModel.connect(() => {
+        if (seq !== this.serverLoadSeq) return;
+        this.setModelStatus({
+          kind: "loading",
+          loadedBytes: 0,
+          totalBytes: 0,
+          label: `${def.label}（iMac側でモデルを起動中です。初回は少し時間がかかります）`,
+        });
+      });
+      if (seq !== this.serverLoadSeq) return;
+      this.setModelStatus({ kind: "ready", paramCount: WonderModel.paramCountFor() });
+    } catch (e) {
+      if (seq !== this.serverLoadSeq) return;
+      const message = e instanceof Error ? e.message : String(e);
+      this.setModelStatus({ kind: "error", message });
+    } finally {
+      if (seq === this.serverLoadSeq) {
+        this.modelBusy = false;
+        this.renderModelSwitch();
+      }
+    }
+  },
+
   async loadModel(url) {
     const def = modelDef(this.modelId);
     if (def.engine === "ultra") {
@@ -15742,6 +15926,7 @@ const App = {
       ServerModel.dispose();
       ChatModel.dispose();
       CodeModel.dispose();
+      WonderModel.dispose();
       if (UltraImacModel.ready) {
         this.setModelStatus({ kind: "ready", paramCount: ULTRA_PARAM_COUNT });
         return;
@@ -15764,6 +15949,7 @@ const App = {
       disposeUltra();
       ChatModel.dispose();
       CodeModel.dispose();
+      WonderModel.dispose();
       if (ServerModel.readyFor(def.id)) {
         this.setModelStatus({
           kind: "ready",
@@ -15788,6 +15974,7 @@ const App = {
       disposeUltra();
       ServerModel.dispose();
       CodeModel.dispose();
+      WonderModel.dispose();
       if (ChatModel.readyFor(def.id)) {
         this.setModelStatus({ kind: "ready", paramCount: ChatModel.paramCountFor() });
         return;
@@ -15820,6 +16007,29 @@ const App = {
       });
       return;
     }
+    if (def.engine === "wonder") {
+      // エージェント専門（Cube Wonder）：端末には読み込まない。
+      // ここ（ページ表示時・選択の復元時）は自動では接続せず、
+      // 未接続の待機表示にする。接続はモデルが選ばれたとき
+      // （switchModel）と接続ボタンから、connectServerModel
+      // 経由で行う。
+      this.ultraLoadSeq++;
+      this.setUltraGgufNotice(null);
+      this.setUltraEngineChoice(false);
+      disposeUltra();
+      ServerModel.dispose();
+      ChatModel.dispose();
+      CodeModel.dispose();
+      if (WonderModel.readyFor(def.id)) {
+        this.setModelStatus({ kind: "ready", paramCount: WonderModel.paramCountFor() });
+        return;
+      }
+      this.setModelStatus({
+        kind: "standby",
+        message: `${def.label} は未接続です。iMacサーバーに接続してください`,
+      });
+      return;
+    }
     // 端末内モデル（Nano / Flash）が選択された：Ultra のエンジンと
     // サーバーモデルの接続状態があれば破棄し、GGUF の案内も隠す
     // （アクティブなエンジンは常に1つだけ）。進行中の Ultra 読み込み
@@ -15831,6 +16041,7 @@ const App = {
     ServerModel.dispose();
     ChatModel.dispose();
     CodeModel.dispose();
+    WonderModel.dispose();
     // ベースURLの上書きは選択中モデルごとのキーに保存する
     // （Nano は従来の jisaku-ai-model-base-url、Flash は専用キー）。
     store.set(def.urlKey, url);
@@ -15974,6 +16185,7 @@ const App = {
     ServerModel.dispose();
     ChatModel.dispose();
     CodeModel.dispose();
+    WonderModel.dispose();
     this.setUltraEngineChoice(false);
     this.setUltraGgufNotice(null);
     this.modelBusy = true;
@@ -19150,6 +19362,38 @@ const App = {
     return picked.length ? picked : null;
   },
 
+  /* Cube Wonder 用：現在の会話の直近のやり取りを user /
+     assistant のメッセージ列にする。Wonder の文脈長
+     （-c 4096）に収めるため、直近6ターン・1ターン800字・
+     合計2400字で切り捨てる（雑談用より長く、コード用より
+     短い）。 */
+  historyMessagesForWonder() {
+    if (!this.historyCurrent) return null;
+    const turns = this.historyCurrent.turns || [];
+    const prior =
+      turns.length && turns[turns.length - 1].role === "user"
+        ? turns.slice(0, -1)
+        : turns.slice();
+    const usable = prior.filter(
+      (t) => t.role === "user" || (t.role === "ai" && !t.memnote),
+    );
+    if (!usable.length) return null;
+    const picked = [];
+    let used = 0;
+    for (let i = usable.length - 1; i >= 0 && picked.length < 6; i--) {
+      const t = usable[i];
+      let text = String(t.text || "");
+      if (text.length > 800) text = text.slice(0, 800) + "…";
+      if (picked.length > 0 && used + text.length > 2400) break;
+      picked.unshift({
+        role: t.role === "user" ? "user" : "assistant",
+        content: text,
+      });
+      used += text.length;
+    }
+    return picked.length ? picked : null;
+  },
+
   /* 自作モデル用：直近のやり取りの抜粋を質問の末尾に添える
      （記憶の装飾と同じ流儀で、QA 形式の中に収める）。再開した
      会話でない・前のやり取りが無い場合は質問をそのまま返す
@@ -20050,6 +20294,102 @@ const App = {
             text: "プログラミング専門モデルでエラーが起きました。",
             badge: "unknown",
             note: `Cube Code（iMacサーバー）への接続で問題が起きました: ${message}`,
+          });
+        }
+      }
+      return;
+    }
+
+    // 2.8a) Cube Wonder 選択時の事実質問は、手順3の証拠＋検証
+    // ゲート経路に倒す（2026-11-25 の調整：本人の「先に調整して
+    // から push」の決定）。証拠を集め、Wonder が下書きを書き、
+    // 文単位の検証ゲートを通った答えだけを表示する（通らなければ
+    // 手順3の棄権表示になる）。事実質問の判定は
+    // isWonderFactQuestion（既存の保守的な分類器 classifyQuestion
+    // ＋長さの関門）。事実質問でない入力（雑談・作文・貼り付け文
+    // の要約など）は、この下の 2.8 で Wonder が直接担当する。
+    // 接続が無ければここで接続し、modelReady を更新する（Ultra
+    // の復旧と同じ考え方）。メーターが空なら、接続を始める前に
+    // 穏やかに止める（2.5 の関門は未接続時に素通りするため、
+    // ここでも担保する。接続済みで空の場合は 2.5 が先に止める）。
+    const wonderSelected = modelDef(this.modelId).engine === "wonder";
+    let wonderFactRoute = false;
+    if (wonderSelected && isWonderFactQuestion(question)) {
+      const meter = getCubeMeter();
+      if (meter && !meter.canUse()) {
+        this.pushAssistant({
+          text: "サーバーモデルの時間メーターが0になりました。",
+          badge: "unknown",
+          note: "Cube Nano / Cube Flash はこの端末の中で動くため、メーターなしでそのまま使えます。モデルを切り替えてお試しください。ログイン中なら、ポイントでメーター時間を追加することもできます（サイドバーの「ポイントでメーター追加」）。メーターの無料分は日付が変わると戻ります。",
+        });
+        return;
+      }
+      if (!modelReady) {
+        try {
+          await WonderModel.connect();
+          modelReady = modelReadyFor(this.modelId);
+        } catch {
+          // 接続できなければ modelReady は偽のまま。手順3が
+          // 「読み込まれていない」として、証拠側の答え／棄権に倒す。
+        }
+      }
+      wonderFactRoute = true;
+    }
+
+    // 2.8) Cube Wonder が選ばれているときの直接担当（Cube Code
+    // を選んだときと同じ考え方）。事実質問は上の 2.8a で手順3の
+    // 検証ゲート経路に倒してあるため、ここに来るのは事実質問
+    // 以外（雑談・作文・要約など）だけ。Wonder は会話・文章の
+    // 要約や作成を担うエージェント専門モデルで、分からない
+    // ことは分からないと言う訓練方針のため、この分岐では検証
+    // ゲートには通さず生成をそのまま出す。知識メモ帳には保存
+    // しない（検証済みの事実ではないため）。
+    if (wonderSelected && !wonderFactRoute) {
+      const meter = getCubeMeter();
+      if (meter && !meter.canUse()) {
+        this.pushAssistant({
+          text: "サーバーモデルの時間メーターが0になりました。",
+          badge: "unknown",
+          note: "Cube Nano / Cube Flash はこの端末の中で動くため、メーターなしでそのまま使えます。モデルを切り替えてお試しください。ログイン中なら、ポイントでメーター時間を追加することもできます（サイドバーの「ポイントでメーター追加」）。メーターの無料分は日付が変わると戻ります。",
+        });
+        return;
+      }
+      this.setPhase("thinking");
+      try {
+        if (!WonderModel.readyFor("wonder")) {
+          await WonderModel.connect();
+        }
+        const raw = await generateForModel("wonder", question, {
+          historyMessages: this.historyMessagesForWonder(),
+        });
+        this.setPhase("idle");
+        if (raw) {
+          this.pushAssistant({
+            text: raw,
+            badge: "none",
+            note: "Cube Wonder（エージェント専門モデル）の返事です。",
+          });
+        } else {
+          this.pushAssistant({
+            text: "うまく返事を作れませんでした。もう一度送ってみてください。",
+            badge: "unknown",
+            note: "Cube Wonder（エージェント専門モデル）が空の返事を返しました。",
+          });
+        }
+      } catch (e) {
+        this.setPhase("idle");
+        if (e && e.code === "METER_EMPTY") {
+          this.pushAssistant({
+            text: "サーバーモデルの時間メーターが0になりました。",
+            badge: "unknown",
+            note: "Cube Nano / Cube Flash はこの端末の中で動くため、メーターなしでそのまま使えます。モデルを切り替えてお試しください。ログイン中なら、ポイントでメーター時間を追加することもできます（サイドバーの「ポイントでメーター追加」）。メーターの無料分は日付が変わると戻ります。",
+          });
+        } else {
+          const message = e instanceof Error ? e.message : String(e);
+          this.pushAssistant({
+            text: "エージェント専門モデルでエラーが起きました。",
+            badge: "unknown",
+            note: `Cube Wonder（iMacサーバー）への接続で問題が起きました: ${message}`,
           });
         }
       }
