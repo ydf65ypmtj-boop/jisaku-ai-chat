@@ -2538,6 +2538,343 @@ async function webSearchAnswer(question) {
   };
 }
 
+/* モデルの元の答えを、一般Web検索（/gsearch）の本文で文単位に照合
+   するフォールバック。索引レーンの証拠では裏づけが1つも取れなかっ
+   た答え（gate.status === "none"）専用で、照合は従来の検証ゲート
+   （verifyModelAnswer）をそのまま使い、証拠の集合だけを Web の
+   本文に差し替える（ゲートの判定基準は一切緩めない）。全部の文が
+   通れば全文を、一部だけなら通った文のみを表示する（partial）。
+   1つも通らなければ null（従来の棄権表示に落とす）。知識メモ帳に
+   は保存しない（Web経由の確認は保存対象外、という従来方針どおり）。 */
+async function webVerifyModelAnswer(question, modelAnswer) {
+  if (!modelAnswer) return null;
+  const pages = await fetchWebSearchPages(question);
+  if (!pages) return null;
+  const gate = verifyModelAnswer(modelAnswer, question, {
+    fact: null,
+    article: null,
+    results: pages,
+  });
+  if (gate.status !== "all" && gate.status !== "partial") return null;
+  // 実体すり替え対策（変更B再投入時の追加条件）：表示する文そのものが
+  // 質問の対象について述べているかを、Web レーンと同じ照合で確認する。
+  // モデルの元の答えが対象を取り違えていれば、証拠と一致していても
+  // 質問への答えとしては表示しない（不一致なら棄権に倒す）。
+  const displayText = gate.status === "all" ? modelAnswer : gate.text;
+  if (!webAnswerEntityOk(question, displayText, pages)) return null;
+  const source = gate.source || pages[0];
+  const evidence =
+    source.snippet || (source.text ? source.text.slice(0, 200) : "");
+  return {
+    text: displayText,
+    gate,
+    pages,
+    sourceTitle: source.title || source.url,
+    sourceUrl: source.url,
+    evidence,
+  };
+}
+
+/* ================================================================== */
+/* はい/いいえ型の否定裏づけ経路（階段2、2026-11-24）                    */
+/*                                                                    */
+/* 誤解型の質問（「〜というのは本当ですか」「〜できますか」等）では、    */
+/* モデルが誤った肯定・否定を書き、証拠がそれを否定しているのに、      */
+/* 従来は「裏づけなし（gate none）」で棄権するしかなかった。ここでは    */
+/* 証拠の側から、命題への立場（肯定/否定）が文の形から決定的に読める    */
+/* 文を1つ選び、その証拠文そのものを答えとして表示する。証拠に無い      */
+/* 事実は足さないし、文の書き換えもしない（文末の文体だけを最小限      */
+/* そろえる）。                                                        */
+/*                                                                    */
+/* 表示前の関門は既存の仕組みのまま：構成した答えは検証ゲート          */
+/* （verifyModelAnswer で status "all"）と実体照合                      */
+/* （webAnswerEntityOk）を必ず通し、どちらか落ちれば出さない。        */
+/* ゲート自体は一切緩めない（拾える文の範囲が広がるだけ）。            */
+/* 「はい、／いいえ、」の接頭辞は付けない：接頭辞を付けると文頭の      */
+/* 主語の結びつき照合が成立せず、検証を通る文まで落ちるため（実測）。  */
+/* 肯定・否定は証拠文自体が担う（「視認することは出来ない」が          */
+/* そのまま「いいえ」の答えになる）。                                  */
+/*                                                                    */
+/* 関連性の判定がこの経路の要：証拠文は逐語引用なので検証ゲートは      */
+/* 「証拠と一致するか」は見られても「質問に答えているか」は見られ      */
+/* ない。そこで候補文には、質問の名詞塊（単位）が2つ以上含まれる        */
+/* ことを必須にする（対象の名前だけに触れた別話題の文を拾わない）。    */
+/* 立場の異なる候補が両方あれば曖昧として出さない。                    */
+/*                                                                    */
+/* 発火は ask() 側で「種類つき事実なし・モデルが主張を書いたが1つも    */
+/* 裏づかなかった（gate none）」場合に限る。モデル自身が棄権した答え   */
+/* （gate abstain/nonclaim/partial）を復活させることはしない          */
+/* （変更Bと同じ規律）。                                               */
+/* ================================================================== */
+
+// 命題そのものを否定する言い回し（俗説・誤解の明示）。
+const YESNO_DEBUNK_MARKERS =
+  /俗説|迷信|誤解|誤り|間違い|都市伝説|実際(は|には)/;
+// 述語の否定形（命題が成り立たないことを述べる文）。
+const YESNO_NEGATION_MARKERS =
+  /ではない|ではありません|じゃありません|なかった|ないと(言|され|考え)|ない。|できない|できません|見えない|見られない|聞こえない|存在しない|決まっていない|対応していない|一律では|同じでは|含まれていない|認められていない|認められない|示されていない|証明されていない/;
+// 伝聞・信念の言い回し。「そう信じられていた」は真実の肯定ではない
+// ため、肯定の根拠にはしない。
+const YESNO_HEARSAY_MARKERS =
+  /と言われ|信じられ|考えられ|伝えられ|思われ|とされる|とされていた|説がある|という説/;
+
+/** はい/いいえで答えられる質問か（wh疑問は対象外）。 */
+function isYesNoQuestion(question) {
+  const q = String(question ?? "")
+    .trim()
+    .replace(/[？?]+$/, "");
+  if (!/か$/.test(q)) return false;
+  if (
+    /何(です|が|を|に|の|は|桁|色|人|個|本|枚|円|歳|番|回|秒|倍)|なに|誰|どこ|いつ|どれ|どの|どう(なり|なる|して|いう|思)|なぜ|どうして|いくつ/.test(
+      q,
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/** 質問の内容語（命題との照合用）。 */
+function yesNoQuestionTerms(question) {
+  return keyTerms(normalizeJa(String(question ?? ""))).filter((t) => {
+    if (t.length < 2) return false;
+    if (/^\d/.test(t)) return false;
+    if (EVIDENCE_STOP_TERMS.has(t)) return false;
+    if (/ですか|ますか|でしょうか|教えて|ください|知りたい|聞きたい/.test(t)) {
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * 関連性判定の「単位」：質問の内容語に、対象の記事タイトル・結果の
+ * タイトル・『…』の対象を加え、他の単位に含まれる断片（「万里」や
+ * 「長城」は「万里の長城」の断片）を落としたもの。複合名詞の断片を
+ * 別々に数えると、対象の名前に触れただけの別話題の文が「2語一致」
+ * になってしまうため、塊の単位で数える。
+ */
+function yesNoUnits(question, article, results) {
+  const raw = new Set(yesNoQuestionTerms(question));
+  const subj = subjectOf(question);
+  if (subj) raw.add(normalizeJa(subj));
+  if (article?.title) raw.add(normalizeJa(article.title));
+  // 結果のタイトルは、質問文の中に現れるものだけを単位にする（質問に
+  // 出てこない別対象の記事が、自分のタイトルで自己錨付けして候補に
+  // 紛れ込むのを防ぐ。「脳」のような1文字の対象名は内容語の抽出から
+  // 落ちるため、ここで拾う意味がある）。
+  const nq = normalizeJa(String(question ?? ""));
+  for (const r of results ?? []) {
+    if (r?.title && nq.includes(normalizeJa(r.title))) {
+      raw.add(normalizeJa(r.title));
+    }
+  }
+  const units = [...raw].filter((u) => u.length >= 2);
+  return units.filter(
+    (u) => !units.some((v) => v !== u && v.includes(u)),
+  );
+}
+
+/**
+ * 質問の主語の塊（文頭から最初の「は／が」まで）。取れなければ null。
+ * 候補文が対象そのものに触れているかの判定に使う。
+ */
+function yesNoSubjectUnit(question) {
+  const m = String(question ?? "").match(/^(.{2,16}?)[はが]/);
+  if (!m) return null;
+  const s = m[1].replace(/、$/, "").trim();
+  return s.length >= 2 ? s : null;
+}
+
+/** 質問が名指す最上級の候補（「最も高い惑星は、水星ですか」の水星）。 */
+function yesNoClaimedEntity(question) {
+  if (superlativeRank(question) === 0) return null;
+  const m = String(question ?? "").match(
+    /は、?\s*([^、。！？?\s]{2,24}?)\s*(?:ですか|ますか|でしょうか)/,
+  );
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * 証拠文1つの、質問の命題への立場。"neg"（命題を否定）/"pos"（命題を
+ * 肯定）/null（決定的に読めない）。units は yesNoUnits の単位表で、
+ * 文に含まれる単位の数を数えるのに使う。
+ */
+function yesNoSentenceStance(sentence, question, units, claimedEntity) {
+  const ns = normalizeJa(sentence);
+  const countUnits = (text) =>
+    units.filter((u) => text.includes(u)).length;
+  // 「AではなくB」型：単位がどちらの側に多く出るかで立場を決める。
+  const dehaIdx = ns.indexOf("ではなく");
+  if (dehaIdx >= 0) {
+    const aHits = countUnits(ns.slice(0, dehaIdx));
+    const bHits = countUnits(ns.slice(dehaIdx + 4));
+    if (aHits > bHits) return "neg";
+    if (bHits > aHits) return "pos";
+    return null;
+  }
+  if (YESNO_DEBUNK_MARKERS.test(ns) || YESNO_NEGATION_MARKERS.test(ns)) {
+    return "neg";
+  }
+  // 最上級の質問では、勝者を名指さない文を肯定の根拠にしない（別の
+  // 勝者の記事の文が肯定と組み合わさる事故を防ぐ）。別の勝者を
+  // 述べる文は、名指された候補への否定として扱う。
+  const winner = superlativeClaimWinner(sentence);
+  if (superlativeRank(question) > 0) {
+    if (!winner || !claimedEntity) return null;
+    const nw = normalizeJa(winner);
+    const nc = normalizeJa(claimedEntity);
+    if (nw.includes(nc) || nc.includes(nw)) {
+      return YESNO_HEARSAY_MARKERS.test(ns) ? null : "pos";
+    }
+    return "neg";
+  }
+  if (winner) return null;
+  if (YESNO_HEARSAY_MARKERS.test(ns)) return null;
+  if (/ない|なかった|ではな|ません|れな|せん|ずに|ぬ/.test(ns)) return null;
+  return "pos";
+}
+
+/** 証拠文を答えの文体（です・ます）に寄せる。文末だけの最小変換。 */
+function yesNoPoliteSentence(sentence) {
+  let s = String(sentence ?? "").trim();
+  s = s.replace(/である。$/, "です。");
+  s = s.replace(/であった。$/, "でした。");
+  s = s.replace(/ではない。$/, "ではありません。");
+  s = s.replace(/だ。$/, "です。");
+  return s;
+}
+
+/**
+ * はい/いいえ型の質問に、証拠文から答えを構成する。構成できなければ
+ * null（呼び出し側は従来どおり棄権に倒す）。
+ */
+function yesNoEvidenceAnswer(question, modelAnswer, ctx) {
+  if (!modelAnswer || !isYesNoQuestion(question)) return null;
+  if (ctx?.fact) return null;
+  const article = ctx?.article ?? null;
+  const results = ctx?.results ?? [];
+  const units = yesNoUnits(question, article, results);
+  if (units.length < 2) return null;
+  const claimedEntity = yesNoClaimedEntity(question);
+
+  // 候補プール：対象の記事のリード文＋、結果の本文の文。
+  const nq = normalizeJa(String(question ?? ""));
+  const subjectUnit = yesNoSubjectUnit(question);
+  const nSubject = subjectUnit ? normalizeJa(subjectUnit) : null;
+  // 述語側の単位（質問の主語より後ろに出てくる単位）。肯定の候補には
+  // 述語への言及が必須：対象の名前に触れただけの別話題の文（銀河の
+  // 「グレートウォール」のような別義の文）が、否定の印が無いという
+  // だけで肯定候補になるのを防ぐ。
+  let predicateUnits = [];
+  if (nSubject) {
+    const idx = nq.indexOf(nSubject);
+    const rest = idx >= 0 ? nq.slice(idx + nSubject.length) : nq;
+    predicateUnits = units.filter((u) => u !== nSubject && rest.includes(u));
+  }
+  const pools = [];
+  if (article && article.lead) {
+    pools.push({
+      title: article.title,
+      url: article.url,
+      sentences: splitSentences(article.lead),
+      fromArticle: true,
+      titleInQuestion: false,
+    });
+  }
+  for (const r of results) {
+    if (!isUsableEvidenceResult(r)) continue;
+    pools.push({
+      title: r.title,
+      url: r.url,
+      sentences: splitSentences(r.text ?? ""),
+      fromArticle: false,
+      titleInQuestion: !!r.title && nq.includes(normalizeJa(r.title)),
+    });
+  }
+
+  let negBest = null;
+  let posBest = null;
+  for (const pool of pools) {
+    for (const s of pool.sentences) {
+      if (/[？?]/.test(s)) continue;
+      const ns = normalizeJa(s);
+      // 関連性：質問の単位が2つ以上含まれる文だけを候補にする。
+      const hits = units.filter((u) => ns.includes(u)).length;
+      if (hits < 2) continue;
+      // 対象への結びつき：対象の記事の文は無条件に対象の文として扱う。
+      // それ以外は、文が質問の主語の塊を含むか、出典のタイトルが質問に
+      // 現れる場合だけを候補にする（述語の語だけが一致する別対象の文を
+      // 拾わない）。例外は最上級の質問で勝者を名指す文：正しい勝者は
+      // 別対象の記事にしか現れないため、主語の条件を外す。
+      if (!pool.fromArticle && !pool.titleInQuestion) {
+        const subjectOk =
+          !nSubject ||
+          ns.includes(nSubject) ||
+          (superlativeRank(question) > 0 && !!superlativeClaimWinner(s));
+        if (!subjectOk) continue;
+      }
+      const stance = yesNoSentenceStance(s, question, units, claimedEntity);
+      if (!stance) continue;
+      if (stance === "pos") {
+        // 肯定は否定より厳しく：述語側の単位を2つ以上含む文だけを
+        // 肯定候補にする（述語の切り分けができない質問では、単位の
+        // 一致が3つ以上ある文だけ）。
+        const predHits = predicateUnits.filter((u) => ns.includes(u)).length;
+        if (predicateUnits.length >= 2 ? predHits < 2 : hits < 3) continue;
+      }
+      if (stance === "neg") {
+        const score = YESNO_DEBUNK_MARKERS.test(ns) ? 2 : 1;
+        if (!negBest || score > negBest.score) {
+          negBest = { sentence: s, title: pool.title, url: pool.url, score };
+        }
+      } else if (!posBest) {
+        posBest = { sentence: s, title: pool.title, url: pool.url };
+      }
+    }
+  }
+  // 立場が割れている証拠は曖昧なので出さない。
+  if (negBest && posBest) return null;
+  const best = negBest ?? posBest;
+  if (!best) return null;
+  const stance = negBest ? "neg" : "pos";
+  const text = yesNoPoliteSentence(best.sentence);
+  // 表示前の関門：既存ゲートで全ての主張が裏づくこと＋実体照合。
+  // 照合の証拠には、記事そのものも結果の形で含める（種類つき事実の
+  // 定義経路が記事を出典として扱うのと同じで、証拠一式は
+  // fetchServerEvidence が返した範囲のまま）。
+  const gateResults = article
+    ? [
+        {
+          title: article.title,
+          url: article.url,
+          snippet: "",
+          text: article.lead ?? "",
+        },
+        ...results,
+      ]
+    : results;
+  const gate = verifyModelAnswer(text, question, {
+    fact: null,
+    article,
+    results: gateResults,
+  });
+  if (!gate || gate.status !== "all") return null;
+  const pages = [];
+  if (article) {
+    pages.push({ title: article.title, url: article.url, text: article.lead });
+  }
+  for (const r of results) pages.push(r);
+  if (!webAnswerEntityOk(question, text, pages)) return null;
+  return {
+    text,
+    sourceTitle: best.title,
+    sourceUrl: best.url,
+    evidence: best.sentence,
+    stance,
+  };
+}
+
 /* ================================================================== */
 /* 朝のブリーフィング                                                  */
 /*                                                                    */
@@ -6928,8 +7265,28 @@ function normalizeUnits(text) {
 function evidenceWindows(result) {
   const head = `${result.title}\n${result.snippet}\n${result.text.slice(0, 1600)}`;
   const windows = [normalizeUnits(normalizeJa(head))];
-  for (const s of splitSentences(result.text)) {
+  const sentences = splitSentences(result.text);
+  for (const s of sentences) {
     windows.push(normalizeUnits(normalizeJa(s)));
+  }
+  // 段落窓（階段3、2026-11-24）：記事本文を段落（改行区切り）ごとに
+  // 窓へ加える。主語が段落の前の文、値が後の文にあるような「1文では
+  // 完結しない裏づけ」を拾うため。ただし窓の大きさは従来のリード窓
+  // （見出し＋約1600字）と同程度（2400字まで）に抑え、それより長い
+  // 段落は窓にしない。裏づけの条件は従来どおり「主張語と数字が全部
+  // 1つの窓の中にそろうこと」で、記事全体に散らばった語の寄せ集めは
+  // 通らない（厳しさは維持し、届く範囲だけを広げる）。
+  for (const para of String(result.text ?? "").split(/\n+/)) {
+    const p = para.trim();
+    if (p.length >= 8 && p.length <= 2400) {
+      windows.push(normalizeUnits(normalizeJa(p)));
+    }
+  }
+  // 隣接2文の窓（階段3）：「本部はニューヨークに置かれている。前身は
+  // …」のように2文で完結する裏づけを拾う。2文の窓は従来のリード窓
+  // よりずっと小さいため、厳しさの後退にはならない。
+  for (let i = 0; i + 1 < sentences.length; i++) {
+    windows.push(normalizeUnits(normalizeJa(sentences[i] + sentences[i + 1])));
   }
   return windows;
 }
@@ -7405,7 +7762,11 @@ function superlativeWinnerSource(sentence, results, question) {
   const claimNums = numbersIn(sentence);
   for (const r of results ?? []) {
     if (!isUsableEvidenceResult(r)) continue;
-    const lead = (r.text ?? "").slice(0, 1600);
+    // 階段3（2026-11-24）：走査範囲を冒頭1600字から本文全体へ広げる。
+    // 勝者を述べる文や数字が記事の後半にある場合に届かなかったため。
+    // 判定の条件（勝者を述べる文の中での数字の一致など）は従来どおり
+    // で、届く範囲だけが広がる。
+    const lead = r.text ?? "";
     if (claimNums.length > 0) {
       const leadNums = numbersIn(
         normalizeUnits(normalizeJa(`${r.title}\n${lead}`)),
@@ -7577,7 +7938,9 @@ function definitionSentenceSource(sentence, results, question) {
   }
   for (const pass of passes) {
     for (const r of pass) {
-      const leadSentences = splitSentences((r.text ?? "").slice(0, 1600));
+      // 階段3（2026-11-24）：定義文の走査を冒頭1600字から本文全体へ
+      // 広げる（1文単位の照合の厳しさは従来どおり）。
+      const leadSentences = splitSentences(r.text ?? "");
       for (const ls of leadSentences) {
         if (qRank) {
           if (superlativeRank(ls) !== qRank) continue;
@@ -8275,7 +8638,9 @@ function verifySentence(sentence, question, ctx) {
   if (questionContextTerms(question).length > 0) {
     results = results.filter((r) =>
       contextSatisfiedByText(
-        `${r?.title ?? ""}\n${(r?.text ?? "").slice(0, 600)}`,
+        // 階段3（2026-11-24）：文脈の適合を見る範囲を冒頭600字から
+        // 1600字（リード窓と同じ範囲）へ広げる。
+        `${r?.title ?? ""}\n${(r?.text ?? "").slice(0, 1600)}`,
         question,
       ),
     );
@@ -20025,6 +20390,72 @@ const App = {
         });
         return;
       }
+      // Web本文を読ませる書き直しでも答えられなかった場合の、最後の
+      // 受け皿：モデルの元の答えを、一般Web検索の本文で文単位に照合
+      // する（webVerifyModelAnswer）。索引の証拠では裏づけゼロだった
+      // 答えでも、Webの本文に裏づけがあれば、通った文だけを表示する。
+      // 照合は従来の検証ゲートと同一（緩めない）。モデルの棄権文
+      // （gate.status === "abstain"）は対象にしない：モデルが「分か
+      // らない」と言った答えを、証拠側の言い換えで復活させることは
+      // しない。表示した答えは知識メモ帳に保存しない（Web経由の確認
+      // は保存対象外、という従来方針どおり）。
+      if (modelAnswer && gate && gate.status === "none") {
+        const wv = await webVerifyModelAnswer(question, modelAnswer).catch(
+          () => null,
+        );
+        if (wv) {
+          // 嘘チェック可視化：表示する答え（モデル回答×Web照合）の
+          // 検証内訳に差し替える。
+          if (typeof CubeFactCheck !== "undefined") {
+            try {
+              this._fcBreakdown = CubeFactCheck.buildBreakdown({
+                question,
+                gate: wv.gate,
+                fact: null,
+                results: wv.pages,
+              });
+            } catch {
+              this._fcBreakdown = null;
+            }
+          }
+          this.setPhase("idle");
+          this.pushAssistant({
+            text: wv.text,
+            badge: "model",
+            sourceTitle: wv.sourceTitle,
+            sourceUrl: wv.sourceUrl,
+            evidence: wv.evidence,
+            note: "Cubeの答えを、一般のWeb検索で見つけた記事と文単位で照合し、裏づけが取れた部分だけを表示しています。",
+          });
+          return;
+        }
+      }
+      // はい/いいえ型の否定裏づけ（階段2、2026-11-24）：モデルが主張を
+      // 書いたが索引の証拠では1つも裏づかなかった（gate none）
+      // はい/いいえ型の質問では、証拠の側に命題を否定（または肯定）
+      // する決定的な文があれば、その文だけで答えを構成する。構成した
+      // 答えは関数の中で検証ゲート（all）と実体照合を通してある。
+      // 種類つき事実がある場合と、モデル自身が棄権した場合
+      // （abstain/nonclaim/partial）は対象にしない。表示した答えは
+      // 知識メモ帳に保存しない（証拠文の組み立ては保存対象外）。
+      if (modelAnswer && !fact && gate && gate.status === "none") {
+        const yn = yesNoEvidenceAnswer(question, modelAnswer, {
+          article,
+          results,
+        });
+        if (yn) {
+          this.setPhase("idle");
+          this.pushAssistant({
+            text: yn.text,
+            badge: "model",
+            sourceTitle: yn.sourceTitle,
+            sourceUrl: yn.sourceUrl,
+            evidence: yn.evidence,
+            note: "Cubeの答えは裏づけが取れなかったため、検索で見つけた記事の中から、はい／いいえの根拠になる文をそのまま表示しています。",
+          });
+          return;
+        }
+      }
     }
 
     // 5) 種類つき事実が取れなかった場合の表示は、文単位ゲートの結果で
@@ -20346,7 +20777,10 @@ if (typeof module !== "undefined" && module.exports) {
     MODELS, modelDef, validateManifest,
     UltraModel, loadUltra, generateUltra, disposeUltra, modelReadyFor,
     assembleUltraPassage, isUltraAbstention, ultraWriteFactAnswer, ULTRA_PASSAGE_CAP,
-    fetchWebSearchPages, webSearchAnswer, webAnswerEntityOk, GSEARCH_TIMEOUT_MS,
+    fetchWebSearchPages, webSearchAnswer, webVerifyModelAnswer, webAnswerEntityOk, GSEARCH_TIMEOUT_MS,
+    yesNoEvidenceAnswer, isYesNoQuestion,
+    yesNoSentenceStance, yesNoQuestionTerms, yesNoClaimedEntity, yesNoPoliteSentence,
+    yesNoUnits, yesNoSubjectUnit,
     fetchServerEvidence, startEvidencePromises, EVIDENCE_SERVER_TIMEOUT_MS,
     EVIDENCE_WAIT_MS,
     normalizeUltraWrittenStyle,
