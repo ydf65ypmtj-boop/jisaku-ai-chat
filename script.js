@@ -2600,6 +2600,34 @@ function webEntityAliasLinked(pages, subject, target) {
  * 対象が決定的に取れない質問・最上級の説明型の質問は照合しない
  * （true を返し、従来のゲートに委ねる）。
  */
+/* 階段6（2026-11-25）：topicFromQuestion が文節全体を返す質問
+   （「〜という説に、科学的な根拠はありますか」型）では、topic が
+   実体名として機能せず、正しい答えでも実体照合に落ちていた。
+   topic が文節らしいかどうか。 */
+function webTopicIsClauseLike(target) {
+  return webEntityNorm(target).length >= 12 || /、|という/.test(String(target ?? ""));
+}
+
+/* 質問自身が名指す対象の候補：質問文中に逐語で現れるページの
+   タイトルと、質問の文頭の主語句。候補は質問文とその検索結果の
+   タイトルからだけ作るので、質問に無い別実体の名前は候補に
+   ならない。 */
+function questionEntityCandidates(question, pages) {
+  const out = [];
+  const nq = webEntityNorm(question);
+  for (const p of pages ?? []) {
+    const t = String(p?.title ?? "")
+      .replace(/[（(][^（）()]*[）)]\s*$/, "")
+      .trim();
+    if (t && nq.includes(webEntityNorm(t)) && !out.includes(t)) out.push(t);
+  }
+  const head = /^(.{2,24}?)[はが]/.exec(String(question ?? ""))?.[1]
+    ?.replace(/、$/, "")
+    .trim();
+  if (head && head.length >= 2 && !out.includes(head)) out.push(head);
+  return out;
+}
+
 function webAnswerEntityOk(question, answer, pages) {
   const bracketed = subjectOf(question);
   const target = bracketed ?? topicFromQuestion(question);
@@ -2617,6 +2645,22 @@ function webAnswerEntityOk(question, answer, pages) {
   }
   for (const s of subjects) {
     if (webEntityAliasLinked(pages, s, target)) return true;
+  }
+  // 階段6（2026-11-25）：topic が文節全体で実体として照合できない
+  // 場合は、質問自身が名指す対象（上記）でも同じ照合を行う。
+  if (!bracketed && webTopicIsClauseLike(target)) {
+    for (const cand of questionEntityCandidates(question, pages)) {
+      if (cand === target) continue;
+      const nc = webEntityNorm(cand);
+      if (nc.length < 3) continue;
+      if (na.includes(nc)) return true;
+      for (const s of subjects) {
+        if (webEntityNamesMatch(s, cand)) return true;
+      }
+      for (const s of subjects) {
+        if (webEntityAliasLinked(pages, s, cand)) return true;
+      }
+    }
   }
   return false;
 }
@@ -7469,7 +7513,18 @@ function resultAnchoredToQuestion(result, question, modelAnswer) {
     /は「?([^。「」]{1,30}?)」?(?:です|である)[。]?$/,
   );
   const value = valueMatch?.[1]?.trim();
-  const anchors = [subject, topic, aSubject, value].filter(Boolean);
+  // 階段6（2026-11-25）：「マイナンバー（個人番号）」のように別名を
+  // 括弧で併記した名前は、括弧の内外もそれぞれ対象の名前として
+  // 錨に使う。質問自身が2つの名前を同じ対象の名として挙げている
+  // ためで、質問に無い名前が錨になることはない。
+  const expandAlias = (a) => {
+    if (!a) return [];
+    const m = /（(.+?)）/.exec(a);
+    if (!m) return [a];
+    const outer = (a.slice(0, m.index) + a.slice(m.index + m[0].length)).trim();
+    return [a, outer, m[1].trim()].filter((x) => x && x.length >= 2);
+  };
+  const anchors = [subject, topic, aSubject, value].flatMap(expandAlias);
   if (anchors.length === 0) return true;
   for (const a of anchors) {
     if (titleMatchesSubject(result.title, a)) return true;
@@ -7482,7 +7537,7 @@ function resultAnchoredToQuestion(result, question, modelAnswer) {
   const firstSentence =
     splitSentences(result.text)[0] ?? result.text.slice(0, 120);
   const headNorm = normalizeJa(firstSentence).slice(0, 48);
-  for (const a of [subject, topic, aSubject].filter(Boolean)) {
+  for (const a of [subject, topic, aSubject].flatMap(expandAlias)) {
     const na = normalizeJa(a);
     if (
       na.length >= 2 &&
@@ -7535,12 +7590,19 @@ function findCorroboratingResult(modelAnswer, results, question = "") {
   if (qKind && aKind && qKind !== aKind && STRICT_KINDS.includes(qKind)) {
     return null;
   }
-  let content = effectiveContentTerms(modelAnswer, question);
+  // 階段6（2026-11-25）：主張語は経路C（gateContentTerms）と同じく
+  // 末尾の助詞を落としてから使う。従来の effectiveContentTerms は
+  // 「マイナンバーは12桁の番号です」の主語「マイナンバーは」を
+  // そのまま主張語に残し、質問側の語（「マイナンバー」）の言い換え
+  // として落ちないため、証拠窓（「マイナンバー」表記）と一致せず
+  // 正しい答えが落ちていた。助詞落としで空になる場合は従来の
+  // 抽出にフォールバックする。
+  let content = gateContentTerms(modelAnswer, question);
   if (content.length === 0) {
     // 答えの中心が1文字の語（「元素記号Feは鉄の元素です」の鉄）だと
     // 主張語が空になる。値の位置から拾う短い1語で代用する（下の
     // 単独語ルール＝タイトル錨＋同じ窓の共起がそのまま縛る）。
-    content = gateContentTerms(modelAnswer, question);
+    content = effectiveContentTerms(modelAnswer, question);
   }
   if (content.length >= 2) {
     for (const r of results) {
@@ -7884,7 +7946,12 @@ function superlativeWinnerSource(sentence, results, question) {
     }
   }
   if (winners.length === 0) return null;
-  const attr = SUPERLATIVE_ATTRS.find(([re]) => re.test(question));
+  // 階段6（2026-11-25）：属性の語形は sentenceAssertsWinner と同じ
+  // SUPERLATIVE_ATTR_FORMS で判定する（従来の SUPERLATIVE_ATTRS は
+  // 「面積」等の名詞形しか持たず、「最大である」のように順位の語
+  // 自体が属性を担う文を取りこぼしていた）。文が別の属性の語を
+  // 名指す場合は従来どおり一致しない。
+  const attr = SUPERLATIVE_ATTR_FORMS.find(([re]) => re.test(question));
   if (!attr) return null;
   const scope = /(世界|日本|太陽系|全国)/.exec(question)?.[1] ?? null;
   const scopeAlt =
@@ -7939,7 +8006,11 @@ function superlativeWinnerSource(sentence, results, question) {
           ls.includes(`${winner}は日本一`) ||
           ls.includes(`${winner}は世界一`) ||
           ls.includes(`のは${winner}`) ||
-          ls.includes(`は${winner}である`);
+          ls.includes(`は${winner}である`) ||
+          // 階段6（2026-11-25）：勝者の主張の定義を sentenceAssertsWinner
+          // と共通化する（「利根川が最大である」のような「が＋順位語」
+          // の形が、従来のリテラル列挙に無く取りこぼされていたため）。
+          sentenceAssertsWinner(ls, winner, question, titleEq);
         if (!asserts) continue;
         if (/ではなく|でなく|誤り|間違い|と思われがち|という誤解/.test(ls)) {
           continue;
@@ -8464,6 +8535,22 @@ function sentenceSubjectBlocksWinner(ls, winner, question) {
           ? /三番目|3番目|第三/
           : /一番|最も|第1位|世界一|日本一|首位|最[長短高低大小速重広狭深浅新古多]/;
     if (rankPat.test(clause)) return false;
+  }
+  // 階段6（2026-11-25）：勝者が「が」の主語として同じ節内で質問と
+  // 同じ順位を担う形（「…とする利根川が最大である」）も、は形と
+  // 同じく別対象の文とはみなさない。順位印が別の節にある場合は
+  // 従来どおりブロックする。
+  const idxGa = s.indexOf(`${w}が`);
+  if (idxGa >= 0) {
+    const clauseGa = s.slice(idxGa, idxGa + 60).split(/[、。]/)[0] ?? "";
+    const qRankGa = superlativeRank(question ?? "");
+    const rankPatGa =
+      qRankGa === 2
+        ? /二番目|2番目|第二/
+        : qRankGa === 3
+          ? /三番目|3番目|第三/
+          : /一番|最も|第1位|世界一|日本一|首位|最[長短高低大小速重広狭深浅新古多]/;
+    if (rankPatGa.test(clauseGa)) return false;
   }
   return true;
 }
