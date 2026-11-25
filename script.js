@@ -15465,7 +15465,7 @@ const App = {
     // Ultra とサーバーモデル（Twin / Pro / Max）と雑談専門（会話）
     // とコード専門（Code）にはベースURLが無い（どれも iMac
     // サーバーで動かす）。
-    this.baseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code"
+    this.baseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code" || def.engine === "wonder"
       ? ""
       : store.get(def.urlKey) || def.defaultBaseUrl;
     el("base-url").value = this.baseUrl;
@@ -15651,7 +15651,7 @@ const App = {
     this.modelId = id;
     store.set(MODEL_ID_KEY, id);
     const def = modelDef(id);
-    this.baseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code"
+    this.baseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code" || def.engine === "wonder"
       ? ""
       : store.get(def.urlKey) || def.defaultBaseUrl;
     el("base-url").value = this.baseUrl;
@@ -15666,7 +15666,7 @@ const App = {
     // iMac で動かすモデル（Twin / Pro / Max / Ultra / 会話 /
     // Code）は、選ばれた時点でそのまま接続する（待機表示で
     // 止めない）。端末内モデルは従来どおり loadModel で読み込む。
-    if (def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code") {
+    if (def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code" || def.engine === "wonder") {
       await this.connectServerModel();
     } else {
       await this.loadModel(this.baseUrl);
@@ -15712,7 +15712,7 @@ const App = {
     // ベースURL欄にはその旨を表示する。未接続（standby）・接続
     // エラー（error）のときは、接続／再試行のボタンも出す。
     const def = modelDef(this.modelId);
-    const noBaseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code";
+    const noBaseUrl = def.engine === "ultra" || def.engine === "server" || def.engine === "chat" || def.engine === "code" || def.engine === "wonder";
     const baseInput = el("base-url");
     if (baseInput) baseInput.disabled = noBaseUrl;
     const loadBtn = el("load-model-btn");
@@ -20486,6 +20486,7 @@ const App = {
       try {
         if (!WonderModel.readyFor("wonder")) {
           await WonderModel.connect();
+          this.setModelStatus({ kind: "ready", paramCount: WonderModel.paramCountFor() });
         }
         const raw = await generateForModel("wonder", question, {
           historyMessages: this.historyMessagesForWonder(),
