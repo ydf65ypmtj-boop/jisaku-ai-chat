@@ -52,6 +52,32 @@
         border-radius: 14px;
         margin-bottom: 6px;
       }
+      /* 思考レベル（Cube Wonder 専用）：style.css は触らず、追加分だけここに置く */
+      .wonder-think-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 2px 2px 6px;
+      }
+      .wonder-think-row[hidden] { display: none; }
+      .wonder-think-label { font-size: 12px; font-weight: 700; color: var(--dim); }
+      .wonder-think-switch { display: flex; gap: 4px; }
+      .wonder-think-btn {
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--dim);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 700;
+        padding: 4px 11px;
+        border-radius: 999px;
+        cursor: pointer;
+      }
+      .wonder-think-btn[aria-pressed="true"] {
+        background: linear-gradient(120deg, var(--grad-1), var(--grad-2));
+        border-color: transparent;
+        color: #ffffff;
+      }
     </style>
   </head>
   <body>
@@ -378,6 +404,15 @@
                 <button type="button" class="model-switch-btn" data-model="chat" aria-pressed="false">Speak</button>
                 <button type="button" class="model-switch-btn" data-model="code" aria-pressed="false">Code</button>
                 <button type="button" class="model-switch-btn" data-model="wonder" aria-pressed="false">Wonder</button>
+              </div>
+              <!-- 思考レベル（Cube Wonder 専用）：Wonder 選択時だけ表示する -->
+              <div id="wonder-think-row" class="wonder-think-row" hidden>
+                <span class="wonder-think-label">思考</span>
+                <div class="wonder-think-switch" role="group" aria-label="Cube Wonder の思考レベル">
+                  <button type="button" class="wonder-think-btn" data-think="fast" aria-pressed="true">速い</button>
+                  <button type="button" class="wonder-think-btn" data-think="normal" aria-pressed="false">普通</button>
+                  <button type="button" class="wonder-think-btn" data-think="deep" aria-pressed="false">じっくり</button>
+                </div>
               </div>
               <div id="attach-preview" class="attach-preview" hidden>
                 <img id="attach-thumb" alt="添付した画像" />

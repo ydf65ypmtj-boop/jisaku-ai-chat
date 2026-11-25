@@ -1987,19 +1987,39 @@ const CodeModel = {
 /* オンデマンド起動（初回はモデルの読み込みで数十秒〜数分かかる）で、 */
 /* 10分無通信で自動停止する。システムプロンプトは蒸留学習時の標準形   */
 /* のためサーバー側が差し込む——ページは user / assistant の会話列    */
-/* だけを送り、system は絶対に送らない。thinking の無効化もサーバー   */
-/* 側（chat_template_kwargs）が担う。                                 */
+/* だけを送り、system は絶対に送らない。思考の制御（オン／オフと
+   総出力上限）もサーバー側が担い、ページは思考レベル（think_level）
+   を選んで送るだけにする。                                         */
 /* ================================================================== */
 
 const WONDER_CONNECT_TIMEOUT_MS = 300000;
 const WONDER_GENERATE_TIMEOUT_MS = 600000;
 const WONDER_PARAM_COUNT = 8953803264;
+/* 思考レベル（2026-11-25 追加・本人が実施を決定）：サーバー側の
+   /wonder が think_level を受けて、思考の有無と総出力上限を切り
+   替える（fast=思考オフ／normal=思考オン・上限1024／deep=思考
+   オン・上限2048）。既定は "fast"（従来動作）。選択は端末に保存。 */
+const WONDER_THINK_KEY = "cube-wonder-think-level";
+const WONDER_THINK_LEVELS = ["fast", "normal", "deep"];
 
 const WonderModel = {
   connected: false,
   get ready() { return this.connected; },
   readyFor(id) { return id === "wonder" && this.connected; },
   paramCountFor() { return WONDER_PARAM_COUNT; },
+  _thinkLevel: null,
+  /* 思考レベル。初回アクセス時に保存値を読み、無ければ "fast"。 */
+  get thinkLevel() {
+    if (this._thinkLevel === null) {
+      const saved = store.get(WONDER_THINK_KEY);
+      this._thinkLevel = WONDER_THINK_LEVELS.includes(saved) ? saved : "fast";
+    }
+    return this._thinkLevel;
+  },
+  set thinkLevel(v) {
+    this._thinkLevel = WONDER_THINK_LEVELS.includes(v) ? v : "fast";
+    store.set(WONDER_THINK_KEY, this._thinkLevel);
+  },
   /* 接続：サーバー側の /wonder/start がモデルの起動完了まで待って
      から返す（オンデマンド起動）。 */
   async connect(onPolling) {
@@ -2040,7 +2060,7 @@ const WonderModel = {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages, max_tokens: modelDef("wonder").maxNew }),
+          body: JSON.stringify({ messages, max_tokens: modelDef("wonder").maxNew, think_level: this.thinkLevel }),
         },
         WONDER_GENERATE_TIMEOUT_MS,
       );
@@ -15506,7 +15526,15 @@ const App = {
         attachRemove.addEventListener("click", () => this.clearAttachedImage());
       }
     }
+    // 思考レベル（Cube Wonder 専用）：ボタンの配線と初期表示。
+    for (const btn of document.querySelectorAll(".wonder-think-btn")) {
+      btn.addEventListener("click", () => {
+        WonderModel.thinkLevel = btn.dataset.think;
+        this.syncWonderThink();
+      });
+    }
     this.syncAttach();
+    this.syncWonderThink();
     for (const btn of document.querySelectorAll(".suggestion-btn")) {
       btn.addEventListener("click", () => void this.ask(btn.dataset.q));
     }
@@ -15633,6 +15661,7 @@ const App = {
     // （他のモデルへ画像が黙って送られないように）。
     if (id !== "ultra" && pendingChatImage) pendingChatImage = null;
     this.syncAttach();
+    this.syncWonderThink();
     this.syncSend();
     // iMac で動かすモデル（Twin / Pro / Max / Ultra / 会話 /
     // Code）は、選ばれた時点でそのまま接続する（待機表示で
@@ -16408,6 +16437,18 @@ const App = {
       if (note) note.textContent = "画像を添付しました（Cube Ultra が見ます）";
     } else {
       box.hidden = true;
+    }
+  },
+
+  /* 思考レベル（Cube Wonder 専用）：選択行の表示と押下状態を、
+     選択中モデルと現在の思考レベルに合わせる。行は Wonder 選択時
+     だけ出す（画像添付ボタンの Ultra 専用と同じ流儀）。 */
+  syncWonderThink() {
+    const row = el("wonder-think-row");
+    if (row) row.hidden = this.modelId !== "wonder";
+    const level = WonderModel.thinkLevel;
+    for (const btn of document.querySelectorAll(".wonder-think-btn")) {
+      btn.setAttribute("aria-pressed", btn.dataset.think === level ? "true" : "false");
     }
   },
 
