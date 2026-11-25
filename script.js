@@ -3936,7 +3936,8 @@ function factSourceRelatedToEntity(fact, article, entity) {
 /* ------------------------------------------------------------------ */
 /* Cube自身についての質問（固定情報）                                  */
 /*                                                                    */
-/* 作った人・名前・名前の意味・綴りは、Cube自身についての事実であり、  */
+/* 作った人・名前・名前の意味・綴り・モデル一覧・公開時期・料金の      */
+/* 公表状況・会社かどうかは、Cube自身についての事実であり、            */
 /* ウェブ検索では確かめようがない（WikipediaにCubeの記事は無い）。    */
 /* モデルの生成任せにすると「私を作ったのは眞です」のように中心の字が  */
 /* 欠けた答えが出ることがあるため、アプリに固定した正しい事実から      */
@@ -3995,6 +3996,13 @@ function cubeSelfAnswer(question) {
   ) {
     return `${CUBE_SELF_FACTS.name}は英語で「${CUBE_SELF_FACTS.meaning}」という意味です。`;
   }
+  // 会社：「Cubeを作ってる会社はどこ？」——会社ではなく個人の
+  // プロジェクトであることを答える。作った人の分岐より前に置く
+  // （「Cubeを作ってる会社」は を作っ の形で作り手の印にも一致
+  // してしまうため）。Cubeへの言及があるときだけ拾う。
+  if (mentionsCube && /(会社|企業)/.test(q)) {
+    return "Cubeは会社が作っているものではなく、個人のプロジェクトです。";
+  }
   // 作った人：「あなたを作ったのは誰ですか」「Cubeの作者は誰？」
   const makerSubjectAskingWhat =
     /(あなた|君|きみ|お前|おまえ|cube|キューブ)が\s*(作っ|開発し|生ん|つくっ)/i.test(q) &&
@@ -4018,6 +4026,30 @@ function cubeSelfAnswer(question) {
     (selfRef || q.length <= 14)
   ) {
     return `私の名前は${CUBE_SELF_FACTS.name}です。`;
+  }
+  // モデル一覧：「Cubeにはどんなモデルがあるの？」
+  // （2026-11-25 追加。サーバー側 KB（cube-server /chat）と同一の
+  // 事実・文面に揃える。固定情報の更新は両方をセットで行う。）
+  if (
+    selfRef &&
+    /(どんなモデル|モデルの種類|モデルは(何|なに|いくつ)|モデル一覧|何種類のモデル|モデルには|モデルがある)/.test(q)
+  ) {
+    return "Cubeには、Nano、Flash、Twin、Pro、Max、Ultra、Speak、Code、Wonder のモデルがあります。";
+  }
+  // 公開時期：「Cubeっていつ公開されたの？」「公開はいつ？」
+  if (
+    selfRef &&
+    /(いつ公開|公開された|公開はいつ|公開時期|リリース)/.test(q)
+  ) {
+    return "Cubeはまだ正式公開されていません。正式公開は2026年12月15日頃の予定です。";
+  }
+  // 料金：「Cubeの有料プランっていくら？」（公表されている事実だけを
+  // 返す。料金そのものは未公表なので、その旨を答える。）
+  if (
+    selfRef &&
+    /(有料プラン|料金|値段|月額|いくら|課金)/.test(q)
+  ) {
+    return "Cubeはまだ正式公開前で、料金は公表されていません。";
   }
   return null;
 }
@@ -4318,13 +4350,26 @@ function parseChatRoute(question, prevChat) {
   ) {
     if (CHAT_ROUTE_REACTIONS.test(end)) return { via: "continuation" };
     if (CHAT_ROUTE_FEELINGS.test(t)) return { via: "continuation" };
-    if (CHAT_ROUTE_CASUAL_END.test(end)) return { via: "continuation" };
-    // 「〜の？」「〜か？」の短い聞き返し・続きの質問。
-    if (/(の|か)[？?]$/.test(t)) return { via: "continuation" };
-    // 短い文で動詞・形容詞の締めなら、会話の続きの発話とみなす
-    // （名詞だけの発話＝話題の提示は、情報の質問かもしれないので
-    // 拾わない）。
-    if (/(た|い|だ|る|う)$/.test(end)) return { via: "continuation" };
+    /* 事実の断定への同意求め・断定（「スカイツリーって大阪にある
+       んだよね」型）は、個人的な印が無ければ続きでも拾わない。
+       くだけた文末や動詞締めの形でここを通ると、雑談専門が誤解を
+       追認する経路になるため、単独判定の同意求めと同じ規律で
+       検証経路に倒す（2026-11-25、SP-M02 型への対策）。自分の
+       体験・気持ちへの同意求め（個人的な印があるもの）は従来
+       どおり続きとして拾う。 */
+    const factualAssert =
+      (CHAT_ROUTE_SEEK_END.test(t) ||
+        (/って/.test(t) && /(んだ|だ)$/.test(end))) &&
+      !CHAT_ROUTE_PERSONAL.test(t);
+    if (!factualAssert) {
+      if (CHAT_ROUTE_CASUAL_END.test(end)) return { via: "continuation" };
+      // 「〜の？」「〜か？」の短い聞き返し・続きの質問。
+      if (/(の|か)[？?]$/.test(t)) return { via: "continuation" };
+      // 短い文で動詞・形容詞の締めなら、会話の続きの発話とみなす
+      // （名詞だけの発話＝話題の提示は、情報の質問かもしれないので
+      // 拾わない）。
+      if (/(た|い|だ|る|う)$/.test(end)) return { via: "continuation" };
+    }
   }
 
   /* --- 単独の雑談 --- */
@@ -4344,6 +4389,40 @@ function parseChatRoute(question, prevChat) {
     return { via: "seek" };
   }
   return null;
+}
+
+/* ================================================================== */
+/* 橋渡し検出（isBridgeReply）                                          */
+/*                                                                    */
+/* Cube Speak（雑談専門）の返事が「裏づけを取って答える担当に渡す」    */
+/* という橋渡しの定型かどうかを判定する。Speak は事実を聞かれると      */
+/* 捏造せず橋渡しするように学習されている（2026-11-25 のプローブ       */
+/* 40件で橋渡し35件・捏造0件）。ただし経路A（雑談ルーティング）には    */
+/* 受け皿が無く、「担当に渡します」で会話が止まっていた。本物化は      */
+/* ask の 2.6 で行う：この判定に当たったら、元の発話をそのまま手順3    */
+/* の証拠＋検証ゲート経路に流し、検証済みの答え（または正直な棄権）    */
+/* を続けて出す。                                                      */
+/*                                                                    */
+/* 検出は定型の厳密な形に限る（設計書 cube_speak/DESIGN.md §5.1）：    */
+/* - 核：「担当に渡し／担当が答え／担当がいます／そちらに渡します」    */
+/*   の形が返事の中にあること。                                        */
+/* - 具体的な数値（答えそのもの）を含む返事は橋渡し定型ではない        */
+/*   （数値を口にした返事は、橋渡しではなく回答として扱う）。          */
+/* - 長い返事（240字超）は定型とはみなさない。                          */
+/* プローブ40件の実返事では、この条件で橋渡し35件を全て拾い、直接      */
+/* 回答・追認・共感の5件は1件も拾わなかった（単体テストで固定）。      */
+/* ================================================================== */
+
+const BRIDGE_REPLY_MAX_LEN = 240;
+const BRIDGE_CORE_RE =
+  /担当(?:に|が|は)[^。！？\n]{0,16}?(?:渡し|答え|います|進め)|(?:そちら|その担当)に渡します/;
+
+function isBridgeReply(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  if (t.length > BRIDGE_REPLY_MAX_LEN) return false;
+  if (/[0-9０-９]/.test(t)) return false;
+  return BRIDGE_CORE_RE.test(t);
 }
 
 /**
@@ -20347,6 +20426,10 @@ const App = {
     // （generateForModel 側にも同じ関門がある）。
     const chatSelected = modelDef(this.modelId).engine === "chat";
     const chatRoute = parseChatRoute(question, prevTurnWasChat);
+    // 橋渡しの本物化（2026-11-25）：2.6 で Speak が橋渡しを返した
+    // ときに立てる印。立てたら 2.6 は return せず、2.7／2.8 の直接
+    // 担当分岐も素通りして、手順3の証拠＋検証ゲート経路に落ちる。
+    let bridgeFallthrough = false;
     if (chatRoute && !chatSelected && !classifyQuestion(question)) {
       const meter = getCubeMeter();
       if (meter && !meter.canUse()) {
@@ -20366,7 +20449,20 @@ const App = {
           historyMessages: this.historyMessagesForChat(),
         });
         this.setPhase("idle");
-        if (chatText) {
+        if (chatText && isBridgeReply(chatText)) {
+          // 橋渡しを本物にする：Speak が「裏づけを取って答える担当
+          // に渡す」と返したら、その言葉どおり、元の発話をこのまま
+          // 手順3の証拠＋検証ゲート経路に流す。橋渡し文は Speak の
+          // 返事として先に表示し、検証済みの答え（または正直な
+          // 棄権表示）が続けて出る。_prevTurnWasChat は立てない
+          // （このターンの締めはゲート経路の答えになるため）。
+          this.pushAssistant({
+            text: chatText,
+            badge: "none",
+            note: "Cube Speak（雑談専門モデル）が、裏づけを取って答える担当に渡すと返事しました。そのまま実際に、裏づけ確認の経路で調べます。",
+          });
+          bridgeFallthrough = true;
+        } else if (chatText) {
           this._prevTurnWasChat = true;
           this.pushAssistant({
             text: chatText,
@@ -20397,7 +20493,8 @@ const App = {
           });
         }
       }
-      return;
+      // 橋渡しの本物化のときだけ、手順3へ落ちる（return しない）。
+      if (!bridgeFallthrough) return;
     }
 
     // 2.7) Cube Code が選ばれているときは、プログラミング専門
@@ -20408,7 +20505,7 @@ const App = {
     // 全文を含む会話列を渡し、「直して」「〜を追加して」という
     // 続きの依頼でモデルが自分のコードを見て直せるようにする。
     // 知識メモ帳には保存しない（コードは事実の答えではない）。
-    if (modelDef(this.modelId).engine === "code") {
+    if (!bridgeFallthrough && modelDef(this.modelId).engine === "code") {
       const meter = getCubeMeter();
       if (meter && !meter.canUse()) {
         this.pushAssistant({
@@ -20513,7 +20610,7 @@ const App = {
     // ことは分からないと言う訓練方針のため、この分岐では検証
     // ゲートには通さず生成をそのまま出す。知識メモ帳には保存
     // しない（検証済みの事実ではないため）。
-    if (wonderSelected && !wonderFactRoute) {
+    if (wonderSelected && !wonderFactRoute && !bridgeFallthrough) {
       const meter = getCubeMeter();
       if (meter && !meter.canUse()) {
         this.pushAssistant({
@@ -20623,6 +20720,13 @@ const App = {
         if (this.modelId === "ultra") {
           genQuestion = question;
           historyMessages = this.historyMessagesForUltra();
+        } else if (modelDef(this.modelId).engine === "chat") {
+          // 経路B（Cube Speak 直接選択）：手順3でも会話履歴を渡す
+          // （経路Aと揃える。従来は履歴が渡らず単発応答になっていた
+          // 不整合の修正、2026-11-25）。記憶・履歴の装飾（質問末尾へ
+          // の抜粋添付）は自作モデル向けの形式なので付けない。
+          genQuestion = question;
+          historyMessages = this.historyMessagesForChat();
         } else {
           genQuestion = this.historyDecorate(this.memoryDecorate(question));
         }
@@ -21005,6 +21109,19 @@ const App = {
         return;
       }
       if (gate.status === "abstain" || gate.status === "nonclaim") {
+        // 橋渡し文だけの下書き（Cube Speak が「担当に渡す」と言った
+        // もの）は、そのまま出すと「渡す」と言ったきり会話が止まる。
+        // この経路は実際に証拠＋検証で調べた結果なので、裏づけが
+        // 取れなかったことを正直に出す（2026-11-25、橋渡しの
+        // 本物化に伴う表示の整合）。
+        if (isBridgeReply(modelAnswer)) {
+          this.pushAssistant({
+            text: "確認できませんでした。",
+            badge: "unknown",
+            note: "Cube Speak（雑談専門）が裏づけ確認の担当へ回した質問ですが、記事の事実では裏づけが取れなかったため、答えは表示しませんでした。",
+          });
+          return;
+        }
         // 棄権の表明と、事実の主張を含まない会話的な答えは、嘘に
         // なりようがないため従来どおり表示する（保存はしない）。
         this.pushAssistant({
@@ -21330,6 +21447,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseTranslateQuery, fetchTranslate, translateCardOf, translateLangName,
     parseWolframQuery, fetchWolfram, wolframCardOf, WOLFRAM_TIMEOUT_MS,
     parseChatRoute,
+    isBridgeReply,
     fetchGoogleStatus, startGoogleLink, unlinkGoogle,
     parseGmailSendQuery, mergeGmailDraft, gmailSendAskBackText,
     parseGmailReadQuery, sendGmail, fetchGmailList, fetchGmailMessage,
