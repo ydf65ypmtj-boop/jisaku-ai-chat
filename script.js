@@ -4425,6 +4425,85 @@ function isBridgeReply(text) {
   return BRIDGE_CORE_RE.test(t);
 }
 
+/* ================================================================== */
+/* 数値主張検出（hasQuantitativeClaim）                                 */
+/*                                                                    */
+/* 経路A（雑談ルーティング）では、橋渡しでない Speak の返事は         */
+/* ゲート無しでそのまま表示される。橋渡し検出は「数値を含む返事は     */
+/* 回答として扱う」ため、Speak が概数を口にする返事（例：東京〜大阪   */
+/* の距離を「300キロくらい」、正解は約500km）は素通りして無検証で     */
+/* 表示されていた（2026-11-25 の経路A再測定 SP-N01 で実測）。         */
+/* この判定に当たった返事は、下書き（未検証の数値）を表示せず、       */
+/* 橋渡しと同じく元の発話を手順3の証拠＋検証ゲート経路に流す          */
+/* （ask の 2.6）。検証済みの答えが出ればそれが表示され、出なければ   */
+/* 正直な棄権になる。                                                 */
+/*                                                                    */
+/* 通常の雑談を壊さないため、発火は保守的に絞る：                     */
+/* - 数値＋単位のペアがあること。単位は長さ・重さ・金額・割合などの   */
+/*   「世界の事実」向けに限る。人数・個数などの助数詞は、万・億・兆   */
+/*   の桁を伴う場合だけ数える（人口・蔵書数のような大きな事実）。     */
+/*   回数・年齢・時刻・日付・所要時間の単位は数えない（会話文脈の     */
+/*   数と切り分けられないため）。                                     */
+/* - その数値が利用者の発話（今回＋最近の利用者ターン）に既出なら、   */
+/*   おうむ返し等の会話文脈の数とみなして発火しない。                 */
+/* - 数値のある文に一人称・二人称（私・僕・あなた等）があれば、       */
+/*   会話の当事者についての数とみなして発火しない。                   */
+/* - 種目名・運動の報告（「100メートル走」「5キロ走った」）、         */
+/*   「あと〜」の到着見込み、共感の言い回し（分かる・応援等）は       */
+/*   発火しない。                                                     */
+/* - 概数表現（約・くらい・ほど）は発火を妨げない（SP-N01 自体が      */
+/*   ふんわりした言い方だったため）。                                 */
+/* ================================================================== */
+
+const QUANT_CLAIM_RE =
+  /([0-9０-９][0-9０-９,，]*(?:[.．][0-9０-９]+)?)(万|億|兆)?\s*(キロメートル|平方キロメートル|平方メートル|km|キロ|メートル|センチメートル|センチ|ミリメートル|ミリ|光年|ヘクタール|リットル|ミリリットル|キログラム|kg|グラム|トン|円|ドル|度|℃|％|%|パーセント|倍|人|個|本|台|件|冊|匹|頭|枚)/g;
+const QUANT_COUNTABLE_UNITS = new Set([
+  "人", "個", "本", "台", "件", "冊", "匹", "頭", "枚",
+]);
+const QUANT_PERSONAL_RE = /私|僕|ぼく|俺|自分|あなた|君/;
+const QUANT_IDIOM_RE = /分かる|わかる|応援|味方|本気|頑張|楽し/;
+
+function quantNumberValue(raw) {
+  const half = String(raw)
+    .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    .replace(/[,，]/g, "")
+    .replace(/．/g, ".");
+  const v = parseFloat(half);
+  return Number.isFinite(v) ? v : null;
+}
+
+function hasQuantitativeClaim(text, sourceText) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  const sourceNums = new Set();
+  const srcRe = /[0-9０-９][0-9０-９,，]*(?:[.．][0-9０-９]+)?/g;
+  let sm;
+  const src = String(sourceText ?? "");
+  while ((sm = srcRe.exec(src)) !== null) {
+    const v = quantNumberValue(sm[0]);
+    if (v !== null) sourceNums.add(v);
+  }
+  for (const sentence of t.split(/(?<=[。！？\n])/)) {
+    if (!/[0-9０-９]/.test(sentence)) continue;
+    if (QUANT_PERSONAL_RE.test(sentence)) continue;
+    if (QUANT_IDIOM_RE.test(sentence)) continue;
+    QUANT_CLAIM_RE.lastIndex = 0;
+    let m;
+    while ((m = QUANT_CLAIM_RE.exec(sentence)) !== null) {
+      const value = quantNumberValue(m[1]);
+      if (value === null) continue;
+      if (QUANT_COUNTABLE_UNITS.has(m[3]) && !m[2]) continue;
+      const after = sentence.slice(m.index + m[0].length);
+      if (/^走/.test(after)) continue;
+      const before = sentence.slice(0, m.index);
+      if (/(?:あと|残り)\s*$/.test(before)) continue;
+      if (sourceNums.has(value)) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * 同語反復の文か：「「立方体」は「立方体」という意味です」のように、
  * 説明される語と説明の中身が同じで、意味を何も伝えていない文。
@@ -20445,6 +20524,16 @@ const App = {
         if (!ChatModel.readyFor("chat")) {
           await ChatModel.connect();
         }
+        // 数値主張の受け皿（hasQuantitativeClaim）用に、利用者が
+        // 口にした数値の出所（今回の発話＋最近の利用者ターン）を
+        // 用意する。おうむ返しと世界の事実の主張を切り分けるため。
+        const chatSourceText = [
+          question,
+          ...((this.historyCurrent && this.historyCurrent.turns) || [])
+            .filter((turn) => turn.role === "user")
+            .slice(-4)
+            .map((turn) => String(turn.text || "")),
+        ].join("\n");
         const chatText = await generateForModel("chat", question, {
           historyMessages: this.historyMessagesForChat(),
         });
@@ -20461,6 +20550,14 @@ const App = {
             badge: "none",
             note: "Cube Speak（雑談専門モデル）が、裏づけを取って答える担当に渡すと返事しました。そのまま実際に、裏づけ確認の経路で調べます。",
           });
+          bridgeFallthrough = true;
+        } else if (chatText && hasQuantitativeClaim(chatText, chatSourceText)) {
+          // 数値の事実主張を含む返事は、下書き（未検証の数値）を
+          // そのまま表示せず、手順3の証拠＋検証ゲート経路に流す。
+          // 検証済みの答えが出れば手順3が表示し、出なければ正直な
+          // 棄権になる。橋渡しと同じ印（bridgeFallthrough）を使う
+          // （このターンの締めはゲート経路の答えになるため、
+          // _prevTurnWasChat も立てない）。
           bridgeFallthrough = true;
         } else if (chatText) {
           this._prevTurnWasChat = true;
@@ -21448,6 +21545,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseWolframQuery, fetchWolfram, wolframCardOf, WOLFRAM_TIMEOUT_MS,
     parseChatRoute,
     isBridgeReply,
+    hasQuantitativeClaim,
     fetchGoogleStatus, startGoogleLink, unlinkGoogle,
     parseGmailSendQuery, mergeGmailDraft, gmailSendAskBackText,
     parseGmailReadQuery, sendGmail, fetchGmailList, fetchGmailMessage,
