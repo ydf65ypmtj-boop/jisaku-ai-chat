@@ -2097,7 +2097,48 @@ const WONDER_FACT_MAX_LEN = 100;
 function isWonderFactQuestion(q) {
   if (typeof q !== "string" || !q) return false;
   if (q.replace(/\s/g, "").length > WONDER_FACT_MAX_LEN) return false;
-  return !!classifyQuestion(q);
+  if (classifyQuestion(q)) return true;
+  return isFactConfirmation(q);
+}
+
+/* 事実の確認型（「アメリカの大統領はドナルド・トランプですか？」）：
+   wh疑問詞が無いため classifyQuestion を素通りするが、外部の事実を
+   確かめる文なので、Wonder の直接回答ではなく検証ゲートへ回す。
+   2026-11-25 にこの形で土台モデルの古い知識（バイデン大統領）が
+   ゲートを通らず表示された実例を受けて追加した。一般形だけを見て、
+   個別の質問や固有名詞そのものには寄せない。 */
+function isFactConfirmation(q) {
+  const t = q.trim();
+  // 確認の形で終わっているか（「？」の有無は問わない）
+  if (!/(ですか|でしょうか|ますか|ですよね|だよね|かな)[？?]?$/.test(t)) return false;
+  // 依頼・許可・感想・相手への質問など、事実確認ではない確認形は外す
+  if (
+    /できますか|してくれますか|してもらえますか|もらえますか|いいですか|大丈夫ですか|本当ですか|元気ですか|好きですか|嫌いですか|どう思いますか|あなたは|君は|きみは/.test(
+      t,
+    )
+  ) {
+    return false;
+  }
+  // 事実のアンカー（どれか1つ）：
+  // ・役職・肩書き・出来事の名詞
+  if (
+    /大統領|総理大臣|首相|知事|市長|社長|会長|国王|女王|天皇|皇帝|優勝者|チャンピオン|発売日|公開日/.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  // ・述語の位置にカタカナの固有名詞（「〜はトランプですか」型）
+  if (/は[ァ-ヶー][ァ-ヶー・]{1,}です/.test(t)) return true;
+  // ・数値の主張（「〜は10万円ですか」「〜は2025年ですか」型）
+  if (
+    /\d[\d,]*\s*(円|万円|億円|年|か月|ヶ月|日|人|歳|メートル|キロ|センチ|ミリ|グラム|キログラム|トン|本|個|枚|回|点|％|%)/.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /* モデルの生出力から ```file:名前 ブロックを取り出す。取り出せ
