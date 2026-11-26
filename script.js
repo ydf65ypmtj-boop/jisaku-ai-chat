@@ -3117,6 +3117,44 @@ function yesNoEvidenceAnswer(question, modelAnswer, ctx) {
 }
 
 /* ================================================================== */
+/* はい/いいえ型の否定裏づけ・Web 拡張（階段7、2026-11-25）              */
+/*                                                                    */
+/* 階段2の yesNoEvidenceAnswer は、証拠の探索範囲が索引レーン          */
+/* （Wikipedia の対象記事＋照合用検索結果）だけだった。誤解型の質問    */
+/* では索引の対象記事が一般語に解決されてしまい（例：「人間」「金属」  */
+/* のような曖昧さ回避的な記事）、決定的な否定文が索引側に存在しない    */
+/* 一方で、一般Web検索の本文には出典つきの否定文が取れているケースが   */
+/* ある（Bench 50 の棄権34件の再分類で複数件を確認）。                 */
+/* ここでは判定そのものは一切変えず、探索する証拠の範囲だけを Web      */
+/* レーンのページにも広げる。候補文の条件（質問の単位2つ以上・主語へ   */
+/* の結びつき・立場の決定的さ・肯定は否定より厳しく）、立場が割れたら  */
+/* 出さない規律、表示前の検証ゲート（all）と実体照合は階段2と完全に    */
+/* 同一で、yesNoEvidenceAnswer をそのまま再利用する。ゲートの判定      */
+/* 基準は一切緩めない（届く証拠の範囲だけを広げる）。                  */
+/* 発火条件も階段2と同じ：種類つき事実なし・モデルが主張を書いたが     */
+/* 索引ゲートで1つも裏づかなかった（gate none）場合に、索引側の        */
+/* yesNoEvidenceAnswer が文を選べなかったときに限る。                 */
+/* ================================================================== */
+
+/** Web ページ集合に対する階段2判定（同期の核。単体テストはこちら）。 */
+function yesNoWebEvidenceAnswerSync(question, modelAnswer, pages) {
+  if (!modelAnswer || !Array.isArray(pages) || pages.length === 0) {
+    return null;
+  }
+  return yesNoEvidenceAnswer(question, modelAnswer, {
+    article: null,
+    results: pages,
+  });
+}
+
+/** 一般Web検索の本文に対して階段2の否定裏づけを行う。 */
+async function yesNoWebEvidenceAnswer(question, modelAnswer) {
+  if (!modelAnswer || !isYesNoQuestion(question)) return null;
+  const pages = await fetchWebSearchPages(question).catch(() => null);
+  return yesNoWebEvidenceAnswerSync(question, modelAnswer, pages);
+}
+
+/* ================================================================== */
 /* 朝のブリーフィング                                                  */
 /*                                                                    */
 /* 朝（05:00–11:00）にその日初めて Cube を開いたとき、iMac サーバー   */
@@ -8856,6 +8894,723 @@ ruleId: "R14-C1", calcVersion: CALC14_VERSION, type: form.type,
 result: form.result, sentence: s.slice(0, 80),
 });
 return { source: { title: "", url: ""}, via: "calc14"};
+}
+
+/* ================================================================== */
+/* 階段8（2026-11-25）：証拠の深化                                       */
+/*                                                                    */
+/* モデル側診断の実測：Bench 50 の棄権の主因29件に証拠を与えても正答   */
+/* は4件だけで、届かなかった25件のうち19件は、本番 /evidence の抜粋    */
+/* （記事リード＋検索結果テキスト、いずれも先頭6000字まで）に決定打の   */
+/* 文が含まれていなかった。全文を確認すると20件中17件は決定打が全文の  */
+/* どこかに存在した（大半は6000字キャップより後ろ、または抜粋の範囲    */
+/* 外）。そこで証拠レーンの取得経路を深める：バンドルの各出典          */
+/* （Wikipedia 記事）について、同じ MediaWiki API で全文を取得し、      */
+/* 質問文だけから作る一般的な関連度で段落を選び、出典テキストの末尾に  */
+/* 追加する。判定基準（ゲート・事実抽出・照合）は一切変えない。届く    */
+/* 証拠の範囲だけを広げる。失敗したらバンドルは無変更（フェイル        */
+/* ソフト）。すでにバンドル内にある段落は追加しない。                  */
+/* 段落選択の核（deepenSelect）は質問文だけを見て全問共通の規則で動き、 */
+/* 問題ごとの調整は無い。単位モード: A=段落（700字まで）/ I=文グループ */
+/* （350字まで）。                                                      */
+/* ================================================================== */
+
+
+const DEEPEN_STOP = new Set([
+  "ですか", "ますか", "でした", "ました", "ください", "という", "そんな",
+  "こと", "もの", "ため", "よう", "いつ", "どこ", "だれ", "なに", "なん",
+  "どう", "どちら", "どれ", "この", "その", "あの", "はじめ", "さいしょ",
+  "ない", "ある", "いる", "する", "なる", "れる", "られる", "たい",
+  "一般", "一般的", "般的", "すか",
+  "について", "として", "による", "ように",
+]);
+const DEEPEN_BUDGET = 2600;
+const DEEPEN_UNIT_MODE = "A";
+
+function deepenNorm(s) {
+  s = String(s).normalize("NFKC");
+  s = s.replace(/[ァ-ヶ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x60));
+  return s.replace(/\s+/g, "").toLowerCase();
+}
+
+function deepenTerms(question) {
+  const terms = new Map();
+  const add = (t, w) => {
+    t = deepenNorm(t);
+    if (t.length >= 2 && !DEEPEN_STOP.has(t)) {
+      terms.set(t, Math.max(terms.get(t) || 0, w));
+    } else if (t.length === 1 && /[一-龥]/.test(t)) {
+      terms.set(t, Math.max(terms.get(t) || 0, w));
+    }
+  };
+  for (const m of question.matchAll(/『(.+?)』|「(.+?)」/g)) add(m[1] || m[2], 3);
+  for (const m of question.matchAll(/[ァ-ヶー]{2,}/g)) add(m[0], 2);
+  for (const m of question.matchAll(/[一-龥]+/g)) {
+    const run = m[0];
+    if (run.length === 1) add(run, 1);
+    else {
+      add(run, 1);
+      for (let i = 0; i + 2 <= run.length; i++) add(run.slice(i, i + 2), 1);
+    }
+  }
+  for (const m of question.matchAll(/[ぁ-ん]{2,}/g)) {
+    for (let frag of m[0].split(/[はがをにのともへでや、。]/)) {
+      frag = frag.trim();
+      for (const suf of ["ですか", "ますか", "です", "ます", "こと", "もの"]) {
+        if (frag.endsWith(suf) && frag.length > suf.length) {
+          frag = frag.slice(0, frag.length - suf.length);
+          break;
+        }
+      }
+      if (frag.length >= 2 && frag.length <= 6) add(frag, 1);
+    }
+  }
+  for (const m of question.matchAll(/\d+(?:\.\d+)?[a-zA-Zぁ-んァ-ヶ一-龥]{0,3}/g)) add(m[0], 2);
+  for (const m of question.matchAll(/[A-Za-z]{2,}/g)) add(m[0], 1);
+  return terms;
+}
+
+function deepenParagraphsBase(text) {
+  const lines = String(text).split("\n");
+  const paras = [];
+  let cur = [];
+  const flush = () => {
+    if (cur.length) { paras.push(cur.join("").trim()); cur = []; }
+  };
+  for (const ln of lines) {
+    const s = ln.trim();
+    if (!s) { flush(); continue; }
+    const isHeading = s.length <= 30 && !/[。．.！？、,]/.test(s);
+    if (isHeading && cur.length) flush();
+    cur.push(s);
+    if (!isHeading && cur.join("").length >= 700) flush();
+  }
+  flush();
+  const out = [];
+  for (const p of paras) {
+    if (p.length <= 700) { out.push(p); continue; }
+    let buf = "";
+    for (const sent of p.split(/(?<=。)/)) {
+      if (buf.length + sent.length > 700 && buf) { out.push(buf); buf = sent; }
+      else buf += sent;
+    }
+    if (buf) out.push(buf);
+  }
+  const seen = new Set();
+  const dedup = [];
+  for (const p of out) {
+    if (p.length < 10) continue;
+    const k = deepenNorm(p);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    dedup.push(p);
+  }
+  return dedup;
+}
+
+function deepenUnits(text, mode) {
+  const paras = deepenParagraphsBase(text);
+  if (mode !== "I") return paras;
+  const units = [];
+  for (const p of paras) {
+    if (p.length <= 350) { units.push(p); continue; }
+    let buf = "";
+    for (const sent of p.split(/(?<=。)/)) {
+      if (buf.length + sent.length > 350 && buf) { units.push(buf); buf = sent; }
+      else buf += sent;
+    }
+    if (buf) units.push(buf);
+  }
+  return units.filter((u) => u.length >= 10);
+}
+
+// sources: [{key, title, currentText, fullText}] in lane order.
+// Returns Map key -> [paragraphs to append] (rank order preserved).
+function deepenSelect(question, sources, mode) {
+  const terms = deepenTerms(question);
+  let totalWeight = 0;
+  for (const w of terms.values()) totalWeight += w;
+  const minScore = Math.min(3, totalWeight);
+  const cands = [];
+  const seenGlobal = new Set();
+  sources.forEach((src, so) => {
+    if (!src.fullText) return;
+    const curNorm = src.currentText ? deepenNorm(src.currentText) : "";
+    deepenUnits(src.fullText, mode).forEach((para, pi) => {
+      const np = deepenNorm(para);
+      if (seenGlobal.has(np)) return;
+      seenGlobal.add(np);
+      if (curNorm && curNorm.includes(np)) return; // already in the bundle text
+      let score = 0;
+      for (const [term, w] of terms) if (np.includes(term)) score += w;
+      if (score >= minScore) cands.push({ score, so, pi, key: src.key, title: src.title, para });
+    });
+  });
+  cands.sort((a, b) => b.score - a.score || a.so - b.so || a.pi - b.pi);
+  const picked = new Map();
+  const flat = [];
+  let total = 0;
+  for (const c of cands) {
+    const blockLen = c.para.length + String(c.title || "").length + 12;
+    if (total + blockLen > DEEPEN_BUDGET && total > 0) continue;
+    if (!picked.has(c.key)) picked.set(c.key, []);
+    picked.get(c.key).push(c.para);
+    flat.push({ key: c.key, title: c.title, para: c.para });
+    total += blockLen;
+    if (total >= DEEPEN_BUDGET) break;
+  }
+  picked.__flat = flat;
+  return picked;
+}
+
+
+
+/* ================================================================== */
+/* 階段10（2026-11-25）：全文キャッシュ（VM 先行取得・429耐性）        */
+/*                                                                    */
+/* 階段9の実測では、全文取得が Wikimedia API の HTTP 429 で広く失敗   */
+/* し、深化が段落を残せない件が多発した。階段10では全文取得を VM 側   */
+/* に分離する：走行前に VM でペーシング＋リトライ付きで取得し（失敗   */
+/* 時は Firecrawl フォールバック）、キャッシュ JSON として iMac に    */
+/* 置く。ステージングは環境変数 STEP10_FULLTEXT_CACHE の指す JSON     */
+/* （{titles: {タイトル: 全文}, urls: {URL: 全文}}）を最初に引き、    */
+/* キャッシュに無いタイトルだけ従来のライブ取得に倒す（並列度を      */
+/* 下げ、間隔を空ける）。取得経路の変更のみで、段落選択・ゲートの     */
+/* 基準は一切変えない。                                               */
+/* ================================================================== */
+
+
+/* ================================================================== */
+/* 階段12（2026-11-26）：照合の厚み（全文バンドル全体で照らす）        */
+/*                                                                    */
+/* 階段11の実測：pass-2 の照合対象を深化の選択段落に揃えても裏づけ    */
+/* 成立は 0/28 だった。段落は多くが1〜5ブロックしかなく、決定打の文   */
+/* が選外にある場合は照合に届かない。階段8の実測では対象20件中17件   */
+/* に決定打が「全文の中」に存在した（多くは抜粋キャップの後ろ）。     */
+/* 階段12は、ゲートの文単位照合が見えるテキスト範囲を、抜粋＋選択     */
+/* 段落から「取得済み全文バンドル全体」へ広げる。やり方は追加のみ：   */
+/* 全文を article.lead / results[].text の末尾に足す（先頭は一切      */
+/* 変えないため、リード窓・錨の第一文チェックは従来どおりに効き、     */
+/* 文窓・段落窓・隣接2文窓が全文へ届くようになる）。照合の物差し      */
+/* （閾値・ルール・窓の作り方）は一切変えない。事実抽出・事実ツリー・ */
+/* yes/no・Web レーン・生成側は従来の証拠のまま（厚みは照合専用）。   */
+/* ================================================================== */
+
+/* 質問文 → 取得できた全文バンドル [{role, title, url, fullText}]。
+   deepenEvidenceBundle（fetchServerEvidence の深化フック）が記録する。 */
+const FULL_BUNDLE12 = new Map();
+const THICK_STATS12 = { recorded: 0, widenedCalls: 0, charsAdded: 0 };
+
+/**
+ * deepenEvidenceBundle の sources（fullText 解決済み）から、全文が
+ * 取れた出典だけを記録する。role は article / result、index は
+ * results 内の位置（補助情報。照合は title / url で行う）。
+ */
+function recordFullBundle12(question, sources) {
+  const entries = [];
+  for (const s of sources || []) {
+    if (!s || typeof s.fullText !== "string" || !s.fullText) continue;
+    if (s.key === "article") {
+      entries.push({
+        role: "article", index: -1,
+        title: s.title || "", url: s.url || "", fullText: s.fullText,
+      });
+    } else {
+      const m = /^result(\d+)$/.exec(s.key || "");
+      entries.push({
+        role: "result", index: m ? Number(m[1]) : -1,
+        title: s.title || "", url: s.url || "", fullText: s.fullText,
+      });
+    }
+  }
+  if (entries.length) {
+    FULL_BUNDLE12.set(question, entries);
+    THICK_STATS12.recorded += 1;
+  }
+  return entries.length;
+}
+
+function getFullBundle12(question) {
+  return FULL_BUNDLE12.get(question) || null;
+}
+
+/**
+ * ゲート照合専用の文脈を「厚く」する：base の article / results に
+ * 対応する全文を末尾へ追加した新しい文脈を返す。fact は base の
+ * ものをそのまま使う（事実抽出は従来の証拠で済んでいる前提）。
+ * バンドルが無い・対応する全文が無い場合は base をそのまま返す
+ * （フェイルソフト＝階段11と同一の照合範囲）。
+ * 対応づけは url 一致を優先し、次に title 一致で探す。
+ */
+function buildThickGateCtx(question, base) {
+  if (!base) return base;
+  const bundle = FULL_BUNDLE12.get(question);
+  if (!bundle || !bundle.length) return base;
+  const findFull = (role, title, url) => {
+    let byTitle = null;
+    for (const e of bundle) {
+      if (!e || e.role !== role || !e.fullText) continue;
+      if (url && e.url && e.url === url) return e.fullText;
+      if (byTitle === null && title && e.title === title) byTitle = e.fullText;
+    }
+    return byTitle;
+  };
+  let article = base.article || null;
+  if (article) {
+    const full = findFull("article", article.title, article.url);
+    const leadNow = article.lead || "";
+    const alreadyFull =
+      leadNow.length >= full?.length && !!full && leadNow.includes(full.slice(-160));
+    if (full && !alreadyFull) {
+      article = { ...article, lead: leadNow + "\n\n" + full };
+      THICK_STATS12.charsAdded += full.length;
+    }
+  }
+  const results = (base.results || []).map((r) => {
+    if (!r) return r;
+    const full = findFull("result", r.title, r.url);
+    if (!full) return r;
+    const textNow = r.text || "";
+    if (textNow.length >= full.length && textNow.includes(full.slice(-160))) return r;
+    THICK_STATS12.charsAdded += full.length;
+    return { ...r, text: textNow + "\n\n" + full };
+  });
+  // 記事の全文は、照合の窓走査（results を読む）に届けるため、results
+  // の側にも載せる。記事リードは事実抽出と最上級の経路にしか効かず、
+  // 文単位照合は results[].text しか走査しないため、この載せ替えが
+  // 無いと pass-2（ctx2 は記事段落のみで results が空になりうる）で
+  // 厚みが届かない。既に同じ全文を担う result がある場合は足さない。
+  if (article) {
+    const full = findFull("article", article.title, article.url);
+    if (full) {
+      const carried = results.some((r) =>
+        r && (r.text || "").length >= full.length &&
+        (r.text || "").includes(full.slice(-160)));
+      if (!carried) {
+        results.push({
+          title: article.title || "", url: article.url || "",
+          snippet: "", text: full,
+        });
+        THICK_STATS12.charsAdded += full.length;
+      }
+    }
+  }
+  THICK_STATS12.widenedCalls += 1;
+  return { fact: base.fact ?? null, article, results };
+}
+
+let __fulltextCache10 = null;
+const FULLTEXT_STATS = {
+  cacheTitleHits: 0, cacheUrlHits: 0, liveTitles: 0, liveOk: 0,
+};
+
+function fulltextCache10() {
+  if (__fulltextCache10) return __fulltextCache10;
+  __fulltextCache10 = { titles: new Map(), urls: new Map() };
+  try {
+    const p =
+      (typeof process !== "undefined" && process.env && process.env.STEP10_FULLTEXT_CACHE) || "";
+    if (p && typeof require === "function") {
+      const j = JSON.parse(require("fs").readFileSync(p, "utf8"));
+      for (const [k, v] of Object.entries(j.titles || {})) {
+        if (typeof v === "string" && v) __fulltextCache10.titles.set(k, v);
+      }
+      for (const [k, v] of Object.entries(j.urls || {})) {
+        if (typeof v === "string" && v) __fulltextCache10.urls.set(k, v);
+      }
+    }
+  } catch {
+    /* キャッシュが読めなければライブ取得のみで動く（フェイルソフト） */
+  }
+  return __fulltextCache10;
+}
+
+function fulltextCacheByTitle(title) {
+  const t = fulltextCache10().titles.get(title);
+  if (t) FULLTEXT_STATS.cacheTitleHits += 1;
+  return t || "";
+}
+
+function fulltextCacheByUrl(url) {
+  if (!url) return "";
+  const t = fulltextCache10().urls.get(url);
+  if (t) FULLTEXT_STATS.cacheUrlHits += 1;
+  return t || "";
+}
+
+/**
+ * 出典タイトル群の全文エキストラクトを取る。失敗分は欠落。
+ * 注意：MediaWiki の extracts は複数タイトルを1リクエストにまとめると
+ * 実質1ページ分しか返らない（階段8の実測）。本番の wikiFetchExtractWeb
+ * と同じく1タイトルずつ取り、並列度だけ上げる。
+ */
+async function wikiFetchExtractsFull(titles) {
+  const map = new Map();
+  const uniq = [...new Set((titles || []).filter((t) => typeof t === "string" && t))];
+  if (!uniq.length) return map;
+  // 階段10：キャッシュ（VM 先行取得）を先に引き、残りだけライブ取得。
+  const misses = [];
+  for (const t of uniq) {
+    const cached = fulltextCacheByTitle(t);
+    if (cached) map.set(t, cached);
+    else misses.push(t);
+  }
+  FULLTEXT_STATS.liveTitles += misses.length;
+  const fetchOne = async (title) => {
+    try {
+      const data = await wikiApi({
+        action: "query",
+        prop: "extracts",
+        explaintext: "1",
+        exsectionformat: "plain",
+        redirects: "1",
+        titles: title,
+      });
+      const page = data?.query?.pages?.[0];
+      if (page && !page.missing && typeof page.extract === "string" && page.extract) {
+        map.set(title, page.extract);
+        FULLTEXT_STATS.liveOk += 1;
+      }
+    } catch {
+      /* フェイルソフト：取れた分だけ返す */
+    }
+  };
+  // 階段10：ライブ取得は並列度2＋間隔を空け、429 を踏みにくくする。
+  for (let i = 0; i < misses.length; i += 2) {
+    await Promise.all(misses.slice(i, i + 2).map(fetchOne));
+    if (i + 2 < misses.length) {
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+  return map;
+}
+
+/**
+ * バンドルの各出典に、その全文から選んだ関連段落を追加する（破壊的更新）。
+ * 追加した段落数を返す。全文が取れなければ何もしない。
+ */
+async function deepenEvidenceBundle(question, bundle) {
+  const sources = [];
+  if (bundle && bundle.article) {
+    sources.push({
+      key: "article", title: bundle.article.title,
+      url: bundle.article.url || "",
+      currentText: bundle.article.lead || "",
+      obj: bundle.article, field: "lead", fullText: "",
+    });
+  }
+  const results = bundle && Array.isArray(bundle.results) ? bundle.results : [];
+  results.forEach((r, i) => {
+    sources.push({
+      key: "result" + i, title: r.title,
+      url: r.url || "",
+      currentText: r.text || "",
+      obj: r, field: "text", fullText: "",
+    });
+  });
+  if (!sources.length) return 0;
+  const full = await wikiFetchExtractsFull(sources.map((s) => s.title));
+  for (const s of sources) s.fullText = full.get(s.title) || "";
+  // 階段10：タイトルで引けなかった出典は URL のキャッシュでも引く
+  // （Web ページの全文は URL がキーになるため）。
+  for (const s of sources) {
+    if (!s.fullText) {
+      const byUrl = fulltextCacheByUrl(s.url);
+      if (byUrl) s.fullText = byUrl;
+    }
+  }
+  // 階段12：照合の厚み用に、取得できた全文バンドルをそのまま記録する
+  // （失敗しても深化そのものには影響させない）。
+  try { recordFullBundle12(question, sources); } catch {}
+  if (!sources.some((s) => s.fullText)) return 0;
+  const picked = deepenSelect(question, sources, DEEPEN_UNIT_MODE);
+  // 階段9：再生成用に、選ばれた段落をランク順のまま記録しておく
+  // （失敗しても深化そのものには影響させない）。
+  try {
+    REGEN_PICKS.set(question, (picked.__flat || []).map((f) => ({
+      role: f.key === "article" ? "article" : "result",
+      title: f.title || "",
+      para: f.para,
+    })));
+  } catch {}
+  let added = 0;
+  for (const s of sources) {
+    const ps = picked.get(s.key);
+    if (!ps || !ps.length) continue;
+    s.obj[s.field] = (s.obj[s.field] || "") + "\n\n" + ps.join("\n\n");
+    added += ps.length;
+  }
+  return added;
+}
+
+
+/* ================================================================== */
+/* 階段9（2026-11-25）：ゲート none 時の深化証拠つき再生成→再検証       */
+/*                                                                    */
+/* 階段8の実測：深化は「決定打を届ける」仕組みとして機能した（対象     */
+/* 20件に深化証拠を直接渡すと正答 0→4・誤答 7→1）が、現行経路では      */
+/* モデルの生回答が証拠を見ずに生成されるため、Bench 50 の表示結果    */
+/* は変わらなかった。欠けていたのは「深化した証拠を答えの構成に使う   */
+/* 経路」である。そこで、ゲートが「裏づけなし（none）」と判定して      */
+/* 棄権に倒れる場合に限り、深化で選ばれた段落だけを資料としてモデル   */
+/* に渡し、答えを作り直させる。作り直した答えは従来と同一基準の       */
+/* ゲートで再検証し、通ったものだけを表示する（基準は一切緩めない）。 */
+/* 深化の記録が無い・生成が失敗した・再生成が棄権文の形をしている     */
+/* 場合は何もせず、従来どおりの棄権に倒す（フェイルソフト）。         */
+/* 証拠の組み立ては階段8第1段と同形式（【記事：】【検索結果：】の      */
+/* 見出し＋段落、ランク順、見出し込み約2600字を深化側で制限済み）。    */
+/* ================================================================== */
+
+/* 質問文 → 深化で選ばれた段落 [{role, title, para}]（ランク順）。
+   deepenEvidenceBundle（fetchServerEvidence の深化フック）が記録する。 */
+const REGEN_PICKS = new Map();
+
+/* 再生成に渡す証拠の上限（字数）。深化側の予算（2600字・見出し込み
+   相当）で既に制限されているため、ここは安全側の二重キャップ。 */
+const REGEN_EVIDENCE_CAP = 2800;
+
+/* 再生成が「資料では確認できない」旨の棄権文を返した場合は、答えが
+   作れなかったものとして扱う（表示側の棄権と二重に数えない）。 */
+function isRegenAbstention(text) {
+  let t = String(text || "").trim();
+  if (!t) return true;
+  // 階段10（(d) 表示分類の統一）：「すみません、」等の前置きを外して
+  // から判定する。階段9では「すみません、資料には書かれていません
+  // でした。」がこのフィルタをすり抜け、棄権相当文のまま採用扱いに
+  // なった（CB16）。第1パスが訓練済み棄権文（文には／本文には…）を
+  // 「答えなし」と分類するのと同じく、再生成側でも資料ベースの
+  // 棄権形（資料には／資料に＋書かれていません・記載されていません・
+  // 載っていません、資料からは／資料では確認できません）を「答えが
+  // 作れなかった」ものとして扱う。
+  t = t.replace(/^すみません[、，。]?\s*/, "");
+  if (isUltraAbstention(t)) return true;
+  return (
+    t.startsWith("確認できません") ||
+    t.startsWith("分かりません") ||
+    t.startsWith("わかりません") ||
+    t.startsWith("資料には書かれていません") ||
+    t.startsWith("資料に書かれていません") ||
+    t.startsWith("資料には記載されていません") ||
+    t.startsWith("資料に記載されていません") ||
+    t.startsWith("資料には載っていません") ||
+    t.startsWith("資料に載っていません") ||
+    t.startsWith("資料からは確認できません") ||
+    t.startsWith("資料では確認できません")
+  );
+}
+
+/* 階段10（(a) 証拠のトークン予算）：再生成プロンプト全体（system＋
+   user）の上限。モデル側診断の規律（プロンプト予算 1,700 トークン、
+   実測 1,259〜1,696 トークンで 4/1/15 を出した条件）に合わせる。
+   字数ではなくサーバーの /tokenize で数える。ctx 2048 に対し、
+   生成上限 128 トークンとテンプレートの余裕を見込んでも収まる。
+   階段11（(3) 生成短縮）：階段10の実測では再生成の所要時間は
+   プロンプトトークン数にほぼ比例（約0.079秒/トークン、iMac の
+   プリフィル律速）で、1,700トークン予算だと約134秒かかり生成の
+   120秒上限で17件が死んだ。予算を 1,200 トークンに下げると
+   最悪でも約95秒＋短いデコードで上限内に収まる見込み。段落は
+   ランク順に積まれるため、落とされるのは低ランク側から。 */
+const REGEN_TOKEN_BUDGET = 1200;
+
+/* 階段11：再生成の失敗理由の記録（ハーネスが内訳集計に使う）。
+   regenAnswerFromEvidence の各出口で lastReason を立てる：
+   no-picks（深化の記録なし）/ budget-overflow（先頭段落だけで
+   予算超過）/ no-evidence / empty-output / abstention-output /
+   gen-error（生成の例外。120秒上限の打ち切りもここに入るため、
+   ハーネス側で ms と合わせて timeout を分類する）/ ok。 */
+const REGEN_DIAG = { lastReason: null };
+
+/* プロンプト文字列のトークン数をサーバーで数える。数えられなければ
+   null（呼び出し側は保守的な字数見積もりに倒す）。 */
+async function regenTokenCount(text) {
+  try {
+    const res = await fetchWithTimeout(
+      `${ULTRA_IMAC_BASE_URL}/tokenize`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: text }),
+      },
+      15000,
+    );
+    if (!res || !res.ok) return null;
+    const j = await res.json().catch(() => null);
+    return j && Array.isArray(j.tokens) ? j.tokens.length : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 深化で選ばれた段落だけを資料として Ultra に答えを作り直させる。
+ * 階段10の変更は2点のみ（ゲート基準は不変）：
+ * (a) 証拠は字数ではなくトークン予算（プロンプト全体で
+ *     REGEN_TOKEN_BUDGET）で組み直す。段落はランク順に積み、予算を
+ *     超える分は末尾（低ランク）から落とす。先頭の段落だけで超える
+ *     場合は、その段落の末尾を200字ずつ切り詰める（診断の規律と
+ *     同じ機械的な切り方）。/tokenize が使えない場合は証拠1,100字
+ *     （階段11でトークン予算に合わせて引き下げ）の保守的見積もりに
+ *     倒し、その旨を tokenEstimated で返す。
+ * (c) 指示文は「主語と対象を含めた完全な文で」とする。階段9では
+ *     短い答え（主語省略）がゲートの照合形式に届かず正答2件が
+ *     不採用になったため、生成側の答え方だけを寄せる。
+ * 生成は本番と同じ generateUltra 経由（system は本番の
+ * ULTRA_SYSTEM_PROMPT のまま）。成功したら
+ * {text, evidenceChars, picksUsed, promptTokens, tokenEstimated,
+ * blocksDropped}、それ以外は null。
+ */
+async function regenAnswerFromEvidence(question) {
+  try {
+    REGEN_DIAG.lastReason = null;
+    const blocks = REGEN_PICKS.get(question);
+    if (!blocks || !blocks.length) {
+      REGEN_DIAG.lastReason = "no-picks";
+      return null;
+    }
+    const buildEv = (bl) =>
+      bl
+        .map((b) => `【${b.role === "article" ? "記事" : "検索結果"}：${b.title}】\n${b.para}`)
+        .join("\n");
+    const buildUser = (ev) =>
+      `\n\n${ev}\n\n\n${question}\n\n資料だけを根拠に、主語と対象を含めた完全な文で、短く答えてください。`;
+    let use = blocks.slice();
+    let ev = buildEv(use);
+    let tokens = await regenTokenCount(ULTRA_SYSTEM_PROMPT + "\n" + buildUser(ev));
+    let tokenEstimated = false;
+    if (tokens === null) {
+      // /tokenize 不達：字数の保守的見積もり（日本語は概ね
+      // 1字≒1トークン以上。完了した階段9の再生成は証拠1,423字
+      // 以下だった）に倒す。
+      tokenEstimated = true;
+      while (ev.length > 1100 && use.length > 1) {
+        use.pop();
+        ev = buildEv(use);
+      }
+      if (ev.length > 1100) {
+        use = [{ ...use[0], para: use[0].para.slice(0, 1100) }];
+        ev = buildEv(use);
+      }
+    } else {
+      while (tokens > REGEN_TOKEN_BUDGET && use.length > 1) {
+        use.pop();
+        ev = buildEv(use);
+        tokens = await regenTokenCount(ULTRA_SYSTEM_PROMPT + "\n" + buildUser(ev));
+        if (tokens === null) break;
+      }
+      if (tokens !== null && tokens > REGEN_TOKEN_BUDGET) {
+        // 先頭の段落だけで予算超過：末尾を200字ずつ切り詰める。
+        while (tokens > REGEN_TOKEN_BUDGET && use[0].para.length > 200) {
+          use = [{ ...use[0], para: use[0].para.slice(0, use[0].para.length - 200) }];
+          ev = buildEv(use);
+          tokens = await regenTokenCount(ULTRA_SYSTEM_PROMPT + "\n" + buildUser(ev));
+          if (tokens === null) break;
+        }
+        if (tokens !== null && tokens > REGEN_TOKEN_BUDGET) {
+          REGEN_DIAG.lastReason = "budget-overflow";
+          return null;
+        }
+      }
+    }
+    if (!ev) {
+      REGEN_DIAG.lastReason = "no-evidence";
+      return null;
+    }
+    const out = await generateUltra(buildUser(ev));
+    const text = (out || "").trim();
+    if (!text) {
+      REGEN_DIAG.lastReason = "empty-output";
+      return null;
+    }
+    if (isRegenAbstention(text)) {
+      REGEN_DIAG.lastReason = "abstention-output";
+      return null;
+    }
+    REGEN_DIAG.lastReason = "ok";
+    return {
+      text,
+      evidenceChars: ev.length,
+      picksUsed: use.length,
+      promptTokens: tokens,
+      tokenEstimated,
+      blocksDropped: blocks.length - use.length,
+      // 階段11（(2) 照合証拠の統一）：実際に生成へ渡した段落
+      // （予算で切り落とした後のもの）を返す。pass-2 の照合は
+      // この証拠に対して行う。
+      evidenceBlocks: use.map((b) => ({
+        role: b.role, title: b.title, para: b.para,
+      })),
+    };
+  } catch {
+    REGEN_DIAG.lastReason = "gen-error";
+    return null;
+  }
+}
+
+
+/* ================================================================== */
+/* 階段11（2026-11-26）：pass-2 の採用厳格化と照合証拠の統一           */
+/*                                                                    */
+/* 階段10の Bench 50 で嘘1件（CB15）が出た。再生成の誤答が pass-2     */
+/* 照合で nonclaim（主張として読み取れない）と判定され、未検証のまま  */
+/* 採用・表示された。階段9では同一文が none で正しく止まっていた＝    */
+/* ゲートの判定コードは無変更で、再生成機構の「nonclaim 素通り」が    */
+/* 潜在リスクとして発現した。あわせて、裏づけが実際に噛んだ場合は     */
+/* 正答も全て止まった（gate2 の裏づけ成立 0/12）——pass-2 の照合が     */
+/* 第1パスの証拠に対して行われ、再生成の根拠（深化証拠）と対象が      */
+/* ずれていたため。階段11は採用側と照合対象だけを直す：               */
+/* (1) 採用は pass-2 照合で裏づけ成立（all）の場合のみ。nonclaim・    */
+/*     none・partial・abstain では絶対に採用しない（regenAdoptable）。*/
+/* (2) pass-2 の照合対象を、再生成に実際に使った深化証拠へ揃える     */
+/*     （buildRegenPass2Ctx）。照合の基準・物差しは一切変えない。     */
+/* ================================================================== */
+
+/**
+ * 再生成に使った深化証拠ブロック [{role, title, para}] から、
+ * pass-2 照合用の文脈 {fact, article, results} を組み立てる。
+ * article 役の段落は lead に連結し、result 役は results にする。
+ * fact は第1パスと同じ手順（extractFact → scopeToSubject →
+ * sanitizeFact）で組み立てる。変えるのは「どの証拠と照らすか」
+ * だけで、判定の基準は一切変えない。
+ */
+function buildRegenPass2Ctx(question, blocks) {
+  let article = null;
+  const results = [];
+  for (const b of blocks || []) {
+    if (!b || typeof b.para !== "string" || !b.para) continue;
+    if (b.role === "article") {
+      if (!article) {
+        article = { title: b.title || "", url: "", lead: b.para, fields: {} };
+      } else {
+        article.lead += "\n\n" + b.para;
+      }
+    } else {
+      results.push({
+        title: b.title || "", url: "", snippet: "", text: b.para,
+      });
+    }
+  }
+  let fact = null;
+  if (article) {
+    try { fact = extractFact(question, article); } catch { fact = null; }
+  }
+  const scoped = scopeToSubject(question, results);
+  fact = sanitizeFact(fact, article, question);
+  return { fact, article, results: scoped };
+}
+
+/**
+ * 階段11（(1) 採用条件の厳格化）：再生成の答えを採用してよいか。
+ * pass-2 照合で裏づけが成立（status "all"）し、表示が棄権文でも
+ * 棄権形でもない場合のみ true。nonclaim は「検証できなかった」
+ * であって「安全」ではないため、階段10までの素通りを構造的に
+ * 塞ぐ。ゲート基準そのものは変えず、採用側だけを厳しくする。
+ */
+function regenAdoptable(gate2Status, displayed, abstainText) {
+  if (gate2Status !== "all") return false;
+  const d = String(displayed ?? "");
+  if (!d || d === abstainText) return false;
+  if (isRegenAbstention(d)) return false;
+  return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -16323,6 +17078,14 @@ async function fetchServerEvidence(question) {
   }
   const error = typeof data.error === "string" ? data.error : "";
   if (!article && results.length === 0 && error) return null;
+  // 階段8：バンドルが返る前に証拠を深化させる（失敗しても無変更）。
+  // 階段10：バンドル収集パスでは CUBE_DEEPEN_SKIP=1 で深化を止める
+  // （タイトルと URL の一覧だけを取るため。測定経路では使わない）。
+  if (
+    !(typeof process !== "undefined" && process.env && process.env.CUBE_DEEPEN_SKIP === "1")
+  ) {
+    try { await deepenEvidenceBundle(question, { article, results }); } catch {}
+  }
   WikiNet.via = "server";
   WikiNet.lastError = error;
   return { article, results, error };
@@ -22138,6 +22901,25 @@ const App = {
           });
           return;
         }
+        // 階段7（2026-11-25）：索引レーンで決定的な文が見つからなかった
+        // 場合に限り、同じ判定（階段2）を一般Web検索の本文にも広げる。
+        // 判定基準は同一で、探索する証拠の範囲だけが広がる。表示した
+        // 答えは知識メモ帳に保存しない（階段2と同じ方針）。
+        const ynw = await yesNoWebEvidenceAnswer(question, modelAnswer).catch(
+          () => null,
+        );
+        if (ynw) {
+          this.setPhase("idle");
+          this.pushAssistant({
+            text: ynw.text,
+            badge: "model",
+            sourceTitle: ynw.sourceTitle,
+            sourceUrl: ynw.sourceUrl,
+            evidence: ynw.evidence,
+            note: "Cubeの答えは裏づけが取れなかったため、一般のWeb検索で見つけた記事の中から、はい／いいえの根拠になる文をそのまま表示しています。",
+          });
+          return;
+        }
       }
     }
 
@@ -22224,6 +23006,95 @@ const App = {
           note: `「${entity}」についての記事が見つかりませんでした。存在が確認できないものについて、あるように答えることはしません。`,
         });
         return;
+      }
+      // 階段17（2026-11-27）：再生成の前に、第1パスの下書き
+      // そのものを、深化した証拠（再生成 pass-2 と同じ厚み
+      // つき文脈）で照合し直す（正答下書きの救済）。生成を
+      // 伴わず、採用は再検証が all のときだけ
+      // （regenAdoptable）。救済できなければ従来どおり
+      // 再生成へ進む。
+      {
+        const ctxD = buildRegenPass2Ctx(
+          question,
+          REGEN_PICKS.get(question) || [],
+        );
+        const gateD = verifyModelAnswer(
+          modelAnswer,
+          question,
+          buildThickGateCtx(question, ctxD),
+        );
+        if (
+          regenAdoptable(
+            gateD && gateD.status,
+            modelAnswer,
+            "確認できませんでした。",
+          )
+        ) {
+          this.pushAssistant({
+            text: modelAnswer,
+            badge: "model",
+            sourceTitle: gateD.source?.title,
+            sourceUrl: gateD.source?.url,
+            note: "Cubeの答えは最初の照合では裏づけが取れませんでしたが、集めた資料と文単位で照合し直して確認できました。",
+          });
+          return;
+        }
+        // 階段18（2026-11-27）：救済の再検証が partial のときは、
+        // 裏づけの取れた文だけ（gateD.text）を表示する。第1
+        // パスの partial 表示と同じ意味論・同じ注記で、知識
+        // メモ帳には保存しない。
+        if (
+          gateD &&
+          gateD.status === "partial" &&
+          gateD.text &&
+          gateD.text !== modelAnswer &&
+          !isRegenAbstention(gateD.text)
+        ) {
+          this.pushAssistant({
+            text: gateD.text,
+            badge: "model",
+            sourceTitle: gateD.source?.title,
+            sourceUrl: gateD.source?.url,
+            note: "Cubeの答えのうち、ネットの記事で確認が取れた部分だけを表示しています。確認が取れなかった部分は表示しませんでした。",
+          });
+          return;
+        }
+      }
+      // 階段16（2026-11-26）：裏づけが取れなかった答えを棄権させる
+      // 前に、深化した証拠だけを根拠に答えを作り直し、同じ物差し
+      // （pass-2 の厚みつき文脈）で再検証する（階段9〜12の再生成
+      // 機構の本番配線）。採用は再検証が all のときだけ
+      // （regenAdoptable）。採用した答えは知識メモ帳に保存しない
+      // （保存は第1パスの all の経路だけ、という従来の規律は
+      // 変えない）。
+      {
+        const rg = await regenAnswerFromEvidence(question).catch(
+          () => null,
+        );
+        if (rg) {
+          const ctx2 = buildRegenPass2Ctx(
+            question,
+            rg.evidenceBlocks || [],
+          );
+          const gateCtx2 = buildThickGateCtx(question, ctx2);
+          const gate2 = verifyModelAnswer(rg.text, question, gateCtx2);
+          if (
+            regenAdoptable(
+              gate2 && gate2.status,
+              rg.text,
+              "確認できませんでした。",
+            )
+          ) {
+            this.pushAssistant({
+              text: rg.text,
+              badge: "model",
+              sourceTitle: gate2.source?.title,
+              sourceUrl: gate2.source?.url,
+              note: "Cubeの最初の答えは裏づけが取れなかったため、集めた資料だけを根拠に答えを作り直し、ネットの記事と文単位で照合しました。",
+            });
+            return;
+          }
+        }
       }
       this.pushAssistant({
         text: "確認できませんでした。",
@@ -22475,6 +23346,13 @@ if (typeof module !== "undefined" && module.exports) {
     assembleUltraPassage, isUltraAbstention, ultraWriteFactAnswer, ULTRA_PASSAGE_CAP,
     fetchWebSearchPages, webSearchAnswer, webVerifyModelAnswer, webAnswerEntityOk, GSEARCH_TIMEOUT_MS,
     yesNoEvidenceAnswer, isYesNoQuestion,
+    yesNoWebEvidenceAnswer, yesNoWebEvidenceAnswerSync,
+    deepenEvidenceBundle, deepenSelect,
+    regenAnswerFromEvidence,
+    isRegenAbstention, FULLTEXT_STATS,
+    buildRegenPass2Ctx, regenAdoptable, REGEN_DIAG, REGEN_TOKEN_BUDGET,
+    REGEN_PICKS,
+    buildThickGateCtx, recordFullBundle12, getFullBundle12, THICK_STATS12,
     yesNoSentenceStance, yesNoQuestionTerms, yesNoClaimedEntity, yesNoPoliteSentence,
     yesNoUnits, yesNoSubjectUnit,
     fetchServerEvidence, startEvidencePromises, EVIDENCE_SERVER_TIMEOUT_MS,
