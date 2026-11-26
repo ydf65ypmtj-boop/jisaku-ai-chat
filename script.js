@@ -2759,6 +2759,9 @@ async function webSearchAnswer(question) {
   // 実体すり替え対策：裏づけが取れても、答えが質問の対象とは別の
   // 実体について述べている場合は、質問への答えとして表示しない。
   if (!webAnswerEntityOk(question, styled, pages)) return null;
+  // 階段14 R14-2（表示側のみ・判定には触れない）：疑問形のままの文や
+  // 質問の対象を含まない文は、答えとして表示しない。
+  if (!r14DisplayAnswerable("web", styled, question)) return null;
   const source =
     gate.source || pages.find((p) => p.url === sources[0].url) || pages[0];
   const evidence =
@@ -3101,6 +3104,9 @@ function yesNoEvidenceAnswer(question, modelAnswer, ctx) {
   }
   for (const r of results) pages.push(r);
   if (!webAnswerEntityOk(question, text, pages)) return null;
+  // 階段14 R14-2（表示側のみ・判定には触れない）：質問の命題側の語を
+  // 含まない抜粋は、答えになっていない形として表示しない。
+  if (!r14DisplayAnswerable("yesno", text, question)) return null;
   return {
     text,
     sourceTitle: best.title,
@@ -8507,6 +8513,351 @@ function verifyTypedClaim13(sentence, question, ctx, contextResults) {
   return null;
 }
 
+/* ==== 階段14の物差し（ruler-14） ====
+*
+* 設計書：STEP14_DESIGN_2026-11-26.md。階段13（ruler-13.4）の上に足す
+* 変更は3トラックに分離し、版も分ける。
+*
+* 版 ruler-14.x（R14_FLAGS.owner で切替）
+* R14-1：A13-I2 の穴塞ぎ。窓照合の結合点検（windowClaimBindingOk）に、
+* 主値主張（XのAはV）について「証拠文に所有者 Z のA が明示されて
+* いる場合、Z が主張の対象 X と一致しなければ、その文を裏づけに
+* 使わない」を必須化する。一致は normalizeJa の等値と「の」を除いた
+* 等値まで（R13-3 と同じ正規化の範囲）。所有者が指示語などで判定
+* できない場合は「一致しない」として扱う（緩める側には倒さない）。
+* 所有者の明示が無い文・主値主張でない主張には一切触れない。
+*
+* 版 display-14.x（R14D_FLAGS でレーン別に切替）
+* R14-2：表示レーンの回答性条件。判定（verifyModelAnswer）には一切
+* 触れず、表示してよいテキストの形だけを見る。
+* - yesno：表示文が質問の命題側の語を少なくとも1つ含むこと。
+* - web：表示文が疑問形でなく、質問の対象（アンカー）を含むこと。
+* - deffact：定義種別の fact 表示で、質問の主部アンカーが表示文に
+* あり、かつ質問の焦点語（主部を除いた単位）が少なくとも1つ
+* 表示文に含まれること（ハーネス decide() から呼ばれる）。
+*
+* 版 calc-14.x（CALC14_FLAGS で切替）
+* R14-C1：計算の主張を、CalcLane と同じ決定論的再計算で検算する
+* 検証経路。対象は閉じた3形（割引・割合・速さ×時間）。再計算結果と
+* 主張文中の数値が完全一致し、主張文中の数値がすべて「入力・派生・
+* 結果」の許容集合に含まれ、単位（または等式形）を伴う場合にのみ
+* 裏づけとする。形が合わない質問では CalcLane.solve をオラクルと
+* して同じ条件（結果の明記＋外国数値なし）を課す。
+*
+* R14-3（否定形 yes/no の型付き照合）はフェーズ0のトレースで実施条件
+* （対象ケースの障壁が否定部分の照合形だけであること）を満たさな
+* かったため実施しない。R14-4（複文の原子分解拡張）は設計どおり
+* 実施しない。
+*/
+const R14_FLAGS = { owner: true};
+const R14_VERSION = R14_FLAGS.owner? "ruler-14.1": "ruler-14.0";
+const R14_AUDIT = [];
+const R14D_FLAGS = { yesno: true, web: true, deffact: true};
+const R14D_VERSION = "display-14.1";
+const R14D_AUDIT = [];
+const CALC14_FLAGS = { enabled: true};
+const CALC14_VERSION = "calc-14.1";
+const CALC14_AUDIT = [];
+
+/* ---------- R14-1：所有者一致 ---------- */
+
+// 主張の束縛（binding）から「X の A は V」型の対象 X と属性 A を取る。
+// 属性リストは R13-4 と共通の閉じたリスト（R13_ATTRS）。主値主張で
+// なければ null。
+function r14ClaimOwner(binding) {
+if (!binding ||!binding.subject ||!binding.value) return null;
+const subj = String(binding.subject);
+let best = null;
+for (const a of R13_ATTRS) {
+const idx = subj.lastIndexOf("の" + a);
+if (idx > 0 && (!best || idx > best.idx)) best = { idx, attr: a};
+}
+if (!best) return null;
+const X = subj.slice(0, best.idx).trim();
+if (!X) return null;
+const alts = new Set();
+const add = (s) => {
+const t = String(s || "").trim();
+if (!t) return;
+const n = normalizeJa(t);
+if (n) alts.add(n);
+const stripped = n.replace(/の/g, "");
+if (stripped) alts.add(stripped);
+};
+add(X);
+add(X.split(/[、,]/).pop()); // 時代・条件の前置きを落とした形
+add(X.split("の").pop()); // 最後の節だけの形
+return { X, attr: best.attr, alts: [...alts]};
+}
+
+// 証拠文中の「Z の A」の Z をすべて拾う。Z は直前の区切り（文頭・
+// 読点・括弧・は／が）から「の」の直前まで。
+function r14EvidenceOwners(ls, attr) {
+const n = normalizeJa(ls);
+const needle = "の" + attr;
+const owners = [];
+let idx = 0;
+for (;;) {
+const i = n.indexOf(needle, idx);
+if (i < 0) break;
+let start = 0;
+for (const d of ["は", "が", "、", "。", "「", "」", "（", "）", "・", "："]) {
+const di = n.lastIndexOf(d, i - 1);
+if (di >= start) start = di + 1;
+}
+let owner = n.slice(start, i).trim();
+owner = owner.replace(/^(また|そして|なお|ただし|一方で|一方|現在|当時|かつて|その後|そのため)/, "");
+owners.push(owner);
+idx = i + needle.length;
+}
+return owners;
+}
+
+// 所有者が指示語・代名詞などで名指しできない形か。
+function r14OwnerUndeterminable(owner) {
+const o = String(owner || "");
+if (!o) return true;
+if (o.length > 24) return true;
+if (/^(その|この|あの|同|当|該|それ|これ|あれ|そこ|ここ|同国|同市|同県|同社|同校|同町|同村|同店|同館)/.test(o)) return true;
+if (/^(彼|彼女|同社|同組織|同団体|同チーム|同グループ)$/.test(o)) return true;
+return false;
+}
+
+// 窓照合の結合点検からのフック。true = その文を裏づけに使ってよい。
+// 主値主張でない／証拠文に所有者の明示が無い場合は常に対象外（true）。
+function r14OwnerBindingOk(ls, binding, srcTitle) {
+if (!R14_FLAGS.owner) return true;
+const claim = r14ClaimOwner(binding);
+if (!claim) return true;
+const owners = r14EvidenceOwners(ls, claim.attr);
+if (!owners.length) return true;
+let sawDeterminable = false;
+for (const o of owners) {
+if (r14OwnerUndeterminable(o)) continue;
+sawDeterminable = true;
+const no = normalizeJa(o);
+const noStrip = no.replace(/の/g, "");
+if (claim.alts.includes(no) || claim.alts.includes(noStrip)) {
+R14_AUDIT.push({
+ruleId: "R14-1", rulerVersion: R14_VERSION, status: "owner-match",
+claim: binding.subject, attr: claim.attr, evidenceOwner: o,
+source: srcTitle || "",
+});
+return true;
+}
+}
+R14_AUDIT.push({
+ruleId: "R14-1", rulerVersion: R14_VERSION,
+status: sawDeterminable? "owner-mismatch": "owner-undeterminable",
+claim: binding.subject, attr: claim.attr,
+evidenceOwner: owners.join("|"), source: srcTitle || "",
+});
+return false;
+}
+
+/* ---------- R14-2：表示レーンの回答性条件 ---------- */
+
+const R14_PROP_STOP = new Set([
+"ですか", "ますか", "でしょうか", "のこと", "もの", "ため", "場合",
+"よう", "こと", "これ", "それ", "あれ", "なに", "何", "とは", "では",
+"には", "にも", "から", "まで", "など", "ほど", "だけ", "しか",
+]);
+
+// 質問の命題側（最後の「は」より後、無ければ主部より後）の語。
+function r14PropositionTerms(question) {
+const q = String(question || "");
+let seg = q;
+const hi = q.lastIndexOf("は");
+if (hi >= 0 && hi < q.length - 1) {
+seg = q.slice(hi + 1);
+} else {
+let su = null;
+try { su = yesNoSubjectUnit(q);} catch { su = null;}
+if (su) {
+const i = q.indexOf(su);
+if (i >= 0) seg = q.slice(i + su.length);
+}
+}
+const terms = keyTerms(normalizeJa(seg))
+.filter((t) => t.length >= 2 &&!R14_PROP_STOP.has(t))
+// 質問の末尾の断片（〜ますか／〜ましたか等）だけが残る場合は
+// 命題の語とはみなさない（チェック自体を対象外に戻す）。
+.filter((t) => !/(ますか|ましたか|ですか|でしょうか|ませんか)$/.test(t));
+return [...new Set(terms)];
+}
+
+// 質問の対象（アンカー）候補：主部・話題の先頭節とその「の」末節。
+function r14AnchorTerms(question) {
+const out = new Set();
+const add = (s) => {
+const t = String(s || "").trim();
+if (t.length >= 2) out.add(t);
+};
+let su = null;
+try { su = yesNoSubjectUnit(question);} catch { su = null;}
+if (su) {
+const core = su.replace(/と$/, "");
+add(core);
+for (const seg of core.split("の")) add(seg.replace(/[「」『』]/g, ""));
+}
+let topic = null;
+try { topic = topicFromQuestion(question);} catch { topic = null;}
+if (topic) {
+const head = topic.split(/[、,]/)[0];
+if (head.length <= 14) {
+add(head);
+for (const seg of head.split("の")) add(seg.replace(/[「」『』]/g, ""));
+}
+}
+let subj = null;
+try { subj = subjectOf(question);} catch { subj = null;}
+if (subj) add(subj);
+return [...out];
+}
+
+function r14TextFormOk(text) {
+const t = String(text || "").trim();
+if (!t) return false;
+if (/[？?]/.test(t)) return false;
+const sentences = t.split(/(?<=。)/).filter((s) => s.trim());
+const last = (sentences.length? sentences[sentences.length - 1]: t).trim();
+if (/(ですか|ますか|でしょうか|んですか|のか|かしら|だろうか|かな)[。！]?$/.test(last)) return false;
+return true;
+}
+
+// 表示してよい形かどうか。lane: "yesno" | "web" | "deffact"。
+// 判定には一切触れない。条件が測れない形（語が取れない等）は対象外
+// として通す（表示を狭めるのは、答えていないことが形から確定する
+// ときだけ）。
+function r14DisplayAnswerable(lane, text, question, opts = {}) {
+if (!R14D_FLAGS[lane]) return true;
+const t = String(text || "");
+const nt = normalizeJa(t);
+let ok = true;
+let reason = "";
+if (!r14TextFormOk(t)) {
+ok = false; reason = "interrogative-or-empty";
+}
+if (ok && lane === "yesno") {
+const terms = r14PropositionTerms(question);
+if (terms.length &&!terms.some((x) => nt.includes(normalizeJa(x)))) {
+ok = false; reason = "no-proposition-term";
+}
+}
+if (ok && lane === "web") {
+const anchors = r14AnchorTerms(question);
+if (anchors.length &&!anchors.some((x) => nt.includes(normalizeJa(x)))) {
+ok = false; reason = "no-anchor";
+}
+}
+if (ok && lane === "deffact") {
+const anchors = r14AnchorTerms(question);
+if (anchors.length &&!anchors.some((x) => nt.includes(normalizeJa(x)))) {
+ok = false; reason = "deffact-anchor";
+}
+if (ok) {
+let units = [];
+try { units = yesNoUnits(question, null, []);} catch { units = [];}
+const factTitleN = normalizeJa(opts.factTitle || "");
+const focus = units.filter((u) =>
+u.length >= 2 &&!R14_PROP_STOP.has(u) &&
+!(factTitleN && factTitleN.includes(normalizeJa(u))));
+if (focus.length &&!focus.some((u) => nt.includes(normalizeJa(u)))) {
+ok = false; reason = "deffact-focus";
+}
+}
+}
+R14D_AUDIT.push({
+ruleId: "R14-2", displayVersion: R14D_VERSION, lane, ok, reason,
+question: String(question || "").slice(0, 60),
+});
+return ok;
+}
+
+/* ---------- R14-C1：計算の検算経路 ---------- */
+
+function r14NumEq(a, b) {
+return Math.abs(a - b) < 1e-9;
+}
+
+// 質問から閉じた3形の計算を取り出す。取れなければ null。
+function r14CalcForm(question) {
+const q = String(question || "")
+.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+.replace(/，/g, ",")
+.replace(/％/g, "%");
+let m = q.match(/(\d[\d,]*(?:\.\d+)?)\s*円[^。]{0,24}?(?:(\d+(?:\.\d+)?)\s*割\s*引|(\d+(?:\.\d+)?)\s*%\s*(?:引き|引|オフ))/);
+if (m) {
+const price = parseFloat(m[1].replace(/,/g, ""));
+const ratePct = m[2]!= null? parseFloat(m[2]) * 10: parseFloat(m[3]);
+if (price > 0 && ratePct > 0 && ratePct < 100) {
+const result = (price * (100 - ratePct)) / 100;
+return {
+type: "discount", price, ratePct, result, unit: "円",
+allowed: [price, ratePct, ratePct / 10, 10 - ratePct / 10,
+100 - ratePct, price - result, result],
+};
+}
+}
+m = q.match(/(\d[\d,]*(?:\.\d+)?)\s*(人|個|円|本|枚|台|冊|匹|羽|頭|件|問|点|名|世帯|戸|つ)?\s*の\s*(\d+(?:\.\d+)?)\s*%/);
+if (m) {
+const total = parseFloat(m[1].replace(/,/g, ""));
+const pct = parseFloat(m[3]);
+if (total > 0 && pct >= 0 && pct <= 100) {
+const result = (total * pct) / 100;
+return {
+type: "percent", total, pct, result, unit: m[2] || "",
+allowed: [total, pct, result],
+};
+}
+}
+m = q.match(/時速\s*(\d+(?:\.\d+)?)\s*(?:km|キロ(?:メートル)?)[^。]{0,24}?(\d+(?:\.\d+)?)\s*(分|時間)/);
+if (m) {
+const speed = parseFloat(m[1]);
+const t = parseFloat(m[2]);
+const hours = m[3] === "分"? t / 60: t;
+if (speed > 0 && t > 0) {
+const result = speed * hours;
+return {
+type: "speed", speed, time: t, timeUnit: m[3], hours, result,
+unit: "km", allowed: [speed, t, hours, result],
+};
+}
+}
+return null;
+}
+
+// 検算による裏づけ。verifySentence の種類ガード直後（英数字トークン
+// 関門より前）から呼ばれる。再計算と完全一致した場合にだけ
+// { via: "calc14" } を返す。
+function verifyCalcClaim14(sentence, question) {
+if (!CALC14_FLAGS.enabled) return null;
+const s = String(sentence || "");
+let form = r14CalcForm(question);
+if (!form) {
+let lane = null;
+try { lane = CalcLane.solve(question);} catch { lane = null;}
+if (lane && lane.answer!= null && isFinite(Number(lane.answer))) {
+const qNums = numbersIn(question).map(Number);
+form = {
+type: "calclane", result: Number(lane.answer), unit: "",
+allowed: [...qNums, Number(lane.answer)],
+};
+}
+}
+if (!form) return null;
+const nums = numbersIn(s).map(Number);
+if (!nums.length) return null;
+if (!nums.some((n) => r14NumEq(n, form.result))) return null;
+if (!nums.every((n) => form.allowed.some((a) => r14NumEq(n, a)))) return null;
+if (form.unit &&!s.includes(form.unit) &&!/[=＝]/.test(s)) return null;
+CALC14_AUDIT.push({
+ruleId: "R14-C1", calcVersion: CALC14_VERSION, type: form.type,
+result: form.result, sentence: s.slice(0, 80),
+});
+return { source: { title: "", url: ""}, via: "calc14"};
+}
+
 /* ------------------------------------------------------------------ */
 /* 文単位の出典検証ゲート（2026-11-16）                                */
 /*                                                                    */
@@ -9632,6 +9983,11 @@ function windowClaimBindingOk(sentence, question, src, ctx) {
       }
       continue;
     }
+    // 階段14 R14-1：主値主張では、証拠文に所有者（ZのA）が明示
+    // されている場合、その所有者が主張の対象 X と一致しなければ、
+    // その文は裏づけに使わない（A13-I2 の穴塞ぎ。所有者の明示が
+    // 無い文は対象外）。
+    if (!r14OwnerBindingOk(ls, binding, src)) continue;
     if (subjectLinkedInSentence(ls, binding, src)) return true;
   }
   return false;
@@ -9658,6 +10014,12 @@ function verifySentence(sentence, question, ctx) {
       (qKind === "place" && aKind === "hq");
     if (!locationPair) return null;
   }
+  // 階段14 検算トラック（別版管理 calc-14）：計算の主張は、質問自身
+  // の数値から決定論的に再計算して完全一致した場合に限り、ここで
+  // 裏づける。主張文中の数値はすべて「入力・派生・結果」の集合に
+  // 閉じ込められるため、別の実体についての文が紛れ込む余地はない。
+  const calc14 = verifyCalcClaim14(sentence, question);
+  if (calc14) return calc14;
   // 質問が特定の英数字トークン（Fe、H2O等）を名指している場合、
   // そのトークンに触れていない文は質問への答えとして裏づけない
   // （Feを聞かれて元素記号一般の定義が照合を通る、を防ぐ）。
@@ -22168,6 +22530,7 @@ if (typeof module !== "undefined" && module.exports) {
     factSourceRelatedToEntity,
     verifyModelAnswer, splitForGate, verifySentence,
     R13_VERSION, R13_FLAGS, R13_AUDIT, verifyTypedClaim13, anchored13, anchoredForCorroboration13,
+    R14_VERSION, R14_FLAGS, R14_AUDIT, R14D_VERSION, R14D_FLAGS, R14D_AUDIT, CALC14_VERSION, CALC14_FLAGS, CALC14_AUDIT, r14DisplayAnswerable, r14OwnerBindingOk, r14PropositionTerms, r14CalcForm, verifyCalcClaim14,
     factIsContested, entityNotFound, scopeToSubject, subjectOf,
     sanitizeFact, questionContextTerms, contextSatisfiedByText,
     isClaimSentence, isDegenerateAnswer, placeAnswerMissesFactValue,
