@@ -7711,8 +7711,22 @@ function windowSupportsAnswer(windowText, modelAnswer, content) {
  */
 function resultSupportsAnswer(result, modelAnswer, content) {
   if (!isUsableEvidenceResult(result)) return false;
+  if (
+    evidenceWindows(result).some((w) =>
+      windowSupportsAnswer(w, modelAnswer, content),
+    )
+  ) {
+    return true;
+  }
+  // 階段13 R13-3：複合名詞の「の」の有無などの表記差は、正規化した
+  // 語と窓でもう一度だけ照合する（厳密照合が落ちた場合の受け皿。
+  // 数字の照合は従来どおり窓照合の中で行われる）。
+  if (!R13_FLAGS.norm) return false;
+  const stripNo13 = (s) => String(s).replace(/の/g, "");
+  const nContent = (content || []).map(stripNo13).filter(Boolean);
+  if (nContent.length === 0) return false;
   return evidenceWindows(result).some((w) =>
-    windowSupportsAnswer(w, modelAnswer, content),
+    windowSupportsAnswer(stripNo13(w), modelAnswer, nContent),
   );
 }
 
@@ -7826,7 +7840,7 @@ function findCorroboratingResult(modelAnswer, results, question = "") {
   if (content.length >= 2) {
     for (const r of results) {
       if (
-        resultAnchoredToQuestion(r, question, modelAnswer) &&
+        anchoredForCorroboration13(r, question, modelAnswer, content) &&
         resultSupportsAnswer(r, modelAnswer, content)
       ) {
         return r;
@@ -7899,6 +7913,598 @@ function findCorroboratingResult(modelAnswer, results, question = "") {
 
 function isCorroborated(modelAnswer, results, question = "") {
   return findCorroboratingResult(modelAnswer, results, question) !== null;
+}
+
+
+/* ================= 階段13（2026-11-26）：照合の物差しの型付き経路 =================
+ * 設計：RULER_DESIGN_2026-11-26.md／診断確定：step13_work/phase0_findings.md。
+ *
+ * 既存経路（窓照合・定義・最上級）が全て落ちた主張文に対してだけ呼ばれる
+ * fall-through。主張を型付きスロット（対象・関係・値）に分解し、証拠側も
+ * 同じ型で照合する。採用条件は従来どおり「裏づけ all のみ」（不変条件 I1）。
+ * 設計書で却下された緩和（過半一致・窓の記事全体化・単独語の一般解禁・
+ * nonclaim 解禁）は実装していない。
+ *
+ * ルール台帳は ruler_manifest13.json。各ルールは R13_FLAGS で個別に
+ * 切れる（フラグを切ると、そのルールの裏づけは成立しなくなる）。
+ * 裏づけが成立したら R13_AUDIT に {ruleId, rulerVersion, sourceTitle,
+ * sourceUrl, windowHash, matchedSlots} を残す。
+ */
+const R13_FLAGS = {
+  anchor: true, // R13-9 話題アンカーの見出し包含（フェーズ0で新設）
+  loc: true,    // R13-1 所在述語の型付き照合
+  atom: true,   // R13-2 原子主張への分解＋原子単位の窓
+  norm: true,   // R13-3 複合名詞・表記の正規化（窓照合の受け皿）
+  swap: true,   // R13-4 属性関係の主値入替対応
+  slot: true,   // R13-5 質問スロット補完（順序）
+  range: true,  // R13-6 時間範囲の型付き比較
+  neg: true,    // R13-7 否定対比
+  scale: true,  // R13-7 尺度正規化
+};
+// 版番号（設計書 §6.2）：中核のみ=13.1、条件付きを足すごとに +1 段。
+const R13_VERSION =
+  "ruler-13." +
+  (1 +
+    (R13_FLAGS.slot ? 1 : 0) +
+    (R13_FLAGS.range ? 1 : 0) +
+    (R13_FLAGS.neg || R13_FLAGS.scale ? 1 : 0));
+const R13_AUDIT = [];
+function r13Hash(text) {
+  let h = 0x811c9dc5;
+  const s = String(text || "");
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+function r13Audit(ruleId, result, windowText, slots) {
+  R13_AUDIT.push({
+    ruleId,
+    rulerVersion: R13_VERSION,
+    sourceTitle: result?.title ?? "",
+    sourceUrl: result?.url ?? "",
+    windowHash: r13Hash(windowText),
+    matchedSlots: slots,
+  });
+}
+
+/* ---------- R13-9：話題アンカーの見出し包含 ----------
+ * 既存の錨は「タイトル＝錨候補」の厳密な一致を要求するため、錨候補が
+ * 長い名詞句（「世界初の○○「△△」を発明したの」のような形）で
+ * タイトルが短い（「△△」）記事を対象記事
+ * と認められない（フェーズ0の F7）。基底形（括弧注記を除いたタイトル）
+ * が3字以上で一般語でなく、錨候補（質問の対象・話題・答えの主語の
+ * いずれか）に含まれる／錨候補を接頭に持つ場合に限り、対象記事と認める。
+ * アンカーは「どの記事を見るか」の指定にすぎず、裏づけ自体は従来どおり
+ * 窓照合 all＋結合チェック（または下の型付き照合）が必須。 */
+const R13_ANCHOR_GENERIC = new Set([
+  "日本", "世界", "一覧", "歴史", "概要", "地理", "交通", "文化", "社会",
+  "自然", "人間", "動物", "植物",
+]);
+function r13TitleBase(title) {
+  const nt = normalizeJa(String(title || ""));
+  return nt.replace(/[（(][^（）()]*[）)]\s*$/, "").trim();
+}
+// カタカナ→ひらがなの折り畳み（タイトルと話題で、かな種だけが
+// 違う形を同じ対象として扱うため）。
+function r13FoldKana(s) {
+  return String(s || "").replace(/[ァ-ヶ]/g, (c) =>
+    String.fromCharCode(c.charCodeAt(0) - 0x60),
+  );
+}
+function anchored13(result, question, modelAnswer) {
+  if (resultAnchoredToQuestion(result, question, modelAnswer)) return true;
+  if (!R13_FLAGS.anchor) return false;
+  // 拡張錨は Wikipedia の記事タイトル規約（対象の名前＝記事タイトル）
+  // に合わせて較正したもので、フェーズ0の実測も全て Wikipedia 記事。
+  // 一般 Web ページのタイトルは対象名とは限らないため、URL が分かる
+  // 場合は Wikipedia 記事に限る（階段7の Web レーンの錨規律も変え
+  // ない）。URL が無い結果は深化・バンドル由来（Wikipedia 取得分）
+  // なので対象に含める。
+  const url13 = String(result?.url || "");
+  if (url13 && !/wikipedia\.org/.test(url13)) return false;
+  const base = r13FoldKana(r13TitleBase(result?.title));
+  if (base.length < 3 || R13_ANCHOR_GENERIC.has(base)) return false;
+  const rawAnchors = [
+    subjectOf(question),
+    topicFromQuestion(question),
+    answerSubjectOf(modelAnswer),
+  ].filter(Boolean);
+  // 錨候補の掃除：引用符を除いた形と、「は」で切った主語側の形も候補に
+  // 加える（話題抽出が「「X」は、…」のように述語断片を含む場合がある）。
+  const cleaned = [];
+  for (const a of rawAnchors) {
+    const noQuote = a.replace(/[「」『』]/g, "").trim();
+    if (noQuote) cleaned.push(noQuote);
+    const head = noQuote.split("は")[0].replace(/[、,]$/, "").trim();
+    if (head && head.length >= 2 && head !== noQuote) cleaned.push(head);
+  }
+  const anchors = [...rawAnchors, ...cleaned].map((a) =>
+    r13FoldKana(normalizeJa(a)),
+  );
+  for (const na of anchors) {
+    if (na.length >= 3 && (na.includes(base) || base.startsWith(na))) {
+      return true;
+    }
+  }
+  return false;
+}
+/* findCorroboratingResult（複数語経路）専用の錨：拡張錨を使う場合は、
+ * 主張語に実質語（漢字またはカタカナを含む語）が少なくとも1つ要る。
+ * 動詞の断片だけが残った主張（「した」「えられてい」等）は、無関係な
+ * 文の部分文字列として偶然そろってしまうため、拡張錨では通さない
+ * （フェーズ3で CB21 の誤反転から追加した安全条件）。 */
+function anchoredForCorroboration13(result, question, modelAnswer, content) {
+  if (resultAnchoredToQuestion(result, question, modelAnswer)) return true;
+  if (!anchored13(result, question, modelAnswer)) return false;
+  return (content || []).some((t) => /[一-龯ァ-ヶ]/.test(t));
+}
+
+/* ---------- 型付き経路の共通部品 ---------- */
+// 証拠文に否定・伝聞・留保の印がある文は型付き照合の証拠にしない。
+function r13EvidenceClean(s) {
+  return !/(ではない|ではありません|なかった|と言われ|とされる|と伝え|らしい|かもしれない|可能性)/.test(
+    s,
+  );
+}
+function r13SentencesOf(result) {
+  return splitSentences(String(result?.text || ""));
+}
+// 主張文の (対象, 値) を、述語の形からスロットとして取り出す。
+function r13ClaimSlots(sentence) {
+  const b = claimCopulaBinding(sentence);
+  return b ? { subject: b.subject, value: b.value } : null;
+}
+
+/* ---------- R13-1：所在述語の型付き照合 ----------
+ * 所在形（「XはYにあります」）と到着形（来航／到着／上陸）を区別する。
+ * 到着形は関係種別（来航系／上陸系）が主張と証拠で一致しないと成立
+ * しない（来航地と上陸地のような関係種別の取り違え防止）。 */
+const R13_LOC_ATTRS = ["本部", "所在地", "首都", "本社"];
+function r13Loc(sentence, question, results, ctx) {
+  // (a) 到着・上陸形：値は結合から、関係動詞は主張文自身から取る。
+  const arrVerb = sentence.match(/(来航|到着|寄港|上陸)/)?.[1] || null;
+  const slots = r13ClaimSlots(sentence);
+  if (arrVerb && slots && slots.value) {
+    const claimClass = arrVerb === "上陸" ? "land" : "arrive";
+    // [パターン, 値の位置]：before=「値に/へ動詞」、after=「動詞したのは値」
+    const verbPatterns =
+      claimClass === "land"
+        ? [["に上陸", "before"], ["へ上陸", "before"], ["上陸したのは", "after"], ["上陸地は", "after"], ["上陸の地である", "after"], ["上陸の地は", "after"]]
+        : [["に来航", "before"], ["へ来航", "before"], ["来航したのは", "after"], ["に到着", "before"], ["へ到着", "before"], ["到着したのは", "after"], ["に寄港", "before"], ["へ寄港", "before"], ["寄港したのは", "after"]];
+    for (const r of results) {
+      for (const s of r13SentencesOf(r)) {
+        if (!r13EvidenceClean(s)) continue;
+        if (!s.includes(slots.value)) continue;
+        const hit = verbPatterns.some(([p, side]) => {
+          const idx = s.indexOf(p);
+          if (idx < 0) return false;
+          if (side === "before") {
+            return s.slice(Math.max(0, idx - 14), idx).includes(slots.value);
+          }
+          return s.slice(idx + p.length, idx + p.length + 16).includes(slots.value);
+        });
+        if (hit) {
+          return { result: r, window: s, slots: { relation: arrVerb, value: slots.value } };
+        }
+      }
+    }
+    return null;
+  }
+  // (b) 所在形：「XはYにあります／ある／所在／位置」
+  const m = sentence.match(
+    /^(.+?)は「?([^、。]{1,24}?)」?に(?:あります|ある|所在します|所在する|位置します|位置する|置かれています|置かれている)[。]?$/,
+  );
+  if (!m) return null;
+  const target = m[1].trim();
+  const value = m[2].trim();
+  if (!target || !value) return null;
+  const targetHead = target.split("の")[0];
+  const valuePats = [
+    `${value}にあ`, `${value}に所在`, `${value}に位置`, `${value}に置かれ`,
+    `は${value}`, `${value}が本部`, `${value}に本部`,
+  ];
+  const claimNow = /(現在|今は|現在は)/.test(sentence);
+  for (const r of results) {
+    for (const s of r13SentencesOf(r)) {
+      if (!r13EvidenceClean(s)) continue;
+      if (!s.includes(value)) continue;
+      if (!(s.includes(target) || (targetHead.length >= 2 && s.includes(targetHead)))) {
+        continue;
+      }
+      const pat = valuePats.find((p) => s.includes(p));
+      if (!pat) continue;
+      // 支部の所在を本部の所在と取り違えない：値の直前に施設名
+      // （事務所・支部など）がある文は、本部の主張を裏づけない。
+      if (target.includes("本部")) {
+        const before = s.slice(Math.max(0, s.indexOf(pat) - 24), s.indexOf(pat));
+        if (/(事務所|支部|支局|分室|出張所|別館)/.test(before)) continue;
+      }
+      // 移転の事実がある文は、現在の所在の主張を裏づけない。
+      if (claimNow && /(移転|移った|移し|移され)/.test(s)) continue;
+      if (
+        classifyQuestion(question) === "place" &&
+        !placeWindowComplete(sentence, question, r)
+      ) {
+        continue;
+      }
+      return {
+        result: r,
+        window: s,
+        slots: { target, relation: "所在", value },
+      };
+    }
+  }
+  return null;
+}
+
+/* ---------- R13-4：属性関係の主値入替対応 ----------
+ * 主張 (X, 属性A, 値V) について、証拠側の同順（「AはV」）・入替
+ * （「VはXのA」）の両形を、節（、；で区切った範囲）単位で照合する。
+ * 同じ節に別の値が同じ属性で結ばれていれば、その節は使わない。
+ * コピュラは過去形（でした／だった）も値として認める（CB34 の実測：
+ * 既存の単独語経路は過去形コピュラの値を拾えなかった）。 */
+const R13_ATTRS = ["首都", "本部", "所在地", "本社", "正式名称"];
+function r13Swap(sentence, question, results) {
+  const slots = r13ClaimSlots(sentence);
+  if (!slots) return null;
+  const attr = R13_ATTRS.find((a) => slots.subject.includes(a));
+  if (!attr) return null;
+  const idx = slots.subject.lastIndexOf("の" + attr);
+  if (idx <= 0) return null;
+  const X = slots.subject.slice(0, idx).replace(/^[^、]*、/, ""); // 時代修飾などを落とした素の対象も候補に含めるため両形で試す
+  const Xfull = slots.subject.slice(0, idx);
+  const V = String(slots.value || "").trim();
+  if (!V || V.length > 20) return null;
+  const eraClaim = /(時代|当時|戦前|戦後)/.test(slots.subject);
+  for (const r of results) {
+    const base = r13TitleBase(r.title);
+    const nX = normalizeJa(Xfull);
+    const anchoredToX =
+      base.length >= 2 &&
+      (base.includes(nX) || nX.includes(base) ||
+        base.includes(normalizeJa(X)) || normalizeJa(X).includes(base));
+    if (!anchoredToX) continue;
+    const escV = V.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // 結びつきは「型」で見る：節内に属性と値が共起するだけでは不十分
+    // （「Yは名目上はXの首都でありながら」のような、
+    // 限定つき・譲歩の形まで拾ってしまうため。フェーズ3の CB34
+    // pass-1 誤反転で確認）。認める形は同順（属性はV／属性はVに
+    // 置かれた）と入替（Vは…の属性です／である／でした）だけ。
+    const bindForms = [
+      new RegExp(attr + "は「?" + escV + "」?(?:です|である|でした|だった|に置かれ|に置く|とされ)"),
+      new RegExp(attr + "は「?" + escV + "」?に"),
+      new RegExp(escV + "は[^、。]{0,24}?の" + attr + "(?:です|である|でした|だった)"),
+      new RegExp(escV + "が[^、。]{0,24}?の" + attr + "(?:です|である|でした|だった)"),
+    ];
+    for (const s of r13SentencesOf(r)) {
+      if (!r13EvidenceClean(s)) continue;
+      for (const clause of s.split(/[、；;]/)) {
+        if (!clause.includes(attr) || !clause.includes(V)) continue;
+        if (clause.includes("名目上")) continue; // 限定つきの帰属は無限定の主張を裏づけない
+        if (eraClaim && /(現在|今では|再統一後|統一後)/.test(clause)) continue;
+        // 時代の主張は、証拠の節にも過去・時代の印が要る（現在の
+        // 首都の文で過去の主張を裏づけない。A13-I3）。
+        if (
+          eraClaim &&
+          !/(当時|時代|かつて|であった|でした|だった|置かれた|まで|以前)/.test(clause)
+        ) {
+          continue;
+        }
+        if (!bindForms.some((re) => re.test(clause))) continue;
+        // 同じ節の競合値： 「属性は○○」の○○が V でないものがあれば不可
+        const cand = clause.match(
+          new RegExp(attr + "は「?([^、。]{1,15}?)」?(?:です|である|でした|だった|に置かれ|に置く|と|、|。|$)"),
+        );
+        if (cand && cand[1].trim() !== V && !cand[1].includes(V) && !V.includes(cand[1].trim())) {
+          continue;
+        }
+        return { result: r, window: s, slots: { X: Xfull, attr, value: V } };
+      }
+    }
+  }
+  return null;
+}
+
+/* ---------- R13-5：質問スロット補完（順序） ----------
+ * 人物1語＋順序の答え（「（人名）が2人目です」の形）は、既存の値抽出
+ * （は…です形）に届かない。質問の順序スロット N と答えの値を分離し、
+ * 証拠側は「出来事＋順序＋人物が同じ文で結ばれている」場合に限る。
+ * 順序の証拠は (i) 明示の順序語、(ii) N=2 の場合のみ「最初の人物Xに
+ * Yが続いた」という継承形（X≠Y を確認する）。 */
+const R13_ORD_KANJI = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+function r13OrdNum(tok) {
+  if (/^\d+$/.test(tok)) return Number(tok);
+  if (tok === "十") return 10;
+  if (tok.length === 2 && tok[0] === "十") return 10 + (R13_ORD_KANJI[tok[1]] || 0);
+  return R13_ORD_KANJI[tok] || null;
+}
+function r13OrdForms(n) {
+  const kanji = Object.keys(R13_ORD_KANJI).find((k) => R13_ORD_KANJI[k] === n);
+  return [`${n}番目`, `${n}人目`, `第${n}`, kanji ? `${kanji}番目` : null, kanji ? `第${kanji}` : null].filter(Boolean);
+}
+function r13Slot(sentence, question, results) {
+  const ordM = (question + " " + sentence).match(
+    /(?:第)?([0-9０-９]+|[一二三四五六七八九十]+)(?:番目|人目)/,
+  );
+  if (!ordM) return null;
+  const nTok = ordM[1].replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0));
+  const N = r13OrdNum(nTok);
+  if (!N || N < 2 || N > 10) return null;
+  let V = null;
+  const headM = sentence.match(/^(.+?)が(?:第)?(?:[0-9０-９]+|[一二三四五六七八九十]+)(?:人目|番目)/);
+  if (headM) V = headM[1].trim();
+  if (!V) {
+    const slots = r13ClaimSlots(sentence);
+    if (slots && slots.value && !/(番目|人目)/.test(slots.value)) V = slots.value.trim();
+  }
+  if (!V || V.length > 20) return null;
+  const evTerms = keyTerms(normalizeJa(question)).filter((t) => t.length >= 2);
+  // 出来事の手がかりが質問に無い場合は補完しない（A13-E3）。出来事の
+  // 動詞（「降り立った」の語幹）が取れる場合は、証拠文にもその動詞が
+  // 要る（順序が別の出来事についてのものは裏づけにしない。A13-E2）。
+  const evVerb = question.match(/([一-龯][一-龯ァ-ヶー]*?)った/)?.[1] || null;
+  if (evTerms.length === 0 && !evVerb) return null;
+  for (const r of results) {
+    for (const s of r13SentencesOf(r)) {
+      if (!r13EvidenceClean(s)) continue;
+      if (!s.includes(V)) continue;
+      if (evVerb && !s.includes(evVerb)) continue;
+      if (evTerms.length > 0 && !evTerms.some((t) => s.includes(t))) continue;
+      // (i) 明示の順序語が値と同じ文にある
+      if (r13OrdForms(N).some((f) => s.includes(f))) {
+        return { result: r, window: s, slots: { ordinal: N, value: V, form: "explicit" } };
+      }
+      // (ii) 継承形（N=2 のみ）：最初の人物（≠V）に V が続いた
+      if (N === 2 && /(最初|1番目|第一)/.test(s)) {
+        const firstM = s.match(/([ァ-ヶー一-龯々]{2,12}?)(?:は|が)[^。]{0,50}?(?:最初|1番目|第一)/);
+        const firstName = firstM?.[1] || null;
+        if (firstName && firstName !== V && !V.includes(firstName) && !firstName.includes(V)) {
+          const vi = s.indexOf(V);
+          const tail = s.slice(vi, vi + 30);
+          if (/(続いた|に続い|次に|その後|続いて)/.test(tail)) {
+            return { result: r, window: s, slots: { ordinal: N, value: V, form: "successor", first: firstName } };
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/* ---------- R13-6：時間範囲の型付き比較 ----------
+ * 季節・月の範囲（「秋から冬」）は範囲として比較する。端点の実質
+ * 変更（初冬↔冬など）は同一視しない。証拠文には端点が順序どおり
+ * そろい、主張の対象（主語の構成要素）も同じ文に要る。 */
+function r13Range(sentence, question, results) {
+  let a = null, b = null, kind = null;
+  let m = sentence.match(/([春夏秋冬])(?:から|〜|~|ー|－|-)([春夏秋冬])/);
+  if (m) { a = m[1]; b = m[2]; kind = "season"; }
+  if (!a) {
+    m = sentence.match(/(\d{1,2})月(?:から|〜|~|ー|－|-)(\d{1,2})月/);
+    if (m) { a = m[1] + "月"; b = m[2] + "月"; kind = "month"; }
+  }
+  if (!a) return null;
+  const slots = r13ClaimSlots(sentence);
+  const subjParts = slots
+    ? slots.subject.split("の").filter((p) => p.length >= 2)
+    : [];
+  for (const r of results) {
+    for (const s of r13SentencesOf(r)) {
+      if (!r13EvidenceClean(s)) continue;
+      const ia = s.indexOf(a);
+      const ib = s.indexOf(b, ia + a.length);
+      if (ia < 0 || ib < 0) continue;
+      const between = s.slice(ia + a.length, ib);
+      if (between.length > 5 || !/(から|〜|~|ー|－|-|・)/.test(between)) continue;
+      if (subjParts.length > 0 && !subjParts.some((p) => s.includes(p))) continue;
+      return { result: r, window: s, slots: { range: [a, b], kind } };
+    }
+  }
+  return null;
+}
+
+/* ---------- R13-7：否定対比 ----------
+ * N1 対比形「XではなくY」：証拠側に Y の出来事と X の出来事の年次が
+ * あり Y が先行すること、または X の明示否定がある場合に限る。
+ * N2 否定命題「AはBではない」：証拠側に「Bの頭名詞が設定されて
+ * いない」型の文がある場合に限る。 */
+function r13Neg(sentence, question, results) {
+  const objTerms = keyTerms(normalizeJa(question)).filter((t) => t.length >= 2);
+  // N1
+  const m1 = sentence.match(/(.+?)ではなく、?(.+?)(?:です|である|だ|でした|だった)[。]?$/);
+  if (m1) {
+    const negName = m1[1].split(/のは|は|が|を/).pop().trim();
+    const Y = m1[2].trim();
+    if (negName && Y && negName.length <= 15 && Y.length <= 15) {
+      const yearOf = (s) => {
+        const ym = s.match(/(1[5-9]\d\d|20\d\d)年/);
+        return ym ? Number(ym[1]) : null;
+      };
+      const objHit = (s) =>
+        objTerms.some((t) => s.includes(t) || (t.length >= 3 && s.includes(t.slice(-2))));
+      for (const r of results) {
+        let yWin = null, yYear = null, xYear = null, xDenied = false;
+        for (const s of r13SentencesOf(r)) {
+          if (s.includes(Y) && objHit(s)) {
+            const y = yearOf(s);
+            if (y !== null) { yWin = s; yYear = y; }
+            else if (!yWin) yWin = s;
+          }
+          if (s.includes(negName)) {
+            const y = yearOf(s);
+            if (y !== null && objHit(s)) xYear = y;
+            if (/(ではない|ではなかった|ではありません)/.test(s)) xDenied = true;
+          }
+        }
+        if (yWin && ((yYear !== null && xYear !== null && yYear < xYear) || xDenied)) {
+          return {
+            result: r, window: yWin,
+            slots: { negated: negName, value: Y, yYear, xYear, form: "contrast" },
+          };
+        }
+      }
+    }
+  }
+  // N2
+  const m2 = sentence.match(/^(.+?)は(.+?)(?:ではありません|ではない|じゃありません|じゃありませんでした)[。]?$/);
+  if (m2) {
+    const A = m2[1].replace(/^「|」$/g, "").trim();
+    const B = m2[2].replace(/^[、,]/, "").trim();
+    const head = B.split("の").pop();
+    const context = B.split("の")[0];
+    if (head && head.length >= 2) {
+      const negPats = [
+        `${head}を設定していない`, `${head}を付けていない`, `${head}を与えられていない`,
+        `${head}を名付けられていない`, `${head}はない`, `${head}は無い`,
+        `${head}を持たない`, `${head}が設定されていない`, `${head}は設定されていない`,
+      ];
+      for (const r of results) {
+        for (const s of r13SentencesOf(r)) {
+          if (!negPats.some((p) => s.includes(p))) continue;
+          if (!(s.includes(context) || s.includes(A))) continue;
+          return {
+            result: r, window: s,
+            slots: { subject: A, negatedProp: B, form: "negprop" },
+          };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/* ---------- R13-7：尺度正規化 ----------
+ * 定義質問の尺度主張（「Sが高いことによってTと感じる傾向」）は、
+ * 主張語の断片化で窓照合が成立しない。尺度名 S・方向（高／低）・
+ * 傾向先 T をスロット化し、証拠文に同じ3点がそろう場合に限る。 */
+function r13Scale(sentence, question, results) {
+  const m = sentence.match(/(?:^|[、。])([^、。]{2,14}?)が(高い|高ければ|低|低い|低ければ|大きい|多い)/);
+  if (!m) return null;
+  const S = m[1].replace(/^.*とは、?/, "").trim();
+  const dirHigh = /高|大きい|多い/.test(m[2]);
+  const qT = question.match(/「(.+?)」/)?.[1] || null;
+  const T = qT;
+  if (!S || !T) return null;
+  const stem = T.replace(/口$/, "");
+  if (!(sentence.includes(T) || (stem && sentence.includes(stem + "く")))) return null;
+  for (const r of results) {
+    for (const s of r13SentencesOf(r)) {
+      if (!r13EvidenceClean(s)) continue;
+      if (!s.includes(S) || !s.includes(T)) continue;
+      if (dirHigh && !/(高い|高ければ|ほど)/.test(s)) continue;
+      if (!dirHigh && !/(低い|低ければ)/.test(s)) continue;
+      return { result: r, window: s, slots: { scale: S, direction: dirHigh ? "high" : "low", tendency: T } };
+    }
+  }
+  return null;
+}
+
+/* ---------- R13-2：原子主張への分解＋原子単位の窓 ----------
+ * 分解は2型だけ（同格：値が「AのB」なら原子「BはAです」を作る／
+ * 並列：「SはP1で、P2です」を節ごとに分ける）。原子の主張語の和集合が
+ * 元の文の主張語を覆えない場合は分解を使わない（現行へフォールバック）。
+ * 原子の検証は既存機構（窓照合＋結合チェック）を原子単位で使う。 */
+/* 同格の入替「BはAです」が意味を保つのは、B が固有名詞的な頭名詞で、
+ * A が所属・役割などの修飾である場合だけ（「○○食品創業者の△△」
+ * →「△△は○○食品創業者です」の形）。B が関係名詞（名前・意味・理由
+ * など）の場合は意味が反転するため原子を作らない（フェーズ3で
+ * CB30 pass-1 の誤反転から追加した安全条件）。 */
+const R13_RELATIONAL_NOUNS = new Set([
+  "名前", "意味", "理由", "場合", "ため", "こと", "もの", "ところ",
+  "はず", "つもり", "とき", "方", "日", "年", "月", "回", "番", "位",
+  "号", "人", "者", "達", "等", "点", "面", "側",
+]);
+function r13Decompose(sentence) {
+  const atoms = [];
+  const slots = r13ClaimSlots(sentence);
+  if (slots && slots.value) {
+    const vi = slots.value.lastIndexOf("の");
+    if (vi >= 2) {
+      const A = slots.value.slice(0, vi);
+      const B = slots.value.slice(vi + 1);
+      const bOk =
+        B.length >= 3 &&
+        !R13_RELATIONAL_NOUNS.has(B) &&
+        /^[一-龯ァ-ヶー]+$/.test(B);
+      const aOk = A.length >= 3 || /(者|家|員|長|社|校|店|団|会)$/.test(A);
+      if (aOk && bOk) atoms.push(`${B}は${A}です。`);
+    }
+  }
+  const pm = sentence.match(/^(.+?は)(.+?)で、(.+?)(?:です|である)[。]?$/);
+  if (pm) {
+    atoms.push(`${pm[1]}${pm[2]}です。`);
+    atoms.push(`${pm[1]}${pm[3]}です。`);
+  }
+  return atoms;
+}
+function r13Atom(sentence, question, results, ctx) {
+  const atoms = r13Decompose(sentence);
+  if (atoms.length === 0) return null;
+  const stripNo = (t) => String(t).replace(/の/g, "");
+  const orig = new Set(gateContentTerms(sentence, question).map(stripNo));
+  if (orig.size === 0) return null;
+  const covered = new Set();
+  for (const a of atoms) {
+    for (const t of gateContentTerms(a, question)) covered.add(stripNo(t));
+  }
+  for (const t of orig) if (!covered.has(t)) return null; // 覆えない→使わない
+  const qKind = classifyQuestion(question);
+  // 対象同一性：全ての原子が「同じ1本の記事」で裏づけられる場合だけ
+  // 成立させる（同名別対象の記事からの寄せ集めを防ぐ。A13-A3）。
+  for (const r of results) {
+    let allOk = true;
+    for (const atom of atoms) {
+      const aKind = answerClaimKind(atom);
+      if (
+        ["person", "author", "hq", "operator", "attribute"].includes(qKind) &&
+        aKind && aKind !== qKind
+      ) {
+        allOk = false;
+        break;
+      }
+      const content = gateContentTerms(atom, question);
+      const useContent = content.length ? content : effectiveContentTerms(atom, question);
+      if (useContent.length === 0) { allOk = false; break; }
+      if (!resultSupportsAnswer(r, atom, useContent)) { allOk = false; break; }
+      if (!windowClaimBindingOk(atom, question, r, ctx)) { allOk = false; break; }
+    }
+    if (allOk) {
+      return { result: r, window: "", slots: { atoms } };
+    }
+  }
+  return null;
+}
+
+/* ---------- 型付き経路の入口（verifySentence の fall-through） ---------- */
+function verifyTypedClaim13(sentence, question, ctx, contextResults) {
+  const pool = (contextResults || ctx?.results || []).filter(
+    (r) => isUsableEvidenceResult(r) && anchored13(r, question, sentence),
+  );
+  if (pool.length === 0) return null;
+  const tries = [];
+  if (R13_FLAGS.loc) tries.push(["R13-1", r13Loc]);
+  if (R13_FLAGS.swap) tries.push(["R13-4", r13Swap]);
+  if (R13_FLAGS.slot) tries.push(["R13-5", r13Slot]);
+  if (R13_FLAGS.range) tries.push(["R13-6", r13Range]);
+  if (R13_FLAGS.neg) tries.push(["R13-7", r13Neg]);
+  if (R13_FLAGS.scale) tries.push(["R13-7", r13Scale]);
+  for (const [ruleId, fn] of tries) {
+    const hit = fn(sentence, question, pool, ctx);
+    if (hit) {
+      r13Audit(ruleId, hit.result, hit.window, hit.slots);
+      return { source: hit.result, via: "typed13:" + ruleId };
+    }
+  }
+  if (R13_FLAGS.atom) {
+    const hit = r13Atom(sentence, question, pool, ctx);
+    if (hit) {
+      r13Audit("R13-2", hit.result, hit.window, hit.slots);
+      return { source: hit.result, via: "typed13:R13-2" };
+    }
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -9113,6 +9719,10 @@ function verifySentence(sentence, question, ctx) {
     const dsrc = definitionSentenceSource(sentence, results, question);
     if (dsrc) return { source: dsrc, via: "definition" };
   }
+  // 階段13：型付き経路（物差しの型付き照合）。既存経路が全て落ちた
+  // 文だけが対象で、採用条件（裏づけ all のみ）は従来どおり。
+  const typed13 = verifyTypedClaim13(sentence, question, ctx, results);
+  if (typed13) return typed13;
   return null;
 }
 
@@ -21557,6 +22167,7 @@ if (typeof module !== "undefined" && module.exports) {
     formatTimestampLabel, formatDistanceLabel,
     factSourceRelatedToEntity,
     verifyModelAnswer, splitForGate, verifySentence,
+    R13_VERSION, R13_FLAGS, R13_AUDIT, verifyTypedClaim13, anchored13, anchoredForCorroboration13,
     factIsContested, entityNotFound, scopeToSubject, subjectOf,
     sanitizeFact, questionContextTerms, contextSatisfiedByText,
     isClaimSentence, isDegenerateAnswer, placeAnswerMissesFactValue,
