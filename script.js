@@ -5766,6 +5766,9 @@ const HOLIDAY_TIMEOUT_MS = 15000;
 const MARKET_TIMEOUT_MS = 15000;
 const MUSIC_TIMEOUT_MS = 15000;
 const PAPERS_TIMEOUT_MS = 30000;
+const BOOKS_TIMEOUT_MS = 45000;
+const ANIME_TIMEOUT_MS = 30000;
+const STATS_TIMEOUT_MS = 45000;
 const TRANSLATE_TIMEOUT_MS = 30000;
 const WOLFRAM_TIMEOUT_MS = 90000;
 
@@ -6591,6 +6594,472 @@ function paperCardOf(r) {
     summary: r.summary,
     link: r.url,
     source: r.source,
+  };
+}
+
+/* ---- 本の検索レーン（cube-server の /books、NDLサーチ＋openBD） ---- */
+/* 発動条件の正本はサーバー側 books_endpoint.js の matchBooksLane。
+   ここはその移植で、本の書誌情報（タイトル・著者・出版社・
+   発売日・ISBN）の意図が明示的な質問だけを拾う。基本形は本人の
+   決定（2026-11-27）：タイトル・著者は NDLサーチで特定し、
+   ISBN が分かれば openBD で詳細を取る。結果は結果として出す
+   （書誌データの転記で、文章は作らない）。NDL の利用条件で
+   クレジット表示が必須——サーバーが返す credit を注記に必ず
+   含める。結果は変わる情報なので知識メモ帳には保存しない。 */
+
+/* テキストから ISBN を抜く（サーバー側 extractIsbn と同一）。 */
+function extractIsbnFromText(text) {
+  const s = String(text || "");
+  const runs = s.match(/[0-9][0-9\-\s]{8,20}[0-9Xx]/g) || [];
+  for (const run of runs) {
+    const bare = run.replace(/[-\s]/g, "").toUpperCase();
+    if (/^97[89]\d{10}$/.test(bare)) return bare;
+    if (/^\d{9}[\dX]$/.test(bare)) return bare;
+  }
+  const m = s.replace(/[-\s]/g, "").toUpperCase()
+    .match(/97[89]\d{10}|\d{9}[\dX]/);
+  return m ? m[0] : "";
+}
+
+const BOOK_FILLER_PATTERNS = [
+  /に関する(本|書籍|小説|マンガ|漫画)/g,
+  /(の|に)(関する|ついての?)/g,
+  /(本|書籍|小説)を?(探して|検索して|教えて|知りたい|見せて|紹介して|ありますか|ある\?|ある？)/g,
+  /(教えて|知りたい|探して|検索して|紹介して|見せて|ありますか|あります|ください|誰ですか|誰\?|誰？|いつですか|いつ\?|いつ？)/g,
+  /[？?！!。、\s]+/g,
+];
+
+/* 書誌の検索語を取り出す（サーバー側 extractBookTerms と同一）。 */
+function extractBookTerms(text) {
+  const raw = String(text || "");
+  let title = "";
+  let author = "";
+  const qm = raw.match(/『([^』]{1,80})』/);
+  if (qm) {
+    title = qm[1].trim();
+    const before = raw.slice(0, qm.index).replace(/の$/, "").trim();
+    const am = before.match(/([^\s、。の]{2,20})$/);
+    if (am && /(の|著|作)/.test(raw.slice(0, qm.index + 1))) author = am[1];
+  }
+  let t = raw;
+  for (const re of BOOK_FILLER_PATTERNS) t = t.replace(re, " ");
+  t = t.replace(/『[^』]*』/g, " ");
+  t = t.replace(/書名|著者|作者|出版社|発売日|出版日|単行本|文庫本|文庫|新書|本|書籍|小説/g, " ");
+  const tokens = t.split(/\s+/).map((tok) =>
+    tok.replace(/^[をがはのにでへとも、。]+/, "")
+      .replace(/[をがはのにでへとも、。]+$/, ""),
+  ).filter(Boolean);
+  return { title, author, terms: tokens.join(" ").slice(0, 120) };
+}
+
+/**
+ * 本の質問かどうか。書誌の意図が明示的なときだけ発火し、
+ * { query, mode（"isbn"|"search"）, isbn, title, author, terms }
+ * を返す（サーバー側 matchBooksLane の移植）。
+ */
+function parseBooksQuery(question) {
+  const raw = String(question || "").trim();
+  if (!raw) return null;
+  const isbn = extractIsbnFromText(raw);
+  const hasHard = Boolean(isbn) || /ISBN|書名|出版社|発売日|出版日|単行本/i.test(raw);
+  if (/(声優|アニメ化|放送開始)/.test(raw) && !hasHard) return null;
+  if (isbn) return { query: raw, mode: "isbn", isbn, title: "", author: "", terms: "" };
+  const hasStrong = hasHard ||
+    /『[^』]+』/.test(raw) ||
+    /(著者|作者|を書いた|書いた人|書いたのは)/.test(raw) ||
+    /(この本|その本|あの本|本の(タイトル|名前|題名)|何という本|っていう本|という本)/.test(raw);
+  if (/(本屋|本店|本館|本部|本社|本当|本日|本名|本線|本州)/.test(raw) && !hasStrong) {
+    return null;
+  }
+  let fire = false;
+  if (/『[^』]+』/.test(raw) &&
+      /(本|小説|マンガ|漫画|著者|作者|書いた|発売|出版|いつ出|何年)/.test(raw)) fire = true;
+  if (/(書名|出版社|発売日|出版日|単行本)/.test(raw)) fire = true;
+  if (/(著者|作者)/.test(raw) && /(本|小説|『|』|書いた)/.test(raw)) fire = true;
+  if (/(この本|その本|あの本|何という本|っていう本|という本)/.test(raw)) fire = true;
+  if (/を書いた(人|方|のは)/.test(raw)) fire = true;
+  if (/(本|書籍)を(探し|検索|教え)/.test(raw)) fire = true;
+  if (!fire) return null;
+  return { query: raw, mode: "search", isbn: "", ...extractBookTerms(raw) };
+}
+
+/* /books に投げ、検証済みの形に整えて返す。 */
+async function fetchBooks(query) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/books`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      },
+      BOOKS_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  const results = [];
+  for (const r of Array.isArray(data.results) ? data.results : []) {
+    if (!r || typeof r.title !== "string" || !r.title) continue;
+    results.push({
+      title: r.title,
+      author: typeof r.author === "string" ? r.author : "",
+      publisher: typeof r.publisher === "string" ? r.publisher : "",
+      pubdate: typeof r.pubdate === "string" ? r.pubdate : "",
+      price: typeof r.price === "string" ? r.price : "",
+      isbn: typeof r.isbn === "string" ? r.isbn : "",
+      description: typeof r.description === "string" ? r.description : "",
+      cover: httpUrlOrEmpty(typeof r.cover === "string" ? r.cover : ""),
+      link: httpUrlOrEmpty(typeof r.link === "string" ? r.link : ""),
+      sources: (Array.isArray(r.sources) ? r.sources : [])
+        .filter((s) => typeof s === "string" && s),
+    });
+  }
+  if (!results.length) return null;
+  return {
+    ok: true,
+    mode: typeof data.mode === "string" ? data.mode : "",
+    results,
+    source: typeof data.source === "string" ? data.source : "",
+    credit: typeof data.credit === "string" ? data.credit : "",
+    fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+  };
+}
+
+/* 本1件を表示用カードにする。 */
+function bookCardOf(r) {
+  return {
+    kind: "book",
+    title: r.title,
+    author: r.author,
+    publisher: r.publisher,
+    pubdate: r.pubdate,
+    price: r.price,
+    isbn: r.isbn,
+    description: r.description,
+    cover: r.cover,
+    link: r.link,
+    sources: r.sources,
+  };
+}
+
+/* ---- アニメ・マンガレーン（cube-server の /anime、AniList） ---- */
+/* 発動条件の正本はサーバー側 anime_endpoint.js の matchAnimeLane。
+   ここはその移植で、アニメ・マンガの意図が明示的な質問だけを
+   拾う。作品情報・放送時期・スコア・話数・制作スタジオ・主な
+   登場人物と声優を AniList の値のまま転記する（文章は作ら
+   ない）。結果は変わる情報なので知識メモ帳には保存しない。 */
+
+const ANIME_SEASONS = ["WINTER", "SPRING", "SUMMER", "FALL"];
+
+function animeSeasonOf(date, offset) {
+  const d = new Date(date.getTime());
+  d.setMonth(d.getMonth() + 3 * (offset || 0));
+  return { season: ANIME_SEASONS[Math.floor(d.getMonth() / 3)], year: d.getFullYear() };
+}
+
+const ANIME_FILLER_PATTERNS = [
+  /(の|に)(関する|ついての?)/g,
+  /(アニメ|マンガ|漫画)を?(探して|検索して|教えて|知りたい|見せて|紹介して|ありますか|ある\?|ある？)/g,
+  /(の声優|の声の人|の制作会社|のスタジオ|の放送|のスコア|の評価|の話数|は何話|はいつから|はいつ放送)/g,
+  /(教えて|知りたい|探して|検索して|紹介して|見せて|ありますか|あります|ください|誰ですか|誰\?|誰？|いつですか|いつ\?|いつ？)/g,
+  /[？?！!。、\s]+/g,
+];
+
+function extractAnimeTerms(text) {
+  const raw = String(text || "");
+  const qm = raw.match(/『([^』]{1,80})』/) || raw.match(/「([^」]{1,80})」/);
+  if (qm) return qm[1].trim();
+  let t = raw;
+  for (const re of ANIME_FILLER_PATTERNS) t = t.replace(re, " ");
+  t = t.replace(/アニメ|マンガ|漫画|声優|放送|今期|来期/g, " ");
+  const tokens = t.split(/\s+/).map((tok) =>
+    tok.replace(/^[をがはのにでへとも、。]+/, "")
+      .replace(/[をがはのにでへとも、。]+$/, ""),
+  ).filter(Boolean);
+  return tokens.join(" ").slice(0, 120);
+}
+
+/**
+ * アニメ・マンガの質問かどうか。意図が明示的なときだけ発火し、
+ * { query, mode（"search"|"season"）, seasonLabel, terms } を
+ * 返す（サーバー側 matchAnimeLane の移植）。
+ */
+function parseAnimeQuery(question) {
+  const raw = String(question || "").trim();
+  if (!raw) return null;
+  if (/アニメイト/.test(raw)) return null;
+  if (/(はどこ|への行き方|までの道|の場所|の住所)/.test(raw) &&
+      !/(アニメ|マンガ|漫画|声優|制作会社|制作スタジオ)/.test(raw)) {
+    return null;
+  }
+  const isManga = /(マンガ|漫画)/.test(raw);
+  if (/(今期|来期|今シーズン|来シーズン|今クール|来クール)/.test(raw) &&
+      /アニメ/.test(raw)) {
+    const next = /(来期|来シーズン|来クール)/.test(raw);
+    const { season, year } = animeSeasonOf(new Date(), next ? 1 : 0);
+    const labels = { WINTER: "冬", SPRING: "春", SUMMER: "夏", FALL: "秋" };
+    return {
+      query: raw, mode: "season",
+      seasonLabel: `${year}年${labels[season]}アニメ`, terms: "",
+    };
+  }
+  let fire = false;
+  if (/(声優|放送開始|制作会社|制作スタジオ|アニメ化)/.test(raw)) fire = true;
+  if (/アニメ/.test(raw) && /(教えて|知りたい|探して|検索|紹介|見せて|おすすめ|一覧|人気|評価|スコア|何話|いつ|誰|どの)/.test(raw)) fire = true;
+  if (/(マンガ|漫画)/.test(raw) && /(教えて|知りたい|探して|検索|紹介|見せて|おすすめ|一覧|人気|評価|いつ|誰|どの|アニメ)/.test(raw)) fire = true;
+  if (/anilist/i.test(raw)) fire = true;
+  if (!fire) return null;
+  return {
+    query: raw, mode: "search",
+    seasonLabel: "", terms: extractAnimeTerms(raw),
+  };
+}
+
+/* /anime に投げ、検証済みの形に整えて返す。 */
+async function fetchAnime(query) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/anime`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      },
+      ANIME_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  const results = [];
+  for (const r of Array.isArray(data.results) ? data.results : []) {
+    if (!r || typeof r !== "object") continue;
+    const titleNative = typeof r.titleNative === "string" ? r.titleNative : "";
+    const titleRomaji = typeof r.titleRomaji === "string" ? r.titleRomaji : "";
+    if (!titleNative && !titleRomaji) continue;
+    results.push({
+      titleNative,
+      titleRomaji,
+      titleEnglish: typeof r.titleEnglish === "string" ? r.titleEnglish : "",
+      format: typeof r.format === "string" ? r.format : "",
+      status: typeof r.status === "string" ? r.status : "",
+      seasonYear: typeof r.seasonYear === "number" ? r.seasonYear : null,
+      season: typeof r.season === "string" ? r.season : "",
+      score: typeof r.score === "number" ? r.score : null,
+      episodes: typeof r.episodes === "number" ? r.episodes : null,
+      studio: typeof r.studio === "string" ? r.studio : "",
+      genres: (Array.isArray(r.genres) ? r.genres : [])
+        .filter((g) => typeof g === "string" && g),
+      characters: (Array.isArray(r.characters) ? r.characters : [])
+        .filter((c) => c && typeof c.name === "string" && c.name)
+        .map((c) => ({
+          name: c.name,
+          voiceActor: typeof c.voiceActor === "string" ? c.voiceActor : "",
+        })),
+      url: httpUrlOrEmpty(typeof r.url === "string" ? r.url : ""),
+    });
+  }
+  if (!results.length) return null;
+  return {
+    ok: true,
+    mode: typeof data.mode === "string" ? data.mode : "",
+    seasonLabel: typeof data.seasonLabel === "string" ? data.seasonLabel : "",
+    results,
+    source: typeof data.source === "string" ? data.source : "AniList",
+    fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+  };
+}
+
+/* アニメ・マンガ1件を表示用カードにする。 */
+function animeCardOf(r) {
+  return {
+    kind: "anime",
+    titleNative: r.titleNative,
+    titleRomaji: r.titleRomaji,
+    format: r.format,
+    status: r.status,
+    seasonYear: r.seasonYear,
+    season: r.season,
+    score: r.score,
+    episodes: r.episodes,
+    studio: r.studio,
+    genres: r.genres,
+    characters: r.characters,
+    url: r.url,
+  };
+}
+
+/* ---- 政府統計レーン（cube-server の /stats、e-Stat） ---- */
+/* 発動条件の正本はサーバー側 estat_endpoint.js の matchStatsLane。
+   ここはその移植。政府統計（国勢調査・労働力調査・消費者物価
+   など）の一次データを出典つきで出すレーンで、数値は API の
+   値を転記するだけ（文章も数値も作らない）。e-Stat の利用規約
+   でクレジット（定型文）の表示が必須——サーバーが返す credit
+   を注記に必ず含める。サーバー側が未設定（not_configured）の
+   間は発火しても従来の手順に倒し、レーンは純粋な追加として
+   振る舞う。結果は変わる情報なので知識メモ帳には保存しない。 */
+
+const STATS_TERMS_RE =
+  /(人口|世帯数|世帯|失業率|完全失業率|就業者数|雇用|消費者物価|物価指数|平均寿命|出生率|合計特殊出生率|死亡率|婚姻率|離婚率|国内総生産|GDP|国勢調査|労働力調査|家計調査|統計|e-?stat)/i;
+
+const STATS_FILLER_PATTERNS = [
+  /(の|に)(関する|ついての?)/g,
+  /(教えて|知りたい|探して|検索して|紹介して|見せて|ありますか|あります|ください|いくつですか|何人ですか|何人\?|何人？|どれくらいですか)/g,
+  /[？?！!。、\s]+/g,
+];
+
+const STATS_STOPWORD_RE = /最新|現在|最近|推移|今年|昨年|去年|前年/g;
+
+function extractStatsKeyword(text) {
+  let t = String(text || "");
+  for (const re of STATS_FILLER_PATTERNS) t = t.replace(re, " ");
+  t = t.replace(STATS_STOPWORD_RE, " ");
+  const tokens = t.split(/\s+/).map((tok) =>
+    tok.replace(/^[をがはのにでへとも、。]+/, "")
+      .replace(/[をがはのにでへとも、。]+$/, ""),
+  ).filter(Boolean);
+  return tokens.join(" ").slice(0, 100);
+}
+
+/**
+ * 政府統計の質問かどうか。統計の意図が明示的なときだけ発火し、
+ * { query, keyword } を返す（サーバー側 matchStatsLane の移植）。
+ */
+function parseStatsQuery(question) {
+  const raw = String(question || "").trim();
+  if (!raw) return null;
+  if (/(翻訳|英訳|和訳)して/.test(raw)) return null;
+  if (/論文|arxiv|学術/i.test(raw)) return null;
+  if (!STATS_TERMS_RE.test(raw)) return null;
+  const explicit = /(統計|国勢調査|労働力調査|家計調査|e-?stat)/i.test(raw);
+  const questionShape =
+    /(何人|何%|何％|何世帯|いくつ|どれくらい|何歳|平均|率|数|最新|現在|増えた|減った|推移|ですか|ますか|教えて|知りたい)/.test(raw) ||
+    /[？?]\s*$/.test(raw);
+  if (!explicit && !questionShape) return null;
+  return { query: raw, keyword: extractStatsKeyword(raw) };
+}
+
+/* /stats に投げ（統計表の一覧）、検証済みの形に整えて返す。 */
+async function fetchStatsList(query) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/stats`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      },
+      STATS_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  const results = [];
+  for (const r of Array.isArray(data.results) ? data.results : []) {
+    if (!r || typeof r !== "object") continue;
+    results.push({
+      statsDataId: typeof r.statsDataId === "string" ? r.statsDataId : "",
+      statName: typeof r.statName === "string" ? r.statName : "",
+      title: typeof r.title === "string" ? r.title : "",
+      organization: typeof r.organization === "string" ? r.organization : "",
+      surveyDate: typeof r.surveyDate === "string" ? r.surveyDate : "",
+      updatedDate: typeof r.updatedDate === "string" ? r.updatedDate : "",
+    });
+  }
+  if (!results.length) return null;
+  return {
+    ok: true,
+    mode: typeof data.mode === "string" ? data.mode : "list",
+    results,
+    source: typeof data.source === "string" ? data.source : "",
+    credit: typeof data.credit === "string" ? data.credit : "",
+    fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+  };
+}
+
+/* /stats に統計表 ID で投げ、その表の値を整えて返す。 */
+async function fetchStatsData(statsDataId) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      `${CUBE_SERVER_BASE_URL}/stats`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ statsDataId }),
+      },
+      STATS_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+  const data = res ? await res.json().catch(() => null) : null;
+  if (!res || !res.ok || !data || typeof data.ok !== "boolean") return null;
+  if (!data.ok) {
+    return {
+      ok: false,
+      error: typeof data.error === "string" ? data.error : "",
+    };
+  }
+  const values = [];
+  for (const v of Array.isArray(data.values) ? data.values : []) {
+    if (!v || typeof v !== "object") continue;
+    values.push({
+      label: typeof v.label === "string" ? v.label : "",
+      value: typeof v.value === "string" ? v.value : "",
+      unit: typeof v.unit === "string" ? v.unit : "",
+    });
+  }
+  if (!values.length) return null;
+  return {
+    ok: true,
+    mode: "data",
+    statsDataId: typeof data.statsDataId === "string" ? data.statsDataId : statsDataId,
+    title: typeof data.title === "string" ? data.title : "",
+    values,
+    source: typeof data.source === "string" ? data.source : "",
+    credit: typeof data.credit === "string" ? data.credit : "",
+    fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : "",
+  };
+}
+
+/* 統計表1件を表示用カードにする。 */
+function statsCardOf(r) {
+  return {
+    kind: "stats",
+    statsDataId: r.statsDataId,
+    statName: r.statName,
+    title: r.title,
+    organization: r.organization,
+    surveyDate: r.surveyDate,
+    updatedDate: r.updatedDate,
   };
 }
 
@@ -10844,6 +11313,30 @@ function verifySentence(sentence, question, ctx) {
 }
 
 /**
+ * 文が数値を含む主張か（partial 保留の判定、2026-11-27）。
+ * 数字（半角・全角）は既存の numbersIn（半角化して拾う）で判定
+ * し、漢数字は桁（万・億・兆）か単位・助数詞を伴う数量だけを
+ * 数える（「一般的」「一番」「万一」のような非数量の用法は拾わ
+ * ない）。「十分」は数量ではないため、数字が前置されていない
+ * 場合だけ先に除いてから判定する（「三十分」は数量として残る）。
+ * 迷ったら数値ありに倒す（partial で出さない＝安全側）。
+ */
+function sentenceHasNumericClaim(sentence) {
+  const s = String(sentence ?? "");
+  if (numbersIn(s).length > 0) return true;
+  const t = s.replace(/(^|[^一二三四五六七八九])十分/g, "$1");
+  if (/[一二三四五六七八九十百千]+[万億兆]/.test(t)) return true;
+  if (
+    /[一二三四五六七八九十百千]+(年|月|日|時|分|秒|人|個|円|位|番目|割|点|歳|回|本|台|件|冊|匹|頭|枚|倍|度|時間|世紀|光年|メートル|キロ|センチ|ミリ|グラム|トン|リットル)/.test(
+      t,
+    )
+  )
+    return true;
+  if (/数[万億兆千百十]/.test(t)) return true;
+  return false;
+}
+
+/**
  * モデルの答え全体の検証ゲート。
  * 返り値：{ status, text, source, perSentence }
  * - status: "all" | "partial" | "none" | "abstain" | "nonclaim"
@@ -10888,6 +11381,8 @@ function verifyModelAnswer(modelAnswer, question, ctx) {
   let firstSource = null;
   let hasAbstention = false;
   const kept = [];
+  let keptClaimCount = 0;
+  let keptSource = null;
   for (const s of sentences) {
     if (isAbstentionSentence(s, question)) {
       hasAbstention = true;
@@ -10906,13 +11401,26 @@ function verifyModelAnswer(modelAnswer, question, ctx) {
     if (v) {
       verifiedCount += 1;
       if (!firstSource) firstSource = v.source;
+      // 数値文の partial 保留（2026-11-27、階段18の穴塞ぎ）：
+      // 数値を含む文は、文単位の照合を通っても partial の表示
+      // には入れない。文の照合は主張語の共起で通ることがあり、
+      // 数値そのものの裏づけを保証しない（階段19ステージング
+      // CB21：資料が約600万〜800万年と言う中で「約7万年前」の
+      // 文が partial で通った）。数値文は、答え全体が all に
+      // なったときだけ表示される。
+      const numeric = sentenceHasNumericClaim(s);
       perSentence.push({
         sentence: s,
         kind: "claim",
         verified: true,
         via: v.via,
+        ...(numeric ? { numericHeld: true } : {}),
       });
-      kept.push(s);
+      if (!numeric) {
+        kept.push(s);
+        keptClaimCount += 1;
+        if (!keptSource) keptSource = v.source;
+      }
     } else {
       perSentence.push({ sentence: s, kind: "claim", verified: false });
     }
@@ -10936,10 +11444,15 @@ function verifyModelAnswer(modelAnswer, question, ctx) {
       perSentence,
     };
   }
+  // 検証済みの主張が数値文だけのときは、partial で表示できる
+  // 文が無いため none とする（Web 照合・再生成など後段に委ねる）。
+  if (keptClaimCount === 0) {
+    return { status: "none", text: "", source: null, perSentence };
+  }
   return {
     status: "partial",
     text: kept.join(""),
-    source: firstSource,
+    source: keptSource ?? firstSource,
     perSentence,
   };
 }
@@ -17313,6 +17826,18 @@ const BADGES = {
     label: "計算の答え（Wolfram|Alpha）",
     className: "badge-wolfram",
   },
+  books: {
+    label: "本の情報（国立国会図書館サーチ / openBD）",
+    className: "badge-books",
+  },
+  anime: {
+    label: "アニメ・マンガの情報（AniList）",
+    className: "badge-anime",
+  },
+  stats: {
+    label: "政府統計の情報（e-Stat）",
+    className: "badge-stats",
+  },
   gmail: {
     label: "Gmail（Google連携で実行）",
     className: "badge-gmail",
@@ -18968,6 +19493,122 @@ const App = {
     return true;
   },
 
+  /* ---- 本の検索レーンの実行と表示 ---- */
+  async runBooksLane(parsed) {
+    this.setPhase("searching");
+    const data = await fetchBooks(parsed.query);
+    this.setPhase("idle");
+    if (!data) return false;
+    const topic = parsed.title || parsed.terms || parsed.query;
+    if (!data.ok) {
+      if (data.error === "not_found") {
+        this.pushAssistant({
+          text: `「${topic}」の本は見つかりませんでした。`,
+          badge: "books",
+          note: "タイトルや著者名を変えてもう一度聞いてください。",
+        });
+      } else {
+        this.pushAssistant({
+          text: "本の情報を取得できませんでした。",
+          badge: "books",
+          note: "時間をおいてもう一度試してください。",
+        });
+      }
+      return true;
+    }
+    let note = "";
+    if (data.credit) note += `${data.credit} `;
+    note += `出典：${data.source || "国立国会図書館サーチ（NDLサーチ）/ openBD"}。`;
+    if (data.fetchedAt) {
+      note += `（${jstDateTimeLabel(data.fetchedAt)}取得）`;
+    }
+    this.pushAssistant({
+      text: `「${topic}」の本を${data.results.length}件見つけました。`,
+      badge: "books",
+      cards: data.results.map(bookCardOf),
+      note,
+    });
+    return true;
+  },
+
+  /* ---- アニメ・マンガレーンの実行と表示 ---- */
+  async runAnimeLane(parsed) {
+    this.setPhase("searching");
+    const data = await fetchAnime(parsed.query);
+    this.setPhase("idle");
+    if (!data) return false;
+    const topic = parsed.mode === "season"
+      ? (data.seasonLabel || parsed.seasonLabel || "今期")
+      : (parsed.terms || parsed.query);
+    if (!data.ok) {
+      if (data.error === "not_found") {
+        this.pushAssistant({
+          text: `「${topic}」の作品は見つかりませんでした。`,
+          badge: "anime",
+          note: "作品名を変えてもう一度聞いてください。",
+        });
+      } else {
+        this.pushAssistant({
+          text: "アニメ・マンガの情報を取得できませんでした。",
+          badge: "anime",
+          note: "時間をおいてもう一度試してください。",
+        });
+      }
+      return true;
+    }
+    let note = `出典：${data.source || "AniList"}。`;
+    if (data.fetchedAt) {
+      note += `（${jstDateTimeLabel(data.fetchedAt)}取得）`;
+    }
+    this.pushAssistant({
+      text: parsed.mode === "season"
+        ? `${topic}の作品を${data.results.length}件見つけました。`
+        : `「${topic}」の作品を${data.results.length}件見つけました。`,
+      badge: "anime",
+      cards: data.results.map(animeCardOf),
+      note,
+    });
+    return true;
+  },
+
+  /* ---- 政府統計レーンの実行と表示 ----
+     純粋な追加レーン：未設定・見つからない・上流エラーのときは
+     何も出さず従来の手順に倒す（従来の答え方を一切変えない）。
+     取れたときだけ、統計表の一覧カードと、先頭の統計表の値を
+     ラベルつきで転記して出す。クレジット（定型文）は必須。 */
+  async runStatsLane(parsed) {
+    this.setPhase("searching");
+    const data = await fetchStatsList(parsed.query);
+    if (!data || !data.ok) {
+      this.setPhase("idle");
+      return false;
+    }
+    let valuesText = "";
+    const first = data.results[0];
+    if (first && first.statsDataId) {
+      const d = await fetchStatsData(first.statsDataId);
+      if (d && d.ok && d.values.length) {
+        const lines = d.values.slice(0, 10).map((v) =>
+          `・${v.label ? `${v.label}：` : ""}${v.value}${v.unit || ""}`);
+        valuesText = `\n\n先頭の統計表「${d.title || first.title}」の値：\n${lines.join("\n")}`;
+      }
+    }
+    this.setPhase("idle");
+    let note = "";
+    if (data.credit) note += `${data.credit} `;
+    note += `出典：${data.source || "e-Stat（政府統計総合窓口）"}。`;
+    if (data.fetchedAt) {
+      note += `（${jstDateTimeLabel(data.fetchedAt)}取得）`;
+    }
+    this.pushAssistant({
+      text: `政府統計で「${parsed.keyword || parsed.query}」に関する統計表を${data.results.length}件見つけました。${valuesText}`,
+      badge: "stats",
+      cards: data.results.map(statsCardOf),
+      note,
+    });
+    return true;
+  },
+
   /* ---- 翻訳レーンの実行と表示 ---- */
   async runTranslateLane(parsed) {
     this.setPhase("searching");
@@ -19957,6 +20598,12 @@ const App = {
         wrap.appendChild(this.buildMusicCard(card));
       } else if (card.kind === "paper") {
         wrap.appendChild(this.buildPaperCard(card));
+      } else if (card.kind === "book") {
+        wrap.appendChild(this.buildBookCard(card));
+      } else if (card.kind === "anime") {
+        wrap.appendChild(this.buildAnimeCard(card));
+      } else if (card.kind === "stats") {
+        wrap.appendChild(this.buildStatsCard(card));
       } else if (card.kind === "translate") {
         wrap.appendChild(this.buildTranslateCard(card));
       } else if (card.kind === "wolfram") {
@@ -20151,6 +20798,127 @@ const App = {
       s.className = "lane-card-meta";
       s.textContent = card.summary;
       div.appendChild(s);
+    }
+    return div;
+  },
+
+  /* 本のカード。書名が主で、著者・出版社・発売日・価格・ISBN は
+     API の値からだけ作る。内容紹介は API の転記（書影は出さない）。 */
+  buildBookCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    if (card.link) {
+      const a = document.createElement("a");
+      a.href = card.link;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = card.title;
+      title.appendChild(a);
+    } else {
+      title.textContent = card.title;
+    }
+    div.appendChild(title);
+    const meta = [];
+    if (card.author) meta.push(card.author);
+    if (card.publisher) meta.push(card.publisher);
+    if (card.pubdate) meta.push(card.pubdate);
+    if (card.price) meta.push(card.price);
+    if (card.isbn) meta.push(`ISBN：${card.isbn}`);
+    if (Array.isArray(card.sources) && card.sources.length) {
+      meta.push(card.sources.join(" / "));
+    }
+    if (meta.length) {
+      const m = document.createElement("p");
+      m.className = "lane-card-meta";
+      m.textContent = meta.join(" / ");
+      div.appendChild(m);
+    }
+    if (card.description) {
+      const s = document.createElement("p");
+      s.className = "lane-card-meta";
+      s.textContent = card.description;
+      div.appendChild(s);
+    }
+    return div;
+  },
+
+  /* アニメ・マンガのカード。作品名が主で、形式・年・スコア・
+     話数・スタジオ・主な登場人物と声優は API の値からだけ作る。 */
+  buildAnimeCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    const name = card.titleNative || card.titleRomaji;
+    if (card.url) {
+      const a = document.createElement("a");
+      a.href = card.url;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = name;
+      title.appendChild(a);
+    } else {
+      title.textContent = name;
+    }
+    div.appendChild(title);
+    const formatLabels = {
+      TV: "TVアニメ", TV_SHORT: "短編アニメ", MOVIE: "映画",
+      SPECIAL: "スペシャル", OVA: "OVA", ONA: "Webアニメ",
+      MUSIC: "ミュージック", MANGA: "マンガ", NOVEL: "小説",
+      ONE_SHOT: "読み切り",
+    };
+    const meta = [];
+    if (card.format) meta.push(formatLabels[card.format] || card.format);
+    if (card.seasonYear) meta.push(`${card.seasonYear}年`);
+    if (typeof card.score === "number") meta.push(`スコア：${card.score}`);
+    if (typeof card.episodes === "number" && card.episodes) {
+      meta.push(card.format === "MANGA" || card.format === "NOVEL"
+        ? `${card.episodes}話` : `全${card.episodes}話`);
+    }
+    if (card.studio) meta.push(`制作：${card.studio}`);
+    if (Array.isArray(card.genres) && card.genres.length) {
+      meta.push(card.genres.slice(0, 5).join(" / "));
+    }
+    if (meta.length) {
+      const m = document.createElement("p");
+      m.className = "lane-card-meta";
+      m.textContent = meta.join(" / ");
+      div.appendChild(m);
+    }
+    if (Array.isArray(card.characters) && card.characters.length) {
+      const pairs = card.characters.map((c) =>
+        c.voiceActor ? `${c.name}（声：${c.voiceActor}）` : c.name);
+      const s = document.createElement("p");
+      s.className = "lane-card-meta";
+      s.textContent = `主な登場人物：${pairs.join("、")}`;
+      div.appendChild(s);
+    }
+    return div;
+  },
+
+  /* 政府統計のカード。統計表名が主で、統計名・作成機関・調査日・
+     更新日は API の値からだけ作る。 */
+  buildStatsCard(card) {
+    const div = document.createElement("div");
+    div.className = "lane-card";
+    const title = document.createElement("p");
+    title.className = "lane-card-title";
+    title.textContent = card.title || card.statName;
+    div.appendChild(title);
+    const meta = [];
+    if (card.statName && card.title && card.statName !== card.title) {
+      meta.push(card.statName);
+    }
+    if (card.organization) meta.push(card.organization);
+    if (card.surveyDate) meta.push(`調査日：${card.surveyDate}`);
+    if (card.updatedDate) meta.push(`更新：${card.updatedDate}`);
+    if (meta.length) {
+      const m = document.createElement("p");
+      m.className = "lane-card-meta";
+      m.textContent = meta.join(" / ");
+      div.appendChild(m);
     }
     return div;
   },
@@ -22199,6 +22967,37 @@ const App = {
       if (handled) return;
     }
 
+    // 本の検索：NDLサーチ＋openBD の実データで答える。書誌の
+    // 意図が明示的な質問だけが発火する（発動条件の正本は
+    // サーバー側の matchBooksLane）。サーバーに届かない場合
+    // だけ従来の手順に倒れる。
+    const booksParsed = parseBooksQuery(question);
+    if (booksParsed) {
+      const handled = await this.runBooksLane(booksParsed);
+      if (handled) return;
+    }
+
+    // アニメ・マンガ：AniList の実データで答える。意図が明示
+    // 的な質問だけが発火する（発動条件の正本はサーバー側の
+    // matchAnimeLane）。サーバーに届かない場合だけ従来の
+    // 手順に倒れる。
+    const animeParsed = parseAnimeQuery(question);
+    if (animeParsed) {
+      const handled = await this.runAnimeLane(animeParsed);
+      if (handled) return;
+    }
+
+    // 政府統計：e-Stat の実データで答える。統計の意図が明示
+    // 的な質問だけが発火する（発動条件の正本はサーバー側の
+    // matchStatsLane）。未設定・見つからない・取得失敗のとき
+    // は runStatsLane が何も出さず false を返すので、従来の
+    // 手順にそのまま倒れる（純粋な追加レーン）。
+    const statsParsed = parseStatsQuery(question);
+    if (statsParsed) {
+      const handled = await this.runStatsLane(statsParsed);
+      if (handled) return;
+    }
+
     // 2.5) 時間制メーターの関門：サーバー側モデル（Twin / Pro /
     // Max / Ultra）が選択され、接続済みで、残量が0なら、生成も
     // 検索照合も始めずに穏やかに止める。端末内モデルへの案内と、
@@ -23391,6 +24190,9 @@ if (typeof module !== "undefined" && module.exports) {
     parseMarketQuery, fetchMarket, marketFxText, marketStockText,
     parseMusicQuery, fetchMusic, musicCardOf,
     parsePapersQuery, fetchPapers, paperCardOf,
+    parseBooksQuery, fetchBooks, bookCardOf,
+    parseAnimeQuery, fetchAnime, animeCardOf,
+    parseStatsQuery, fetchStatsList, fetchStatsData, statsCardOf,
     parseTranslateQuery, fetchTranslate, translateCardOf, translateLangName,
     parseWolframQuery, fetchWolfram, wolframCardOf, WOLFRAM_TIMEOUT_MS,
     parseChatRoute,
@@ -23406,7 +24208,7 @@ if (typeof module !== "undefined" && module.exports) {
     gcalPlusOneHour, GOOGLE_SENDLOG_SEEN_KEY,
     formatTimestampLabel, formatDistanceLabel,
     factSourceRelatedToEntity,
-    verifyModelAnswer, splitForGate, verifySentence,
+    verifyModelAnswer, splitForGate, verifySentence, sentenceHasNumericClaim,
     R13_VERSION, R13_FLAGS, R13_AUDIT, verifyTypedClaim13, anchored13, anchoredForCorroboration13,
     R14_VERSION, R14_FLAGS, R14_AUDIT, R14D_VERSION, R14D_FLAGS, R14D_AUDIT, CALC14_VERSION, CALC14_FLAGS, CALC14_AUDIT, r14DisplayAnswerable, r14OwnerBindingOk, r14PropositionTerms, r14CalcForm, verifyCalcClaim14,
     factIsContested, entityNotFound, scopeToSubject, subjectOf,

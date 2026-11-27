@@ -561,6 +561,9 @@ a { color: var(--accent); }
 .badge-papers { background: #2f5d8a; color: #ffffff; }
 .badge-translate { background: #0e7a5f; color: #ffffff; }
 .badge-wolfram { background: #c2410c; color: #ffffff; }
+.badge-books { background: #6d4c2f; color: #ffffff; }
+.badge-anime { background: #7b2d8b; color: #ffffff; }
+.badge-stats { background: #14532d; color: #ffffff; }
 .badge-gmail { background: #b3261e; color: #ffffff; }
 .badge-gcal { background: #1a73e8; color: #ffffff; }
 @media (prefers-color-scheme: dark) {
@@ -579,6 +582,9 @@ a { color: var(--accent); }
   .badge-papers { background: #a8c6e0; color: #1d1a15; }
   .badge-translate { background: #7fd8bd; color: #1d1a15; }
   .badge-wolfram { background: #f0a58e; color: #1d1a15; }
+  .badge-books { background: #d9b48f; color: #1d1a15; }
+  .badge-anime { background: #d5a6e0; color: #1d1a15; }
+  .badge-stats { background: #8fd0a5; color: #1d1a15; }
   .badge-gmail { background: #f2b8b5; color: #601410; }
   .badge-gcal { background: #a8c7fa; color: #0b3050; }
 }
